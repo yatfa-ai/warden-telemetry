@@ -1,0 +1,4 @@
+node_modules/
+# The durable store is runtime data, not source — never commit a receiver's
+# persisted telemetry.
+*.ndjson
