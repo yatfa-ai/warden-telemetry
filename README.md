@@ -15,7 +15,8 @@ server that accepts those events.
 > event against the shared schema, hard-reject anything outside it, and durably persist accepted events —
 > is in place (`server.mjs`), alongside a maintainer **`GET /summary`** read surface that aggregates the
 > persisted events into act-on-able signal (totals, per-type counts, top error names, schema-version
-> distribution). Retention, auth, and multi-version support are later slices. See [Running](#running-the-receiver)
+> distribution). **Every route — both `/ingest` and `/summary` — is gated behind an optional shared-secret
+> bearer token (`AUTH_TOKEN`).** Retention and multi-version support are later slices. See [Running](#running-the-receiver)
 > below and the design reference at the bottom.
 
 ## Why a separate repo
@@ -76,6 +77,7 @@ vendored `schema.ts`.
 ```bash
 node server.mjs            # listens on :7421, POST /ingest + GET /summary, persists ./telemetry.ndjson
 PORT=8080 STORE=/var/lib/warden/events.ndjson node server.mjs
+AUTH_TOKEN=cpy0kr3v... node server.mjs   # gate every route behind a shared secret
 npm test                   # node --test (zero real network, zero real filesystem)
 ```
 
@@ -93,7 +95,7 @@ curl http://localhost:7421/summary
 # {
 #   "total": 42,
 #   "byType": { "error": 30, "crash": 4, "performance-stall": 8 },
-#   "topErrorNames": [{ "name": "TypeError", "count": 17 }, ...],   // capped at 10, sorted desc
+#   "topErrorNames": [{ "name": "TypeError", "count": 17 }, ...],   # capped at 10, sorted desc
 #   "schemaVersions": { "1": 42 },
 #   "firstSeen": 1719820800000,
 #   "lastSeen": 1720000000000
@@ -105,7 +107,25 @@ identifiers (chat/session names). `total` is the record count; `byType` is alway
 `{ error, crash, performance-stall }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
 error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen`/`lastSeen` bound the
 observed time window (`null` on an empty store). A fresh receiver with no traffic returns `total: 0` with
-zeroed counters.
+zeroed counters. When `AUTH_TOKEN` is set, add the bearer header (e.g. `-H "Authorization: Bearer <token>"`)
+to this and every other request — see below.
+
+### Authenticating with a shared secret (`AUTH_TOKEN`)
+
+By default the receiver is **OPEN** — any client that can reach the port can POST `/ingest` (or read
+`/summary`). That is fine for a quick local dev run, but on a shared/LAN host you should gate it with a
+shared secret:
+
+```bash
+AUTH_TOKEN=$(openssl rand -hex 32) node server.mjs   # generate a strong secret, then run gated
+```
+
+When `AUTH_TOKEN` is set, **every** route requires an `Authorization: Bearer <AUTH_TOKEN>` header, checked
+before routing — so neither `/ingest` nor `/summary` can be reached without the secret. A request missing a
+valid token is rejected with **401** (a non-retryable 4xx; the client drops the batch rather than looping).
+When `AUTH_TOKEN` is **unset**, behavior is unchanged (open) — the keystone stays runnable bare for local
+dev. The secret is compared in constant time. Set the matching token on the Warden client side via the
+Settings "Receiver auth token" field (sent as the same `Authorization: Bearer` header).
 
 ## Design reference
 
