@@ -10,8 +10,11 @@ It is the **receiver half** of Warden's telemetry system. The **client** that co
 sends events lives in the [warden](https://github.com/yatfa-ai/warden) repo. This repo hosts only the
 server that accepts those events.
 
-> **Status: early / not yet implemented.** This repository currently contains only its design and this
-> README. See the design reference at the bottom.
+> **Status: ingest keystone implemented (R1).** The minimal Node ingest service — accept a client's
+> POSTed `{ schemaVersion, events }` batch, enforce the `x-telemetry-schema` handshake, validate every
+> event against the shared schema, hard-reject anything outside it, and durably persist accepted events —
+> is in place (`server.mjs`). A maintainer query/view API, retention, auth, and multi-version support are
+> later slices. See [Running](#running-the-receiver) below and the design reference at the bottom.
 
 ## Why a separate repo
 
@@ -53,7 +56,31 @@ The client and this receiver agree on a **schema version**. A schema bump is a *
 both repos** — schema drift between client and receiver is the main risk this design guards against, so the
 schema is pinned and version-bumped deliberately.
 
-> The shared schema definition will be published here once implemented.
+The shared schema lives in **[`schema.ts`](./schema.ts)**, vendored **verbatim** from the client
+(`warden/web/src/lib/telemetry/schema.ts`). It is zero-dependency and runtime-import-free, and loads
+standalone here via Node's native TypeScript type-stripping (Node ≥ 22.6; target 24) — no transpile step,
+no Vite, no validation library (no zod). **Never hand-roll a parallel validator:** a second validator that
+can disagree with the client's is exactly the drift this design guards against.
+
+A drift guard (`test/drift.test.mjs`) asserts the vendored constants match the pinned client contract and
+that `validateEvent` still accepts the canonical client fixtures — so a schema change can't land here
+silently; a bump must consciously update both the vendored file and the pinned assertions.
+
+## Running the receiver
+
+Requires **Node ≥ 22.6** (target 24, to match the Warden backend) for native type-stripping of the
+vendored `schema.ts`.
+
+```bash
+node server.mjs            # listens on :7421, POST /ingest, persists ./telemetry.ndjson
+PORT=8080 STORE=/var/lib/warden/events.ndjson node server.mjs
+npm test                   # node --test (zero real network, zero real filesystem)
+```
+
+Point a Warden client at it by setting its telemetry `endpointUrl` to `http://<host>:7421/ingest` and
+opting in (base tier). A `schemaVersion: 1` batch of valid events returns `202 Accepted` and is appended to
+the NDJSON store; an unknown `x-telemetry-schema` version or any out-of-schema event is hard-rejected with
+a **non-retryable 4xx** (the client drops the batch rather than retrying it forever).
 
 ## Design reference
 
