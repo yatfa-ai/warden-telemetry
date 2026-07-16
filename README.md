@@ -10,11 +10,13 @@ It is the **receiver half** of Warden's telemetry system. The **client** that co
 sends events lives in the [warden](https://github.com/yatfa-ai/warden) repo. This repo hosts only the
 server that accepts those events.
 
-> **Status: ingest keystone implemented (R1).** The minimal Node ingest service — accept a client's
+> **Status: ingest + read surface implemented (R1 + R2).** The minimal Node ingest service — accept a client's
 > POSTed `{ schemaVersion, events }` batch, enforce the `x-telemetry-schema` handshake, validate every
 > event against the shared schema, hard-reject anything outside it, and durably persist accepted events —
-> is in place (`server.mjs`). A maintainer query/view API, retention, auth, and multi-version support are
-> later slices. See [Running](#running-the-receiver) below and the design reference at the bottom.
+> is in place (`server.mjs`), alongside a maintainer **`GET /summary`** read surface that aggregates the
+> persisted events into act-on-able signal (totals, per-type counts, top error names, schema-version
+> distribution). Retention, auth, and multi-version support are later slices. See [Running](#running-the-receiver)
+> below and the design reference at the bottom.
 
 ## Why a separate repo
 
@@ -72,7 +74,7 @@ Requires **Node ≥ 22.6** (target 24, to match the Warden backend) for native t
 vendored `schema.ts`.
 
 ```bash
-node server.mjs            # listens on :7421, POST /ingest, persists ./telemetry.ndjson
+node server.mjs            # listens on :7421, POST /ingest + GET /summary, persists ./telemetry.ndjson
 PORT=8080 STORE=/var/lib/warden/events.ndjson node server.mjs
 npm test                   # node --test (zero real network, zero real filesystem)
 ```
@@ -81,6 +83,29 @@ Point a Warden client at it by setting its telemetry `endpointUrl` to `http://<h
 opting in (base tier). A `schemaVersion: 1` batch of valid events returns `202 Accepted` and is appended to
 the NDJSON store; an unknown `x-telemetry-schema` version or any out-of-schema event is hard-rejected with
 a **non-retryable 4xx** (the client drops the batch rather than retrying it forever).
+
+### Reading the signal back — `GET /summary`
+
+A maintainer reads **aggregates** (not raw NDJSON) of the persisted events:
+
+```bash
+curl http://localhost:7421/summary
+# {
+#   "total": 42,
+#   "byType": { "error": 30, "crash": 4, "performance-stall": 8 },
+#   "topErrorNames": [{ "name": "TypeError", "count": 17 }, ...],   // capped at 10, sorted desc
+#   "schemaVersions": { "1": 42 },
+#   "firstSeen": 1719820800000,
+#   "lastSeen": 1720000000000
+# }
+```
+
+The response carries **counts and histograms only** — it never echoes raw events or extended-tier
+identifiers (chat/session names). `total` is the record count; `byType` is always the full
+`{ error, crash, performance-stall }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
+error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen`/`lastSeen` bound the
+observed time window (`null` on an empty store). A fresh receiver with no traffic returns `total: 0` with
+zeroed counters.
 
 ## Design reference
 

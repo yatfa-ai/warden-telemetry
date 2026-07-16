@@ -131,3 +131,149 @@ test('POST /ingest?foo=bar still routes to ingest (query string ignored)', async
 test('createRequestHandler requires a store (fails loud, not silent)', () => {
   assert.throws(() => createRequestHandler(), /store/);
 });
+
+// ── GET /summary — the maintainer read surface (WARDEN-567) ───────────────────
+// A store pre-seeded with a known event mix via an INJECTED source (reads return
+// the seeded events; writes go nowhere). Still ZERO real fs, ZERO real network —
+// the handler is driven directly with fake req/res like the ingest tests above.
+function readableStore(events) {
+  return createNdjsonStore({
+    sink: async () => {},
+    source: () => events.map((e) => structuredClone(e)),
+  });
+}
+
+const errorEvent = {
+  schemaVersion: 1,
+  type: 'error',
+  runtime: 'main',
+  timestamp: 5,
+  name: 'TypeError',
+  message: 'm',
+  frames: [],
+};
+const crashEvent = {
+  schemaVersion: 1,
+  type: 'crash',
+  runtime: 'renderer',
+  timestamp: 9,
+  reason: 'oom',
+};
+
+test('GET /summary returns the aggregate over a pre-populated store → 200 + JSON', async () => {
+  const store = readableStore([errorEvent, crashEvent]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['content-type'], 'application/json');
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 2);
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0 });
+  assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
+  assert.deepEqual(body.schemaVersions, { '1': 2 });
+  assert.equal(body.firstSeen, 5);
+  assert.equal(body.lastSeen, 9);
+});
+
+test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an error)', async () => {
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 0);
+  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0 });
+  assert.deepEqual(body.topErrorNames, []);
+  assert.deepEqual(body.schemaVersions, {});
+  assert.equal(body.firstSeen, null);
+  assert.equal(body.lastSeen, null);
+});
+
+test('GET /summary never echoes raw events or extended-tier names (aggregates only)', async () => {
+  const store = readableStore([
+    { ...errorEvent, chatName: 'Refactor auth', sessionName: 'claude-7b3a2f1', message: 'secret' },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const json = res.body;
+  assert.equal(json.includes('Refactor auth'), false, 'no chatName');
+  assert.equal(json.includes('claude-7b3a2f1'), false, 'no sessionName');
+  assert.equal(json.includes('secret'), false, 'no message');
+});
+
+test('GET /summary?foo=bar still routes (query string ignored, like POST /ingest)', async () => {
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?foo=bar' }), res);
+  assert.equal(res.statusCode, 200);
+});
+
+test('GET /summary reflects events appended since the handler was built (live read)', async () => {
+  // sink + source share one array: appends become visible to subsequent reads.
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+
+  // empty before any ingest
+  let res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(JSON.parse(res.body).total, 0);
+
+  // ingest one event, then summary sees it
+  await handler(fakeReq({ headers: headersV1, body: validBody }), fakeRes());
+  res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(JSON.parse(res.body).total, 1);
+});
+
+test('both POST /ingest and GET /summary are routed by the SAME createRequestHandler (no route drift)', async () => {
+  // The drift-style assertion: the read route is wired through createRequestHandler
+  // ALONGSIDE POST /ingest — one handler serves both, proving the read surface did
+  // not displace or shadow the ingest route.
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+
+  const ingestRes = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), ingestRes);
+  assert.equal(ingestRes.statusCode, 202, 'POST /ingest still routes through the handler');
+
+  const summaryRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), summaryRes);
+  assert.equal(summaryRes.statusCode, 200, 'GET /summary is wired through the same handler');
+});
+
+test('GET /ingest still 404s (GET is not ingest; only GET /summary is a read route)', async () => {
+  const { handler } = wiring();
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/ingest' }), res);
+  assert.equal(res.statusCode, 404);
+});
+
+test('POST /summary → 404 (only GET /summary is wired; POST /summary is not ingest)', async () => {
+  const { handler } = wiring();
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'POST', url: '/summary', body: validBody }), res);
+  assert.equal(res.statusCode, 404);
+});
+
+test('GET /summary on a write-only (source-less) store → 500, not a crash', async () => {
+  // A store wired without a source has a readEvents() that throws loud. The handler
+  // must surface that as a clean 500, never let it kill the server process.
+  const store = createNdjsonStore({ sink: async () => {} }); // no source
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 500);
+  assert.match(JSON.parse(res.body).error, /source|summary/);
+});
