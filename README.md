@@ -109,6 +109,13 @@ curl http://localhost:7421/summary
 #     "lastStatus": 415,
 #     "lastReason": "unsupported telemetry schema version...",  # receiver diagnostic, not a payload
 #     "lastSeen": 1720000099000
+#   },
+#   "timeline": {
+#     "buckets": [
+#       { "bucketStart": 1719913600000, "bucketEnd": 1719915400000, "count": 2 },   # earlier baseline
+#       { "bucketStart": 1719998200000, "bucketEnd": 1720000000000, "count": 15 }   # recent spike — suspect a deploy
+#     ],
+#     "bucketMs": 1800000                                                          # 30-min buckets (24h window / 48 cap)
 #   }
 # }
 ```
@@ -132,6 +139,15 @@ tally is receiver-local and **does not survive a restart** (a misconfiguration d
 purely additive: it records rejections that already happen, relaxes no check, and routes nothing anywhere.
 When `AUTH_TOKEN` is set, add the bearer header (e.g. `-H "Authorization: Bearer <token>"`) to this and
 every other request — see below.
+
+`timeline` is a bounded temporal distribution — event **counts per time bucket** over a rolling recent
+window (the last 24h, split into at most 48 buckets of 30 min each) — so you can distinguish a **recent
+volume spike** (a regression or a deploy event — e.g. 15 errors landing in the newest bucket) from a
+**long-running baseline** (a flat trickle across the window). It reads only the `timestamp` on
+already-persisted events and emits counts, never raw events or extended-tier identifiers. Events older
+than the window are excluded from the distribution but are still counted in `total` / `byType` /
+`firstSeen` / `lastSeen` (those span the full retained set); a quiet store returns `buckets: []` with the
+`bucketMs` granularity still conveyed. It is purely additive — computed on read, it collects nothing new.
 
 ### Verifying the receiver is reachable — `GET /capabilities`
 

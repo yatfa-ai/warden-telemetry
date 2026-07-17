@@ -29,8 +29,11 @@
 // before relying on the receiver). The GET /summary aggregate also carries a
 // bounded `rejections` tally (WARDEN-591) — counts by status of the rejections
 // that already happen at every rejection site, so a maintainer can tell
-// "traffic is arriving and being hard-rejected" from "no traffic at all." The
-// client POSTs the batch verbatim to its configured endpointUrl (e.g.
+// "traffic is arriving and being hard-rejected" from "no traffic at all" —
+// AND a bounded `timeline` distribution (WARDEN-603) — event counts per time
+// bucket over a rolling recent window, so a maintainer can distinguish a recent
+// volume spike (a regression / deploy) from a long-running baseline. The client
+// POSTs the batch verbatim to its configured endpointUrl (e.g.
 // http://host:7421/ingest) and never rewrites the host, so these route paths
 // are the receiver's to define.
 
@@ -40,7 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { SCHEMA_VERSION, validateEvent } from './schema.ts';
 import { createNdjsonStore, fileSink, fileSource, fileRewrite } from './store.mjs';
 import { ingest } from './ingest.mjs';
-import { summarize } from './summary.mjs';
+import { summarize, summarizeTimeline } from './summary.mjs';
 
 export const DEFAULT_PORT = 7421;
 export const DEFAULT_STORE_PATH = new URL('./telemetry.ndjson', import.meta.url).pathname;
@@ -338,10 +341,18 @@ export function createRejectionTally({ now = Date.now } = {}) {
  * `rejections` dep = a zeroed `rejections` field on /summary and no recording —
  * today's behavior, exactly like an absent retention dep.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object } }} deps
+ * `now` (optional clock, WARDEN-603): the GET /summary `timeline` distribution
+ * is a rolling recent window measured back from `now`, so the handler — the
+ * testable seam — takes an injectable `now` (default `Date.now`) to stay
+ * fake-clock testable, mirroring `createRejectionTally({ now })`. Production is
+ * unchanged when `now` is omitted (real clock). The timeline itself is ALWAYS
+ * computed (it is a pure read over persisted `timestamp`s, like `summarize()`),
+ * so every /summary response carries the field whether or not `now` is wired.
+ *
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, now?: () => number }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, now = Date.now } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
 
   // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
@@ -378,16 +389,20 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     if (req.method === 'GET' && pathname === SUMMARY_PATH) {
       try {
         const events = await store.readEvents();
-        // Compose the bounded `rejections` tally here — NOT inside summarize().
-        // summarize(events) stays a PURE single-arg function of the event array
-        // (documented + tested that way); the tally is handler-injected state,
-        // composed here exactly the way `retention` is handler-injected rather
-        // than summarize-injected. The field is ALWAYS present: the tally's
-        // snapshot when wired, or the zeroed EMPTY_REJECTIONS otherwise (so the
-        // shape is stable for every caller, wired or not).
+        // Compose the bounded `rejections` tally AND the bounded `timeline`
+        // distribution here — NOT inside summarize(). summarize(events) stays a
+        // PURE single-arg function of the event array (documented + tested that
+        // way); both are handler-composed, exactly the way `retention` is
+        // handler-injected rather than summarize-injected. `rejections` is the
+        // tally's snapshot when wired, or the zeroed EMPTY_REJECTIONS otherwise
+        // (stable shape for every caller). `timeline` is ALWAYS computed — a pure
+        // read over the events' `timestamp`s measured back from the injected `now`
+        // (default Date.now) — so the field is present for every caller, wired or
+        // not. Counts only; never raw events or extended-tier names.
         return sendJson(res, 200, {
           ...summarize(events),
           rejections: rejections ? rejections.snapshot() : EMPTY_REJECTIONS,
+          timeline: summarizeTimeline(events, { now }),
         });
       } catch (e) {
         return sendJson(res, 500, { error: `could not read summary: ${e?.message ?? e}` });
