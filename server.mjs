@@ -13,6 +13,14 @@
 //                  requires `Authorization: Bearer <AUTH_TOKEN>`; unset = OPEN (dev
 //                  only). Gate every route so an unauthenticated reader can't reach
 //                  /ingest (or any future read surface) — WARDEN-569.
+//       STORE_MAX_EVENTS  (default 10000) — retention COUNT cap. The persisted file
+//                  is compacted to the newest N events once N are exceeded. The
+//                  DEFAULT IS BOUNDED (unbounded growth was the bug — WARDEN-579).
+//                  `0` disables the count cap.
+//       STORE_MAX_AGE_HOURS (default 0 = off) — retention AGE window. Events whose
+//                  epoch-ms `timestamp` is older than now minus this many hours are
+//                  dropped on compaction. `0` disables the age window. When set, a
+//                  periodic sweep expires old events even on a quiet store.
 //
 // The receiver owns its routes: POST /ingest (write) and GET /summary (read —
 // the maintainer aggregate surface, WARDEN-567). The client POSTs the batch
@@ -23,7 +31,7 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { SCHEMA_VERSION, validateEvent } from './schema.ts';
-import { createNdjsonStore, fileSink, fileSource } from './store.mjs';
+import { createNdjsonStore, fileSink, fileSource, fileRewrite } from './store.mjs';
 import { ingest } from './ingest.mjs';
 import { summarize } from './summary.mjs';
 
@@ -31,6 +39,33 @@ export const DEFAULT_PORT = 7421;
 export const DEFAULT_STORE_PATH = new URL('./telemetry.ndjson', import.meta.url).pathname;
 export const INGEST_PATH = '/ingest';
 export const SUMMARY_PATH = '/summary';
+
+// ── RETENTION CONFIG (WARDEN-579) ────────────────────────────────────────────
+// The persisted store is bounded by default (unbounded growth was the bug). The
+// count cap is the hard bound on record count (→ file size); the age window is
+// an optional freshness complement. Both default to bounded/opt-in; an explicit
+// `0` on a knob opts that policy out (both `0` = the unbounded escape hatch).
+export const DEFAULT_MAX_EVENTS = 10000; // count cap — hard bound on record count
+export const DEFAULT_MAX_AGE_HOURS = 0; // age OFF by default (count cap carries the bound)
+// A compaction is debounced to >=1 min and never runs synchronously per event
+// (WARDEN-88 Anti-Pattern 1/2: a per-event file rewrite would freeze the receiver
+// the way the lifecycle poll once froze warden). The age-expiry sweep ticks on a
+// bounded interval and only when an age window is configured.
+export const RETENTION_DEBOUNCE_MS = 60_000;
+export const RETENTION_SWEEP_MS = 5 * 60_000; // 5-min cadence for age-expiry
+const HOUR_MS = 60 * 60 * 1000;
+
+// Parse a non-negative number env override for retention. Unset/empty → fallback;
+// an explicit "0" disables that policy (the opt-out); a malformed/negative value
+// falls back to the (bounded) default so a typo can never silently unbound the
+// store — the default stays bounded under any misconfiguration.
+function envRetentionInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
 
 // The default shared-schema deps — the vendored schema.ts, loaded once at module
 // init via Node's native type-stripping. Overridable per-handler for tests.
@@ -101,6 +136,93 @@ function tokensMatch(provided, expected) {
 }
 
 /**
+ * Build the maintenance trigger that keeps the persisted store bounded
+ * (WARDEN-579). It invokes `store.prune(...)` OFF the request path, on a
+ * DEBOUNCED (≥1 min), re-entrancy-guarded cadence — never a synchronous rewrite
+ * per event (WARDEN-88 Anti-Pattern 1/2: a per-event compaction would freeze the
+ * receiver the way the lifecycle poll once froze warden).
+ *
+ * Two arming paths, both coalesced by a single debounce timer:
+ *   - `afterAppend(count)` — REACTIVE: once `maxEvents`-worth have been appended
+ *     since the last prune, arm a debounced prune (handles volume-driven growth).
+ *   - `sweep()`           — PERIODIC: arm a debounced prune on a timer (handles
+ *     age-window expiry on a QUIET store, where no append would trigger it).
+ *
+ * `setTimer` / `clearTimer` / `now` are injected so the trigger is unit-testable
+ * with a fake clock and a deterministic scheduler — no real timer in tests.
+ *
+ * @param {{ prune(opts: object): Promise<void> }} store
+ * @param {{ maxEvents?: number, maxAgeMs?: number, debounceMs?: number, now?: () => number, setTimer?: (fn: () => void, ms: number) => unknown, clearTimer?: (id: unknown) => void }} [opts]
+ * @returns {{ afterAppend(count?: number): void, sweep(): void, cancel(): void }}
+ */
+export function createRetentionTrigger(
+  store,
+  {
+    maxEvents = 0,
+    maxAgeMs = 0,
+    debounceMs = RETENTION_DEBOUNCE_MS,
+    now = Date.now,
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (id) => clearTimeout(id),
+  } = {}
+) {
+  let timerId = null;
+  let running = false;
+  let appendedSincePrune = 0;
+
+  function flush() {
+    timerId = null;
+    // Re-entrancy guard: if a prune is still mid-flight, let it finish. The next
+    // append (or sweep tick) after it completes re-arms; under sustained ingest
+    // there is always a next append, so nothing is dropped for long.
+    if (running) return;
+    running = true;
+    appendedSincePrune = 0;
+    Promise.resolve(store.prune({ maxEvents, maxAgeMs, now: now() }))
+      .catch(() => {
+        // A prune failure must NEVER kill the receiver (telemetry is best-effort).
+        // The atomic rename in `fileRewrite` means a failed compaction leaves the
+        // prior file intact; the next prune retries. Swallow, don't crash.
+      })
+      .finally(() => {
+        running = false;
+        // If appends landed during the prune and re-crossed the count bound, arm
+        // another debounced prune so a burst-then-quiet doesn't leave the store
+        // over the bound waiting for the next append.
+        if (maxEvents > 0 && appendedSincePrune >= maxEvents) arm();
+      });
+  }
+
+  function arm() {
+    // Debounce: a burst of appends coalesces into ONE prune. Re-entrancy: don't
+    // arm while a prune is running (the next append after it completes re-arms).
+    if (timerId != null || running) return;
+    timerId = setTimer(flush, debounceMs);
+  }
+
+  return {
+    /** Record an append count; arm a debounced prune once the count bound is crossed. */
+    afterAppend(countAppended = 0) {
+      appendedSincePrune += countAppended;
+      if (maxEvents > 0 && Number.isFinite(maxEvents) && appendedSincePrune >= maxEvents) {
+        arm();
+      }
+    },
+    /** Arm a debounced prune unconditionally (the periodic age-expiry sweep). */
+    sweep() {
+      arm();
+    },
+    /** Cancel any pending debounced prune (e.g. on server shutdown). */
+    cancel() {
+      if (timerId != null) {
+        clearTimer(timerId);
+        timerId = null;
+      }
+    },
+  };
+}
+
+/**
  * Build the request handler. `store` and `schema` are injected so the handler is
  * testable with a capturing store and WITHOUT a live port (tests call the handler
  * directly with a fake req/res). The defaults wire the real file-backed store and
@@ -114,10 +236,18 @@ function tokensMatch(provided, expected) {
  * ingest() runs, so nothing is persisted on a reject. When unset, behavior is
  * UNCHANGED (open) — the keystone stays runnable bare for local dev.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string }} deps
+ * `retention` (optional maintenance trigger, WARDEN-579): AFTER a successful
+ * persist, the handler records the accepted count via `retention.afterAppend(n)`
+ * — FIRE-AND-FORGET (not awaited). The trigger arms a debounced, off-path prune
+ * if the count bound was crossed; the compaction itself never runs on the request
+ * path, so the 202 is sent immediately and ingest latency is unaffected. No
+ * `retention` dep = today's behavior (the handler is unchanged for callers that
+ * don't wire retention).
+ *
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void } }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
   return async (req, res) => {
     // AUTH GATE — optional but, when authToken is set, the FIRST thing checked and
@@ -168,6 +298,16 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // ingest's own rejection discipline guarantees a non-retryable 4xx (or 202);
     // map the result straight onto the response.
     const result = await ingest({ headers: req.headers, body }, { ...schema, store });
+
+    // RETENTION (WARDEN-579) — fire-and-forget: AFTER a successful persist, tell
+    // the maintenance trigger how many events landed so it can arm a DEBOUNCED,
+    // off-path prune if the count bound was crossed. NOT awaited: the 202 is sent
+    // at once and any compaction runs later — never a synchronous rewrite here.
+    // Skipped on reject (nothing appended) and when no retention is wired.
+    if (retention && result.ok && result.body && result.body.accepted > 0) {
+      retention.afterAppend(result.body.accepted);
+    }
+
     return sendJson(res, result.status, result.body);
   };
 }
@@ -176,19 +316,44 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
  * Create (and by default start) a receiver. Every dependency is injectable; the
  * defaults wire the real file-backed store + vendored schema. `authToken` mirrors
  * the PORT/STORE env pattern: read from AUTH_TOKEN when not passed explicitly.
+ * Retention bounds (WARDEN-579) mirror the same pattern: read from
+ * STORE_MAX_EVENTS / STORE_MAX_AGE_HOURS when not passed, defaulting to bounded.
  *
- * @param {{ port?: number, storePath?: string, store?: object, schema?: object, authToken?: string }} [opts]
+ * @param {{ port?: number, storePath?: string, store?: object, schema?: object, authToken?: string, maxEvents?: number, maxAgeHours?: number }} [opts]
  * @returns {import('node:http').Server}
  */
 export function createReceiver({
   port = process.env.PORT ? Number(process.env.PORT) : DEFAULT_PORT,
   storePath = process.env.STORE ?? DEFAULT_STORE_PATH,
-  store = createNdjsonStore({ sink: fileSink(storePath), source: fileSource(storePath) }),
+  store = createNdjsonStore({
+    sink: fileSink(storePath),
+    source: fileSource(storePath),
+    rewrite: fileRewrite(storePath),
+  }),
   schema = DEFAULT_SCHEMA,
   authToken = process.env.AUTH_TOKEN,
+  maxEvents = envRetentionInt('STORE_MAX_EVENTS', DEFAULT_MAX_EVENTS),
+  maxAgeHours = envRetentionInt('STORE_MAX_AGE_HOURS', DEFAULT_MAX_AGE_HOURS),
 } = {}) {
-  const handler = createRequestHandler({ store, schema, authToken });
+  const maxAgeMs = maxAgeHours > 0 ? maxAgeHours * HOUR_MS : 0;
+  const retention = createRetentionTrigger(store, { maxEvents, maxAgeMs });
+  const handler = createRequestHandler({ store, schema, authToken, retention });
   const server = createServer(handler);
+
+  // Periodic age-expiry sweep — ONLY when an age window is set. A quiet store
+  // (no appends) still needs old events to expire, so sweep on a timer; the
+  // trigger debounces + re-entrancy-guards the actual prune. unref'd so it never
+  // keeps the process alive solely to prune. Cleaned up on server close.
+  let sweepInterval = null;
+  if (maxAgeMs > 0) {
+    sweepInterval = setInterval(() => retention.sweep(), RETENTION_SWEEP_MS);
+    sweepInterval.unref?.();
+  }
+  server.on('close', () => {
+    retention.cancel();
+    if (sweepInterval) clearInterval(sweepInterval);
+  });
+
   if (port != null) server.listen(port);
   return server;
 }
@@ -201,8 +366,14 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const addr = server.address();
     const port = typeof addr === 'object' && addr ? addr.port : '(unknown)';
     const authed = process.env.AUTH_TOKEN ? 'auth: ON (Authorization: Bearer required)' : 'auth: OFF (open — dev only)';
+    const maxEv = envRetentionInt('STORE_MAX_EVENTS', DEFAULT_MAX_EVENTS);
+    const maxAh = envRetentionInt('STORE_MAX_AGE_HOURS', DEFAULT_MAX_AGE_HOURS);
+    const retention =
+      maxEv > 0 || maxAh > 0
+        ? `retention: max ${maxEv} events${maxAh > 0 ? `, ${maxAh}h age` : ''}`
+        : 'retention: OFF (unbounded — not recommended)';
     console.log(
-      `warden-telemetry receiver listening on :${port} (POST ${INGEST_PATH}, GET ${SUMMARY_PATH}; store: ${storePath}; ${authed})`
+      `warden-telemetry receiver listening on :${port} (POST ${INGEST_PATH}, GET ${SUMMARY_PATH}; store: ${storePath}; ${authed}; ${retention})`
     );
   });
 }

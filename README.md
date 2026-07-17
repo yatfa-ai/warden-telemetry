@@ -16,7 +16,9 @@ server that accepts those events.
 > is in place (`server.mjs`), alongside a maintainer **`GET /summary`** read surface that aggregates the
 > persisted events into act-on-able signal (totals, per-type counts, top error names, schema-version
 > distribution). **Every route — both `/ingest` and `/summary` — is gated behind an optional shared-secret
-> bearer token (`AUTH_TOKEN`).** Retention and multi-version support are later slices. See [Running](#running-the-receiver)
+> bearer token (`AUTH_TOKEN`).** The persisted store is bounded by a maintainer-configurable **retention**
+> policy (a count cap and/or an age window) so events don't accumulate without limit over the receiver's
+> lifetime. Multi-version schema support is a later slice. See [Running](#running-the-receiver)
 > below and the design reference at the bottom.
 
 ## Why a separate repo
@@ -78,6 +80,7 @@ vendored `schema.ts`.
 node server.mjs            # listens on :7421, POST /ingest + GET /summary, persists ./telemetry.ndjson
 PORT=8080 STORE=/var/lib/warden/events.ndjson node server.mjs
 AUTH_TOKEN=cpy0kr3v... node server.mjs   # gate every route behind a shared secret
+STORE_MAX_EVENTS=50000 STORE_MAX_AGE_HOURS=168 node server.mjs   # retain newest 50k events / 7 days
 npm test                   # node --test (zero real network, zero real filesystem)
 ```
 
@@ -109,6 +112,32 @@ error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen
 observed time window (`null` on an empty store). A fresh receiver with no traffic returns `total: 0` with
 zeroed counters. When `AUTH_TOKEN` is set, add the bearer header (e.g. `-H "Authorization: Bearer <token>"`)
 to this and every other request — see below.
+
+### Keeping the store bounded — retention
+
+Accepted events are appended to one NDJSON file. Without a bound that file grows for as long as the
+receiver runs, which eventually degrades the very signal it exists to deliver (disk pressure, a `/summary`
+read that grows slow, ingest persistence that degrades). Retention compacts the file to a maintainer-
+configurable bound. **The default is bounded** — you do not have to opt in:
+
+- **`STORE_MAX_EVENTS`** (default `10000`) — the **count cap**. Once the store exceeds this many events, it is
+  compacted down to the newest N (oldest excess dropped off the front). This is the hard bound on record
+  count, and therefore on file size. Set `0` to disable the count cap.
+- **`STORE_MAX_AGE_HOURS`** (default `0` = off) — the **age window**. Events whose `timestamp` is older than
+  now minus this many hours are dropped on the next compaction. When set, a maintainer-curated periodic sweep
+  also expires old events on a quiet store (one with no incoming traffic). Set `0` to disable the age window.
+
+Both may be set; an event is retained only if it survives both policies. To opt out of retention entirely
+(run unbounded — **not recommended**), set both to `0`.
+
+Compaction preserves the trust model exactly: retention **only ever removes** events. It never expands what
+a tier collects, never routes data elsewhere, and never touches the pre-collection redaction contract — it
+trims a file of events that already landed, schema-validated and redacted. `/summary` aggregates are derived
+purely from whatever the store currently holds, so they stay self-consistent after a compaction (`firstSeen` /
+`lastSeen` bound the retained window, `byType` / `topErrorNames` / `schemaVersions` reflect only the retained
+set). A compaction rewrites the file atomically (temp file + rename), runs **off the request path** on a
+debounced (≥1 min), re-entrancy-guarded trigger, and performs **no** rewrite at all when nothing exceeds the
+bound — ingest latency is unaffected.
 
 ### Authenticating with a shared secret (`AUTH_TOKEN`)
 
