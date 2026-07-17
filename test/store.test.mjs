@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createNdjsonStore, parseNdjson } from '../store.mjs';
+import { createNdjsonStore, parseNdjson, applyRetention } from '../store.mjs';
 
 test('createNdjsonStore requires an injected sink (no implicit real-fs default — hermetic by construction)', () => {
   assert.throws(() => createNdjsonStore(), /sink/);
@@ -106,4 +106,226 @@ test('readEvents() on a source-less store throws a loud TypeError (fail loud, no
   // Mirrors createRequestHandler's synchronous "requires a store" throw: the
   // error surfaces at the call, not as a silent [] or a swallowed rejection.
   assert.throws(() => store.readEvents(), /source/);
+});
+
+// ── RETENTION (WARDEN-579) ────────────────────────────────────────────────────
+// Exercises the retention policy + prune with INJECTED capturing sink/source/
+// rewrite fns — still ZERO real filesystem. `fileRewrite` (the real-fs wiring)
+// is NOT tested here for the same reason as fileSink/fileSource: it is a thin fs
+// wrapper, and exercising it would touch real disk. `applyRetention` (the pure
+// fs-free policy core) and `prune` (driven through an in-memory rewrite seam)
+// ARE unit-tested below.
+//
+// An in-memory FILE MIRROR: sink appends a line, source parses it back, rewrite
+// replaces the whole content — exactly the contract the production
+// fileSink/fileSource/fileRewrite trio satisfies, with no disk involved.
+function inMemoryFile() {
+  let text = '';
+  return {
+    sink: async (line) => {
+      text += `${line}\n`;
+    },
+    source: () => parseNdjson(text),
+    rewrite: async (newText) => {
+      text = newText;
+    },
+    read: () => parseNdjson(text),
+    snapshot: () => text,
+  };
+}
+
+// ── applyRetention — the PURE policy core (plain arrays, no seams) ───────────
+
+test('applyRetention count cap keeps the LAST N (newest by arrival order), drops the older excess', () => {
+  const events = [{ i: 1 }, { i: 2 }, { i: 3 }, { i: 4 }, { i: 5 }];
+  assert.deepEqual(applyRetention(events, { maxEvents: 2 }), [{ i: 4 }, { i: 5 }]);
+});
+
+test('applyRetention count cap is a no-op when the store is already under the cap', () => {
+  const events = [{ i: 1 }, { i: 2 }];
+  assert.deepEqual(applyRetention(events, { maxEvents: 10 }), [{ i: 1 }, { i: 2 }]);
+  // Exactly at the cap → still no drop.
+  assert.deepEqual(applyRetention(events, { maxEvents: 2 }), [{ i: 1 }, { i: 2 }]);
+});
+
+test('applyRetention age window drops events older than now - maxAgeMs and keeps the rest', () => {
+  const NOW = 10_000;
+  const events = [
+    { i: 'old', timestamp: NOW - 4000 },
+    { i: 'fresh', timestamp: NOW - 500 },
+    { i: 'edge', timestamp: NOW - 1000 }, // exactly at the cutoff boundary → kept (>=)
+  ];
+  // maxAgeMs = 1000 → cutoff = 9000 → drop timestamp < 9000.
+  assert.deepEqual(applyRetention(events, { maxAgeMs: 1000, now: NOW }), [
+    { i: 'fresh', timestamp: NOW - 500 },
+    { i: 'edge', timestamp: NOW - 1000 },
+  ]);
+});
+
+test('applyRetention age window KEEPS events with no finite timestamp (age unknowable → never silently dropped)', () => {
+  const NOW = 10_000;
+  const events = [
+    { i: 'noTs' },
+    { i: 'nullTs', timestamp: null },
+    { i: 'strTs', timestamp: 'oops' },
+    { i: 'fresh', timestamp: NOW },
+  ];
+  const kept = applyRetention(events, { maxAgeMs: 1000, now: NOW });
+  assert.deepEqual(kept, events.slice(0, 3).concat(events[3])); // all four kept
+});
+
+test('applyRetention applies BOTH policies (an event is retained iff it survives both)', () => {
+  const NOW = 10_000;
+  const events = [
+    { i: 'old-and-excess', timestamp: NOW - 9999 },
+    { i: 'fresh-1', timestamp: NOW },
+    { i: 'fresh-2', timestamp: NOW },
+  ];
+  // Age drops the old one; count cap 1 then keeps the LAST 1 of what survived.
+  assert.deepEqual(applyRetention(events, { maxEvents: 1, maxAgeMs: 1000, now: NOW }), [
+    { i: 'fresh-2', timestamp: NOW },
+  ]);
+});
+
+test('applyRetention with both policies disabled retains everything (the opt-out)', () => {
+  const events = [{ i: 1 }, { i: 2 }, { i: 3 }];
+  assert.deepEqual(applyRetention(events, { maxEvents: 0, maxAgeMs: 0 }), events);
+  // Defaults are also disabled (calling with no opts keeps all).
+  assert.deepEqual(applyRetention(events), events);
+});
+
+test('applyRetention on a non-array yields [] (robust to a bad read)', () => {
+  assert.deepEqual(applyRetention(null, { maxEvents: 1 }), []);
+  assert.deepEqual(applyRetention(undefined, { maxEvents: 1 }), []);
+});
+
+test('applyRetention never mutates its input', () => {
+  const events = [{ i: 1 }, { i: 2 }, { i: 3 }];
+  applyRetention(events, { maxEvents: 1 });
+  assert.deepEqual(events, [{ i: 1 }, { i: 2 }, { i: 3 }]); // untouched
+});
+
+// ── prune — the persisted-seam compaction (in-memory rewrite) ────────────────
+
+test('prune with a count cap rewrites the file to the newest N retained events', async () => {
+  const f = inMemoryFile();
+  const store = createNdjsonStore(f);
+  await store.appendEvents([{ i: 1 }, { i: 2 }, { i: 3 }, { i: 4 }, { i: 5 }]);
+  const res = await store.prune({ maxEvents: 2 });
+  assert.equal(res.before, 5);
+  assert.equal(res.after, 2);
+  assert.equal(res.pruned, 3);
+  assert.equal(res.rewrote, true);
+  // Newest 2 (append order) retained; the file now holds exactly them.
+  assert.deepEqual(f.read(), [{ i: 4 }, { i: 5 }]);
+});
+
+test('prune with an age window drops aged-out events and rewrites the rest', async () => {
+  const f = inMemoryFile();
+  const store = createNdjsonStore(f);
+  const NOW = 10_000;
+  await store.appendEvents([
+    { i: 'old', timestamp: NOW - 4000 },
+    { i: 'fresh', timestamp: NOW - 500 },
+  ]);
+  const res = await store.prune({ maxAgeMs: 1000, now: NOW });
+  assert.equal(res.pruned, 1);
+  assert.deepEqual(f.read(), [{ i: 'fresh', timestamp: NOW - 500 }]);
+});
+
+test('prune performs NO rewrite when nothing exceeds the bound (no churn, no disk write)', async () => {
+  const f = inMemoryFile();
+  let rewriteCalls = 0;
+  const store = createNdjsonStore({
+    sink: f.sink,
+    source: f.source,
+    rewrite: async (t) => {
+      rewriteCalls += 1;
+      await f.rewrite(t);
+    },
+  });
+  await store.appendEvents([{ i: 1 }, { i: 2 }]);
+  const res = await store.prune({ maxEvents: 10 }); // bound not exceeded
+  assert.equal(rewriteCalls, 0, 'rewrite seam was not invoked');
+  assert.equal(res.rewrote, false);
+  assert.equal(res.pruned, 0);
+  assert.equal(res.after, 2);
+});
+
+test('prune rewrites the file to EMPTY NDJSON when every event is aged out', async () => {
+  const f = inMemoryFile();
+  let writtenText = 'UNSET';
+  const store = createNdjsonStore({
+    sink: f.sink,
+    source: f.source,
+    rewrite: async (t) => {
+      writtenText = t;
+      await f.rewrite(t);
+    },
+  });
+  const NOW = 10_000;
+  await store.appendEvents([{ timestamp: 1 }, { timestamp: 2 }]);
+  const res = await store.prune({ maxAgeMs: 1000, now: NOW });
+  assert.equal(res.pruned, 2);
+  assert.equal(res.rewrote, true);
+  assert.equal(writtenText, '', 'an emptied store is rewritten as empty NDJSON');
+  assert.deepEqual(f.read(), []);
+});
+
+test('prune on a store WITHOUT a rewrite seam rejects loud (fail loud, not a silent no-op)', async () => {
+  const store = createNdjsonStore({ sink: async () => {}, source: () => [] }); // no rewrite
+  // Async rejection (not sync throw) so the server trigger's Promise.catch recovers.
+  await assert.rejects(() => store.prune({ maxEvents: 1 }), /rewrite/);
+});
+
+test('prune on a store WITHOUT a source seam rejects loud', async () => {
+  const store = createNdjsonStore({ sink: async () => {} }); // write-only
+  await assert.rejects(() => store.prune({ maxEvents: 1 }), /source/);
+});
+
+test('after prune, readEvents reflects the retained set (post-prune round-trip)', async () => {
+  const f = inMemoryFile();
+  const store = createNdjsonStore(f);
+  await store.appendEvents([{ i: 1 }, { i: 2 }, { i: 3 }, { i: 4 }]);
+  await store.prune({ maxEvents: 2 });
+  // readEvents is the exact surface /summary uses — it must see the post-prune set.
+  assert.deepEqual(await store.readEvents(), [{ i: 3 }, { i: 4 }]);
+});
+
+test('prune serializes against a concurrent append — an appended-during-compaction event is never lost', async () => {
+  // A SLOW rewrite: it stalls until we release a gate, so we can start a
+  // concurrent append WHILE the compaction is mid-flight and prove serialization
+  // keeps the new event (it is not clobbered by the in-place rewrite).
+  const f = inMemoryFile();
+  let release;
+  const rewriteGate = new Promise((r) => {
+    release = r;
+  });
+  const store = createNdjsonStore({
+    sink: f.sink,
+    source: f.source,
+    rewrite: async (t) => {
+      await rewriteGate;
+      await f.rewrite(t);
+    },
+  });
+
+  // Seed 3 events, then compact to a count cap of 2 (drops the oldest). The
+  // prune is started WITHOUT awaiting — it stalls inside the slow rewrite.
+  await store.appendEvents([{ i: 1 }, { i: 2 }, { i: 3 }]);
+  const pruneP = store.prune({ maxEvents: 2 });
+  // Yield so prune reaches the rewrite gate (reads, computes, stalls).
+  await new Promise((r) => setTimeout(r, 0));
+
+  // Append a 4th event WHILE the compaction is mid-flight (it was NOT in the
+  // snapshot prune read).
+  const appendP = store.appendEvents([{ i: 4 }]);
+
+  release(); // let the rewrite finish; both ops now complete in serialized order
+  await Promise.all([pruneP, appendP]);
+
+  // The 4th event must survive — serialization queued the append AFTER the
+  // rewrite instead of letting the rename drop it.
+  const finalIds = f.read().map((e) => e.i);
+  assert.ok(finalIds.includes(4), `appended-during-prune event not lost (got ${JSON.stringify(finalIds)})`);
 });

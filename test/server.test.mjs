@@ -10,9 +10,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, DEFAULT_MAX_EVENTS } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
-import { createNdjsonStore } from '../store.mjs';
+import { createNdjsonStore, parseNdjson } from '../store.mjs';
 
 // A fake IncomingMessage: an EventEmitter whose body chunks emit on nextTick
 // (mimicking a real readable stream). readBody consumes via .on('data'|'end').
@@ -276,4 +276,291 @@ test('GET /summary on a write-only (source-less) store → 500, not a crash', as
   await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
   assert.equal(res.statusCode, 500);
   assert.match(JSON.parse(res.body).error, /source|summary/);
+});
+
+// ── RETENTION (WARDEN-579) ────────────────────────────────────────────────────
+// The maintenance trigger keeps the persisted store bounded. It runs prune OFF
+// the request path on a debounced (>=1 min), re-entrancy-guarded cadence — never
+// a synchronous rewrite per event (WARDEN-88). Below: the trigger is driven with
+// an INJECTED fake clock + scheduler (no real timer), and the handler is proven
+// to record appends fire-and-forget. Still ZERO real fs, ZERO real network.
+
+// A fake scheduler + clock: setTimer/clearTimer manage an in-memory queue; now()
+// is a fixed, controllable value. Lets the trigger's debounce/re-entrancy logic be
+// exercised deterministically without a single real setTimeout.
+function fakeClock() {
+  const timers = [];
+  let nowVal = 0;
+  return {
+    setTimer: (fn) => {
+      const id = { fn };
+      timers.push(id);
+      return id;
+    },
+    clearTimer: (id) => {
+      const i = timers.indexOf(id);
+      if (i >= 0) timers.splice(i, 1);
+    },
+    now: () => nowVal,
+    setNow: (v) => {
+      nowVal = v;
+    },
+    pending: () => timers.length,
+    flushAll: () => {
+      while (timers.length) timers.shift().fn();
+    },
+    flushNext: () => {
+      if (timers.length) timers.shift().fn();
+    },
+  };
+}
+
+// An in-memory FILE MIRROR: sink appends, source parses, rewrite replaces —
+// exactly the production fileSink/fileSource/fileRewrite contract, no disk.
+function inMemoryFile() {
+  let text = '';
+  return {
+    sink: async (line) => {
+      text += `${line}\n`;
+    },
+    source: () => parseNdjson(text),
+    rewrite: async (t) => {
+      text = t;
+    },
+    read: () => parseNdjson(text),
+  };
+}
+
+function storeWithRetentionSpy({ pruneImpl } = {}) {
+  const calls = [];
+  return {
+    calls,
+    prune: async (opts) => {
+      calls.push(opts);
+      if (pruneImpl) await pruneImpl(opts);
+      return { before: 0, after: 0, pruned: 0, rewrote: false };
+    },
+  };
+}
+
+test('retention DEFAULT is bounded — DEFAULT_MAX_EVENTS is a finite positive count cap (the unbounded-growth bug is fixed by default)', () => {
+  assert.ok(
+    typeof DEFAULT_MAX_EVENTS === 'number' && DEFAULT_MAX_EVENTS > 0 && Number.isFinite(DEFAULT_MAX_EVENTS),
+    'the default count cap must be a finite positive bound, never unbounded'
+  );
+});
+
+test('retention: afterAppend BELOW the count bound arms NO prune (no per-event rewrite on the request path)', () => {
+  const store = storeWithRetentionSpy();
+  const clock = fakeClock();
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 100,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  trigger.afterAppend(5);
+  trigger.afterAppend(10);
+  assert.equal(store.calls.length, 0, 'no prune ran');
+  assert.equal(clock.pending(), 0, 'no debounce timer was armed');
+});
+
+test('retention: crossing the count bound arms ONE debounced prune — a burst coalesces into a single prune', () => {
+  const store = storeWithRetentionSpy();
+  const clock = fakeClock();
+  clock.setNow(12345);
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 10,
+    maxAgeMs: 3600_000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  trigger.afterAppend(5);
+  assert.equal(clock.pending(), 0, 'below the bound: not armed');
+  trigger.afterAppend(6); // 11 total → crosses 10
+  assert.equal(clock.pending(), 1, 'crossed the bound: one debounce timer armed');
+  trigger.afterAppend(50); // more appends while armed
+  assert.equal(clock.pending(), 1, 'a burst coalesces into the SAME single timer');
+  clock.flushAll();
+  assert.equal(store.calls.length, 1, 'exactly one prune ran');
+  assert.deepEqual(store.calls[0], { maxEvents: 10, maxAgeMs: 3600_000, now: 12345 });
+});
+
+test('retention: a prune mid-flight blocks a SECOND concurrent prune (re-entrancy guard)', async () => {
+  let resolvePrune;
+  const inFlight = new Promise((r) => {
+    resolvePrune = r;
+  });
+  const calls = [];
+  const store = {
+    prune: async (opts) => {
+      calls.push(opts);
+      await inFlight;
+    },
+  };
+  const clock = fakeClock();
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 1,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  trigger.afterAppend(1); // arm
+  clock.flushNext(); // fires flush → starts a prune (stalls on `inFlight`)
+  assert.equal(calls.length, 1, 'first prune started');
+
+  // While that prune is mid-flight, arm + flush again — must NOT start a 2nd prune.
+  trigger.afterAppend(1);
+  clock.flushAll();
+  assert.equal(calls.length, 1, 'no concurrent prune started while one is in flight');
+
+  resolvePrune();
+  await inFlight;
+  await new Promise((r) => setTimeout(r, 0)); // let the .finally re-arm settle
+  assert.equal(calls.length, 1, 'still one — the re-armed timer was not flushed');
+});
+
+test('retention: sweep() arms a debounced prune unconditionally (the age-expiry path on a quiet store)', () => {
+  const store = storeWithRetentionSpy();
+  const clock = fakeClock();
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 0, // count disabled → afterAppend never arms
+    maxAgeMs: 1000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  trigger.afterAppend(999);
+  assert.equal(clock.pending(), 0, 'with count disabled, appends do not arm');
+  trigger.sweep();
+  assert.equal(clock.pending(), 1, 'sweep arms a debounced prune');
+  clock.flushAll();
+  assert.equal(store.calls.length, 1);
+});
+
+test('retention: cancel() clears a pending debounced prune before it fires', () => {
+  const store = storeWithRetentionSpy();
+  const clock = fakeClock();
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 1,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  trigger.afterAppend(1);
+  assert.equal(clock.pending(), 1);
+  trigger.cancel();
+  assert.equal(clock.pending(), 0, 'pending timer cleared');
+  clock.flushAll(); // nothing to flush
+  assert.equal(store.calls.length, 0, 'no prune ran');
+});
+
+test('retention: a prune FAILURE is swallowed — it never crashes the receiver', async () => {
+  const store = { prune: async () => { throw new Error('disk full'); } };
+  const clock = fakeClock();
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 1,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  trigger.afterAppend(1);
+  assert.doesNotThrow(() => clock.flushAll(), 'flushing a failed prune must not throw');
+  await new Promise((r) => setTimeout(r, 0)); // let the rejected prune's .catch settle
+});
+
+test('retention: ingest below the count bound triggers NO rewrite (the request path performs only the fast append)', async () => {
+  const f = inMemoryFile();
+  let rewriteCalls = 0;
+  const store = createNdjsonStore({
+    sink: f.sink,
+    source: f.source,
+    rewrite: async (t) => {
+      rewriteCalls += 1;
+      await f.rewrite(t);
+    },
+  });
+  const clock = fakeClock();
+  const retention = createRetentionTrigger(store, {
+    maxEvents: 1000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, retention });
+
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  assert.equal(res.statusCode, 202);
+  assert.equal(rewriteCalls, 0, 'no rewrite seam call on a sub-bound ingest');
+  assert.equal(clock.pending(), 0, 'no prune armed on a sub-bound ingest');
+});
+
+test('retention: sustained ingest past the count bound arms a debounced prune that compacts the store to the cap', async () => {
+  const f = inMemoryFile();
+  const store = createNdjsonStore(f);
+  const clock = fakeClock();
+  const retention = createRetentionTrigger(store, {
+    maxEvents: 3,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, retention });
+
+  // Ingest 4 one-event batches; maxEvents=3 → a debounced prune is armed once the
+  // bound is crossed, but it has NOT fired yet (the response path does not flush it).
+  for (let i = 0; i < 4; i++) {
+    const res = fakeRes();
+    await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+    assert.equal(res.statusCode, 202);
+  }
+  assert.equal(clock.pending(), 1, 'a debounced prune is armed once the bound is crossed');
+  assert.equal(f.read().length, 4, 'pre-prune: all 4 events still persisted');
+
+  clock.flushAll(); // fire the off-path, debounced prune
+  await new Promise((r) => setTimeout(r, 0)); // let the async compaction settle
+
+  assert.equal(f.read().length, 3, 'post-prune: store bounded to the count cap');
+});
+
+test('retention: /summary stays self-consistent over a pruned store — aggregates reflect the retained set only', async () => {
+  const f = inMemoryFile();
+  const store = createNdjsonStore(f);
+  const handler = createRequestHandler({ store });
+
+  // Seed a known mix: 3 errors (2 distinct names) + 1 crash across a time window.
+  await store.appendEvents([
+    { schemaVersion: 1, type: 'error', runtime: 'main', timestamp: 100, name: 'TypeError', message: 'm', frames: [] },
+    { schemaVersion: 1, type: 'error', runtime: 'main', timestamp: 200, name: 'RangeError', message: 'm', frames: [] },
+    { schemaVersion: 1, type: 'error', runtime: 'main', timestamp: 300, name: 'TypeError', message: 'm', frames: [] },
+    { schemaVersion: 1, type: 'crash', runtime: 'renderer', timestamp: 400, reason: 'oom' },
+  ]);
+
+  // Prune to the newest 2 by count → drops the two oldest errors.
+  await store.prune({ maxEvents: 2 });
+
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+
+  // Retained = the last 2 appended: error@300 (TypeError) + crash@400.
+  assert.equal(body.total, 2);
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0 });
+  assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }], 'RangeError was pruned');
+  assert.deepEqual(body.schemaVersions, { '1': 2 });
+  assert.equal(body.firstSeen, 300, 'firstSeen bounds the RETAINED window (100 was pruned)');
+  assert.equal(body.lastSeen, 400);
+});
+
+test('retention: an absent retention dep leaves the handler unchanged (today behavior — no afterAppend call)', async () => {
+  const captured = [];
+  const store = createNdjsonStore({ sink: async (l) => void captured.push(l) });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } }); // no retention
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  assert.equal(res.statusCode, 202);
+  assert.equal(captured.length, 1);
 });
