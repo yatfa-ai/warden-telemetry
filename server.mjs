@@ -23,17 +23,18 @@
 //                  periodic sweep expires old events even on a quiet store.
 //
 // The receiver owns its routes: POST /ingest (write), GET /summary (read —
-// the maintainer aggregate surface, WARDEN-567), and GET /capabilities (the
+// the maintainer aggregate surface, WARDEN-567), GET /capabilities (the
 // config-time verification surface, WARDEN-595 — a client's Settings "Test
 // connection" probe reads it to confirm reachability + schema match + auth
-// before relying on the receiver). The GET /summary aggregate also carries a
-// bounded `rejections` tally (WARDEN-591) — counts by status of the rejections
-// that already happen at every rejection site, so a maintainer can tell
-// "traffic is arriving and being hard-rejected" from "no traffic at all" —
-// AND a bounded `timeline` distribution (WARDEN-603) — event counts per time
-// bucket over a rolling recent window, so a maintainer can distinguish a recent
-// volume spike (a regression / deploy) from a long-running baseline. The client
-// POSTs the batch verbatim to its configured endpointUrl (e.g.
+// before relying on the receiver), and GET /events (read — the maintainer
+// full-fidelity drill-down surface, WARDEN-599). The GET /summary aggregate
+// also carries a bounded `rejections` tally (WARDEN-591) — counts by status of
+// the rejections that already happen at every rejection site, so a maintainer
+// can tell "traffic is arriving and being hard-rejected" from "no traffic at
+// all" — AND a bounded `timeline` distribution (WARDEN-603) — event counts per
+// time bucket over a rolling recent window, so a maintainer can distinguish a
+// recent volume spike (a regression / deploy) from a long-running baseline.
+// The client POSTs the batch verbatim to its configured endpointUrl (e.g.
 // http://host:7421/ingest) and never rewrites the host, so these route paths
 // are the receiver's to define.
 
@@ -44,6 +45,7 @@ import { SCHEMA_VERSION, validateEvent } from './schema.ts';
 import { createNdjsonStore, fileSink, fileSource, fileRewrite } from './store.mjs';
 import { ingest } from './ingest.mjs';
 import { summarize, summarizeTimeline } from './summary.mjs';
+import { selectEvents } from './events.mjs';
 
 export const DEFAULT_PORT = 7421;
 export const DEFAULT_STORE_PATH = new URL('./telemetry.ndjson', import.meta.url).pathname;
@@ -55,6 +57,14 @@ export const SUMMARY_PATH = '/summary';
 // read: returns the receiver's SCHEMA_VERSION + whether auth is required; reads
 // no body, persists nothing.
 export const CAPABILITIES_PATH = '/capabilities';
+// The maintainer full-fidelity drill-down surface (WARDEN-599). Where GET /summary
+// returns AGGREGATES (counts only — diagnostic fields discarded), GET /events
+// returns the recent persisted EVENTS THEMSELVES, BOUNDED to a newest-N window
+// with optional type + since filters — so a maintainer can inspect the actual
+// error/crash/stall payloads /summary only counts, in-product. Pure read over the
+// existing readEvents() seam; the bound keeps a near-full store from yielding a
+// multi-MB response. Inherits the AUTH_TOKEN gate below like every other route.
+export const EVENTS_PATH = '/events';
 
 // ── RETENTION CONFIG (WARDEN-579) ────────────────────────────────────────────
 // The persisted store is bounded by default (unbounded growth was the bug). The
@@ -375,7 +385,8 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
       }
     }
 
-    const { pathname } = new URL(req.url, 'http://localhost');
+    const url = new URL(req.url, 'http://localhost');
+    const { pathname, searchParams } = url;
 
     // GET /summary — the maintainer read surface (WARDEN-567). Returns AGGREGATES
     // of the already-validated, already-redacted events persisted by POST /ingest
@@ -431,6 +442,41 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
         schemaVersion: schema.SCHEMA_VERSION,
         authRequired: Boolean(authToken),
       });
+    }
+
+    // GET /events — the maintainer full-fidelity drill-down surface (WARDEN-599).
+    // Returns the recent persisted EVENTS THEMSELVES (not aggregates) — the
+    // diagnostic payloads /summary deliberately discards: an ErrorEvent's message +
+    // frames, a CrashEvent's reason, a StallEvent's lagMs. BOUNDED to a newest-N
+    // window (default 100, hard cap 200) so a near-full store (up to the 10000
+    // retention cap) can never yield a multi-MB response, with optional ?type= and
+    // ?since= filters. No request body is read; nothing is persisted.
+    //
+    // Reads ONLY already-persisted, already-schema-validated, already-client-
+    // redacted events via the existing readEvents() seam — no new collection, no
+    // re-collection, no third party, no server-side redaction, no tier expansion.
+    // The identical trust posture as /summary, full-fidelity instead of aggregate.
+    //
+    // Gated by the auth block above like every other route (the read surface
+    // inherits the shared secret — auth is NOT re-implemented here). Unknown method
+    // on this path still falls through to the 404 below.
+    if (req.method === 'GET' && pathname === EVENTS_PATH) {
+      try {
+        const events = await store.readEvents();
+        // selectEvents(events, query) is a PURE single-arg-of-the-array function
+        // (sibling of summarize); the handler composes it with the parsed query,
+        // exactly as it composes summarize. `total` is the FULL persisted count
+        // (pre-bound) so a maintainer sees how much the window is a window OF; the
+        // bounded `events` array is the newest-N matching the filters.
+        const selected = selectEvents(events, {
+          type: searchParams.get('type') ?? undefined,
+          limit: searchParams.has('limit') ? Number(searchParams.get('limit')) : undefined,
+          since: searchParams.has('since') ? Number(searchParams.get('since')) : undefined,
+        });
+        return sendJson(res, 200, { events: selected, total: events.length });
+      } catch (e) {
+        return sendJson(res, 500, { error: `could not read events: ${e?.message ?? e}` });
+      }
     }
 
     // Route: only POST /ingest is ingest. Anything else is a 404 (so a maintainer
@@ -538,7 +584,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
         ? `retention: max ${maxEv} events${maxAh > 0 ? `, ${maxAh}h age` : ''}`
         : 'retention: OFF (unbounded — not recommended)';
     console.log(
-      `warden-telemetry receiver listening on :${port} (POST ${INGEST_PATH}, GET ${SUMMARY_PATH}, GET ${CAPABILITIES_PATH}; store: ${storePath}; ${authed}; ${retention})`
+      `warden-telemetry receiver listening on :${port} (POST ${INGEST_PATH}, GET ${SUMMARY_PATH}, GET ${CAPABILITIES_PATH}, GET ${EVENTS_PATH}; store: ${storePath}; ${authed}; ${retention})`
     );
   });
 }
