@@ -367,6 +367,102 @@ test('all three GET read routes are served by the SAME createRequestHandler (no 
   assert.equal(ingestRes.statusCode, 202, 'POST /ingest still routes through the handler');
 });
 
+// ── TIMELINE DISTRIBUTION (WARDEN-603) ────────────────────────────────────────
+// The bounded temporal-distribution field on GET /summary — event counts per time
+// bucket over a rolling recent window, so a maintainer can distinguish a recent
+// volume spike (a regression / deploy) from a long-running baseline. Mirrors the
+// rejections tally's injected-seam discipline: the handler takes an OPTIONAL `now`
+// (default Date.now) so the read-the-shape-with-a-fake-clock tests below stay
+// deterministic. Still ZERO real fs, ZERO real network — driven with fake req/res.
+//
+// The handler composes summarizeTimeline(events, { now }) with its DEFAULT window
+// (24h) and maxBuckets (48) → bucketMs = 1_800_000 (30 min). Every test below seeds
+// timestamps against a fake now = 86_400_000 so the window is exactly [0, 86_400_000]
+// and a timestamp maps to bucket floor(ts / 1_800_000) — the arithmetic is exact and
+// legible, never dependent on the real wall clock.
+
+test('GET /summary on an empty store carries a ZEROED timeline (no false alarm — additive field always present)', async () => {
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.ok(body.timeline, 'timeline field is present (additive — carried on every response)');
+  assert.deepEqual(body.timeline.buckets, [], 'no buckets on an empty store');
+  assert.equal(body.timeline.bucketMs, 1_800_000, 'bucketMs conveys the granularity (24h window / 48 buckets)');
+});
+
+test('GET /summary timeline reflects a known seeded time spread — a recent spike vs an earlier baseline', async () => {
+  // Seed a SPIKE (3 events in the newest bucket, one of them exactly == now so the
+  // top-boundary fold is exercised) plus a single earlier baseline event, then read
+  // the distribution back. bucket 1 = [1.8M, 3.6M); bucket 47 = [84.6M, 86.4M).
+  const newestStart = 84_600_000; // bucket 47
+  const store = readableStore([
+    { ...errorEvent, timestamp: 1_800_000 },      // bucket 1 (baseline)
+    { ...errorEvent, timestamp: newestStart },     // bucket 47 (spike)
+    { ...errorEvent, timestamp: newestStart + 1 }, // bucket 47 (spike)
+    { ...crashEvent, timestamp: 86_400_000 },      // bucket 47 (=== now → newest via boundary fold)
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const { timeline } = JSON.parse(res.body);
+  assert.equal(timeline.buckets.length, 2, 'two distinct buckets: baseline + spike');
+  assert.deepEqual(timeline.buckets, [
+    { bucketStart: 1_800_000, bucketEnd: 3_600_000, count: 1 },   // baseline
+    { bucketStart: 84_600_000, bucketEnd: 86_400_000, count: 3 }, // recent spike (newest)
+  ]);
+  assert.equal(timeline.bucketMs, 1_800_000);
+});
+
+test('GET /summary timeline never echoes raw events or extended-tier names (counts only — in-window event)', async () => {
+  // The seeded event is IN the rolling window (so the timeline actually fires a
+  // bucket) yet carries extended-tier identifiers + a raw message. The timeline
+  // reads ONLY event.timestamp and emits a COUNT — there is no path by which an
+  // identifier could reach the distribution. (Parity with the body-level trust-model
+  // test above, but exercised against a bucket that actually fired.)
+  const store = readableStore([
+    {
+      ...errorEvent,
+      timestamp: 1_800_000,
+      message: 'super secret stack detail',
+      chatName: 'Refactor auth',
+      sessionName: 'claude-7b3a2f1',
+    },
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const { timeline } = JSON.parse(res.body);
+  assert.equal(timeline.buckets.length, 1, 'the in-window event fired a bucket');
+  const json = JSON.stringify(timeline);
+  assert.equal(json.includes('Refactor auth'), false, 'no chatName in timeline');
+  assert.equal(json.includes('claude-7b3a2f1'), false, 'no sessionName in timeline');
+  assert.equal(json.includes('super secret stack detail'), false, 'no message in timeline');
+  assert.equal(json.includes('TypeError'), false, 'no error name either — timestamp is the only field read');
+});
+
+test('GET /summary carries the timeline field for a handler wired WITHOUT an explicit now (backward-compatible additive shape)', async () => {
+  // A handler wired the pre-WARDEN-603 way — { store }, no `now` — still carries the
+  // additive `timeline` field (defaulting to the real clock). The seeded events use
+  // epoch-near-zero timestamps (5 and 9, far outside any real 24h window), so the
+  // timeline is zeroed — proving the field is ALWAYS present with a STABLE shape,
+  // never an absent key that would break a caller composed the old way. (Deterministic:
+  // bucketMs is constant and 5/9 are always pre-window regardless of the real clock.)
+  const store = readableStore([errorEvent, crashEvent]); // timestamps 5 and 9
+  const handler = createRequestHandler({ store }); // no `now` → real clock (default)
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.ok(body.timeline, 'timeline field present even without an explicit now');
+  assert.ok(Array.isArray(body.timeline.buckets), 'buckets is always an array');
+  assert.deepEqual(body.timeline.buckets, [], 'timestamps 5/9 are far pre-window → zeroed distribution');
+  assert.equal(body.timeline.bucketMs, 1_800_000, 'bucketMs always conveyed');
+});
+
 // ── RETENTION (WARDEN-579) ────────────────────────────────────────────────────
 // The maintenance trigger keeps the persisted store bounded. It runs prune OFF
 // the request path on a debounced (>=1 min), re-entrancy-guarded cadence — never

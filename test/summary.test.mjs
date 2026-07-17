@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize } from '../summary.mjs';
+import { summarize, summarizeTimeline } from '../summary.mjs';
 
 // Canonical valid events (verbatim shapes ingest persists — one per base type).
 const validError = {
@@ -180,4 +180,150 @@ test('malformed entries (null / primitives / non-objects) are skipped, not fatal
   assert.equal(s.total, 2);
   assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 0 });
   assert.equal(s.topErrorNames.length, 1);
+});
+
+// ── TIMELINE — bounded temporal distribution (WARDEN-603) ─────────────────────
+// The sibling of summarize(): a PURE function of an event array + an injected
+// `now` (no fs, no network, no deps) — event counts per time bucket over a
+// rolling recent window. Driven directly with a FAKE `now`, mirroring
+// createRejectionTally({ now: () => 0 }) in test/server.test.mjs:578. Small
+// windowMs/maxBuckets make the bucket arithmetic exact and legible.
+
+test('timeline: empty input → zeroed shape (no false alarm on a quiet store)', () => {
+  const t = summarizeTimeline([], { now: () => 10_000_000 });
+  assert.deepEqual(t.buckets, []);
+  assert.ok(t.bucketMs > 0, 'bucketMs conveys the granularity even when empty');
+});
+
+test('timeline: non-array input is treated as empty (defensive — never throws)', () => {
+  const opts = { now: () => 0 };
+  assert.deepEqual(summarizeTimeline(undefined, opts), summarizeTimeline([], opts));
+  assert.deepEqual(summarizeTimeline(null, opts), summarizeTimeline([], opts));
+  assert.deepEqual(summarizeTimeline('nope', opts), summarizeTimeline([], opts));
+});
+
+test('timeline: events within the window land in the correct time bucket', () => {
+  // window [0, 100], 10 buckets of width 10 → bucket 0 = [0,10), bucket 9 = [90,100).
+  const t = summarizeTimeline(
+    [{ timestamp: 5 }, { timestamp: 95 }, { timestamp: 50 }],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    { bucketStart: 0, bucketEnd: 10, count: 1 },
+    { bucketStart: 50, bucketEnd: 60, count: 1 },
+    { bucketStart: 90, bucketEnd: 100, count: 1 },
+  ]);
+  assert.equal(t.bucketMs, 10);
+});
+
+test('timeline: multiple events in the same bucket accumulate into one count', () => {
+  const t = summarizeTimeline(
+    [{ timestamp: 1 }, { timestamp: 2 }, { timestamp: 9 }],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [{ bucketStart: 0, bucketEnd: 10, count: 3 }]);
+});
+
+test('timeline: buckets are sorted chronologically (oldest → newest)', () => {
+  // feed events out of chronological order
+  const t = summarizeTimeline(
+    [{ timestamp: 95 }, { timestamp: 5 }, { timestamp: 50 }],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(
+    t.buckets.map((b) => b.bucketStart),
+    [0, 50, 90]
+  );
+});
+
+test('timeline: an event timestamped exactly `now` lands in the newest bucket', () => {
+  const t = summarizeTimeline([{ timestamp: 100 }], {
+    now: () => 100,
+    windowMs: 100,
+    maxBuckets: 10,
+  });
+  assert.deepEqual(t.buckets, [{ bucketStart: 90, bucketEnd: 100, count: 1 }]);
+});
+
+test('timeline: events older than the rolling window are EXCLUDED from the distribution', () => {
+  // window [100, 200]; an event at 50 (before windowStart) is excluded — it is
+  // still counted by summarize()'s total/firstSeen (the full retained set), just
+  // not in the recent-shape distribution.
+  const t = summarizeTimeline(
+    [{ timestamp: 50 }, { timestamp: 150 }],
+    { now: () => 200, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [{ bucketStart: 150, bucketEnd: 160, count: 1 }]);
+});
+
+test('timeline: future timestamps (client/server clock skew) are excluded from the distribution', () => {
+  const t = summarizeTimeline(
+    [{ timestamp: 250 }, { timestamp: 150 }],
+    { now: () => 200, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [{ bucketStart: 150, bucketEnd: 160, count: 1 }]);
+});
+
+test('timeline: the window ROLLS with `now` — the same event ages out as now advances', () => {
+  // at now=100, ts=50 is in [0,100]; at now=1_000_000 it is far outside the window.
+  const events = [{ timestamp: 50 }];
+  assert.equal(summarizeTimeline(events, { now: () => 100, windowMs: 100, maxBuckets: 10 }).buckets.length, 1);
+  assert.deepEqual(
+    summarizeTimeline(events, { now: () => 1_000_000, windowMs: 100, maxBuckets: 10 }).buckets,
+    []
+  );
+});
+
+test('timeline: bucket count is capped at maxBuckets however many events span the window', () => {
+  // 200 distinct timestamps across the window would naively make 200 buckets;
+  // they collapse into at most maxBuckets grid slots (the 10k-over-months bound).
+  const events = [];
+  for (let i = 0; i < 200; i++) events.push({ timestamp: i }); // timestamps 0..199
+  const t = summarizeTimeline(events, { now: () => 200, windowMs: 200, maxBuckets: 20 });
+  assert.ok(t.buckets.length <= 20, 'never more than maxBuckets buckets');
+  assert.equal(t.buckets.length, 20, 'every grid slot is hit → exactly maxBuckets');
+  // no event is lost: the bucket counts sum to the in-window total
+  assert.equal(
+    t.buckets.reduce((sum, b) => sum + b.count, 0),
+    200
+  );
+});
+
+test('timeline: non-finite / malformed timestamps are ignored (skip-robust, never fatal)', () => {
+  const t = summarizeTimeline(
+    [{ timestamp: Infinity }, { timestamp: NaN }, { timestamp: 'nope' }, { timestamp: 50 }, null, 42, 'str'],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [{ bucketStart: 50, bucketEnd: 60, count: 1 }]);
+});
+
+test('timeline: never echoes raw events or extended-tier identifiers (timestamps only)', () => {
+  const t = summarizeTimeline(
+    [
+      {
+        ...validError,
+        timestamp: 50,
+        message: 'super secret stack detail',
+        chatName: 'Refactor auth',
+        sessionName: 'claude-7b3a2f1',
+      },
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  const json = JSON.stringify(t);
+  assert.equal(json.includes('Refactor auth'), false, 'no chatName in timeline');
+  assert.equal(json.includes('claude-7b3a2f1'), false, 'no sessionName in timeline');
+  assert.equal(json.includes('super secret stack detail'), false, 'no message in timeline');
+  assert.equal(json.includes('TypeError'), false, 'no error name either — timestamps are the only field read');
+});
+
+test('timeline: a degenerate config (non-positive window / maxBuckets) collapses to a zeroed shape', () => {
+  assert.deepEqual(
+    summarizeTimeline([{ timestamp: 5 }], { now: () => 100, windowMs: 0, maxBuckets: 10 }),
+    { buckets: [], bucketMs: 0 }
+  );
+  assert.deepEqual(
+    summarizeTimeline([{ timestamp: 5 }], { now: () => 100, windowMs: 100, maxBuckets: 0 }),
+    { buckets: [], bucketMs: 0 }
+  );
 });
