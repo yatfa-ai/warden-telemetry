@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, DEFAULT_MAX_EVENTS } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, DEFAULT_MAX_EVENTS } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 
@@ -563,4 +563,239 @@ test('retention: an absent retention dep leaves the handler unchanged (today beh
   await handler(fakeReq({ headers: headersV1, body: validBody }), res);
   assert.equal(res.statusCode, 202);
   assert.equal(captured.length, 1);
+});
+
+// ── REJECTIONS TALLY (WARDEN-591) ─────────────────────────────────────────────
+// The in-memory, receiver-local tally surfaces "traffic arriving and being
+// hard-rejected" vs "no traffic at all" in GET /summary. It mirrors the retention
+// trigger's injected-seam discipline (an optional dep + an injected `now` for a
+// fake clock). Bounded: counts by status + a single most-recent sample, never one
+// record per rejection. Below: the tally is driven directly with an INJECTED fake
+// clock, then the handler is proven to record at EVERY rejection site (the
+// auth-gate 401, the 404, the body-read 400, AND the 400/415/422 from ingest).
+
+test('rejections tally: a fresh tally snapshots to the zeroed shape (parity with an idle receiver)', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  assert.deepEqual(tally.snapshot(), {
+    total: 0,
+    byStatus: {},
+    lastStatus: null,
+    lastReason: null,
+    lastSeen: null,
+  });
+});
+
+test('rejections tally: record() accumulates per-status counts + tracks the most-recent occurrence', () => {
+  let clock = 1000;
+  const tally = createRejectionTally({ now: () => clock });
+  tally.record({ status: 415, reason: 'unsupported telemetry schema version: expected "1", got "2"' });
+  clock = 2000;
+  tally.record({ status: 415, reason: 'unsupported telemetry schema version: expected "1", got "3"' });
+  clock = 3000;
+  tally.record({ status: 422, reason: 'one or more events failed schema validation; batch rejected' });
+
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 3);
+  assert.deepEqual(snap.byStatus, { '415': 2, '422': 1 });
+  assert.equal(snap.lastStatus, 422, 'lastStatus is the most-recently-recorded status');
+  assert.equal(
+    snap.lastReason,
+    'one or more events failed schema validation; batch rejected',
+    'lastReason is the single most-recent sample'
+  );
+  assert.equal(snap.lastSeen, 3000, 'lastSeen is the injected now() of the most-recent record');
+});
+
+test('rejections tally: snapshot() is a stable point-in-time copy — a later record does not mutate it', () => {
+  let clock = 5000;
+  const tally = createRejectionTally({ now: () => clock });
+  tally.record({ status: 401, reason: 'unauthorized' });
+  const snap = tally.snapshot();
+  clock = 6000;
+  tally.record({ status: 404, reason: 'not found' });
+  // the earlier snapshot is unchanged by the later record
+  assert.deepEqual(snap, {
+    total: 1,
+    byStatus: { '401': 1 },
+    lastStatus: 401,
+    lastReason: 'unauthorized',
+    lastSeen: 5000,
+  });
+  // a fresh snapshot reflects the new state
+  assert.equal(tally.snapshot().total, 2);
+  assert.equal(tally.snapshot().lastStatus, 404);
+});
+
+test('rejections tally: BOUNDED — many records with varied reasons never grow unbounded (counts by status, one sample)', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  for (let i = 0; i < 1000; i++) {
+    tally.record({ status: 415, reason: `drift reason #${i}` }); // 1000 distinct reasons
+  }
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 1000);
+  assert.deepEqual(snap.byStatus, { '415': 1000 }, 'one count key — not 1000 entries');
+  assert.equal(snap.lastReason, 'drift reason #999', 'only the single most-recent sample reason is retained');
+});
+
+test('rejections tally: record() with no status is a defensive no-op (never throws)', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  tally.record({ reason: 'no status' });
+  tally.record({});
+  assert.deepEqual(tally.snapshot(), {
+    total: 0,
+    byStatus: {},
+    lastStatus: null,
+    lastReason: null,
+    lastSeen: null,
+  });
+});
+
+test('rejections tally: record() with a non-string reason stores null (no unbounded/garbage reason)', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  tally.record({ status: 400, reason: 12345 }); // wrong type — not a payload string
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 1);
+  assert.equal(snap.lastStatus, 400);
+  assert.equal(snap.lastReason, null, 'a non-string reason is not retained');
+});
+
+// ── REJECTIONS AGGREGATE surfaced in GET /summary (WARDEN-591) ─────────────────
+// A tally wired into the handler records at EVERY rejection site; GET /summary
+// reads its snapshot. A handler + tally wired to a LIVE (sink+source) store: a
+// rejection recorded on one request is visible to a follow-up GET /summary on the
+// SAME handler (the tally is a handler closure, so it persists across requests).
+const TALLY_SECRET = 'tally-shared-token';
+
+function wiringWithTally(authToken) {
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const rejections = createRejectionTally();
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    rejections,
+    ...(authToken ? { authToken } : {}),
+  });
+  return { handler, rejections };
+}
+
+// Drive GET /summary on the handler and return just the `rejections` aggregate.
+async function summaryRejections(handler, headers) {
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary', headers }), res);
+  assert.equal(res.statusCode, 200, 'summary read must succeed to inspect the tally');
+  return JSON.parse(res.body).rejections;
+}
+
+test('a 415 rejection (unknown schema) is surfaced in GET /summary — schema drift made visible', async () => {
+  const { handler } = wiringWithTally();
+  const res = fakeRes();
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '2' }, body: 'GARBAGE NOT JSON' }), res);
+  assert.equal(res.statusCode, 415);
+
+  const rej = await summaryRejections(handler);
+  assert.ok(rej.byStatus['415'] >= 1, 'the 415 was recorded');
+  assert.ok(rej.total >= 1);
+  assert.equal(rej.lastStatus, 415);
+  assert.notEqual(rej.lastSeen, null);
+  assert.match(rej.lastReason, /unsupported telemetry schema version/, 'sample reason is the receiver diagnostic, not a payload');
+});
+
+test('a 422 rejection (out-of-schema event) is surfaced in GET /summary', async () => {
+  const { handler } = wiringWithTally();
+  const badBody = JSON.stringify({ schemaVersion: 1, events: [{ ...validError, runtime: 'worker' }] });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: badBody }), res);
+  assert.equal(res.statusCode, 422);
+
+  const rej = await summaryRejections(handler);
+  assert.ok(rej.byStatus['422'] >= 1);
+  assert.equal(rej.lastStatus, 422);
+});
+
+test('a 400 rejection (malformed JSON body) is surfaced in GET /summary', async () => {
+  const { handler } = wiringWithTally();
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: 'not json' }), res);
+  assert.equal(res.statusCode, 400);
+
+  const rej = await summaryRejections(handler);
+  assert.ok(rej.byStatus['400'] >= 1);
+  assert.equal(rej.lastStatus, 400);
+});
+
+test('a 404 rejection (routing miss) is surfaced in GET /summary', async () => {
+  const { handler } = wiringWithTally();
+  const res = fakeRes();
+  await handler(fakeReq({ url: '/somewhere-else', body: validBody }), res);
+  assert.equal(res.statusCode, 404);
+
+  const rej = await summaryRejections(handler);
+  assert.ok(rej.byStatus['404'] >= 1);
+  assert.equal(rej.lastStatus, 404);
+});
+
+test('a 401 rejection (auth gate) is surfaced in GET /summary — the tally covers the PRE-ingest path', async () => {
+  // The 401 is the trickiest path: the auth gate returns BEFORE ingest() runs, so a
+  // naive "record on !result.ok" tally would silently MISS it. This proves the
+  // auth-gate site records. The tally is read via an AUTHENTICATED GET /summary so
+  // the read itself does not add a 401 to the count.
+  const { handler } = wiringWithTally(TALLY_SECRET);
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), res); // no bearer → 401 at the gate
+  assert.equal(res.statusCode, 401);
+
+  const rej = await summaryRejections(handler, { authorization: `Bearer ${TALLY_SECRET}` });
+  assert.ok(rej.byStatus['401'] >= 1, 'the auth-gate 401 was recorded (not just ingest-result rejections)');
+  assert.equal(rej.lastStatus, 401);
+  assert.equal(rej.lastReason, 'unauthorized');
+});
+
+test('a successful ingest (202) does NOT increment rejections (accepted traffic is never counted as rejected)', async () => {
+  const { handler } = wiringWithTally();
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  assert.equal(res.statusCode, 202);
+
+  const rej = await summaryRejections(handler);
+  assert.deepEqual(rej, { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null });
+});
+
+test('an idle receiver (no traffic) returns zeroed rejections in GET /summary (parity with today — no false alarm)', async () => {
+  const { handler } = wiringWithTally();
+  const rej = await summaryRejections(handler);
+  assert.deepEqual(rej, { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null });
+});
+
+test('rejections accumulate across requests and stay bounded — mixed statuses surface a byStatus histogram', async () => {
+  const { handler } = wiringWithTally();
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '2' }, body: 'x' }), fakeRes()); // 415
+  await handler(fakeReq({ headers: headersV1, body: 'not json' }), fakeRes()); // 400
+  await handler(fakeReq({ url: '/no-such-route' }), fakeRes()); // 404
+
+  const rej = await summaryRejections(handler);
+  assert.equal(rej.total, 3);
+  assert.deepEqual(rej.byStatus, { '415': 1, '400': 1, '404': 1 });
+  assert.equal(rej.lastStatus, 404, 'lastStatus reflects the most-recent rejection');
+});
+
+test('GET /summary WITHOUT a wired tally still returns a zeroed rejections field (backward-compatible additive shape)', async () => {
+  // A caller that does not pass a tally (e.g. the existing test wirings) still gets
+  // the rejections field, zeroed — the handler is unchanged for callers that don't
+  // wire the tally, exactly like an absent retention dep.
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store }); // no tally, no schema override
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res.body).rejections, {
+    total: 0,
+    byStatus: {},
+    lastStatus: null,
+    lastReason: null,
+    lastSeen: null,
+  });
 });

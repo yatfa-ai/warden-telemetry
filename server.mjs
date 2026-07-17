@@ -23,9 +23,13 @@
 //                  periodic sweep expires old events even on a quiet store.
 //
 // The receiver owns its routes: POST /ingest (write) and GET /summary (read —
-// the maintainer aggregate surface, WARDEN-567). The client POSTs the batch
-// verbatim to its configured endpointUrl (e.g. http://host:7421/ingest) and
-// never rewrites the host, so these route paths are the receiver's to define.
+// the maintainer aggregate surface, WARDEN-567). The GET /summary aggregate also
+// carries a bounded `rejections` tally (WARDEN-591) — counts by status of the
+// rejections that already happen at every rejection site, so a maintainer can
+// tell "traffic is arriving and being hard-rejected" from "no traffic at all."
+// The client POSTs the batch verbatim to its configured endpointUrl (e.g.
+// http://host:7421/ingest) and never rewrites the host, so these route paths are
+// the receiver's to define.
 
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
@@ -222,6 +226,74 @@ export function createRetentionTrigger(
   };
 }
 
+// ── REJECTIONS TALLY (WARDEN-591) ────────────────────────────────────────────
+// A bounded, in-memory, receiver-local tally of the rejections that ALREADY
+// happen at every rejection site in this handler (the auth-gate 401, the 404
+// routing miss, the body-read 400, and the 400/415/422 returned from ingest).
+// It exists so GET /summary can surface "traffic is arriving and being HARD-
+// rejected" apart from "no traffic at all" — the two were indistinguishable
+// before (an all-rejected receiver returned the SAME empty /summary as an idle
+// one). This is the receiver-side twin of the client's "enabled but no endpoint
+// configured" status, and the chief-risk symptom (schema drift → a flood of
+// 415s) made visible. ADDITIVE ONLY: it records rejections that already happen,
+// relaxes no check, mirrors no invariant, routes nothing, and persists nothing
+// (a misconfiguration detector need not survive a restart).
+//
+// Bounded means: counts by status + a SINGLE most-recent sample (status/reason/
+// ts). It does NOT keep one record per rejection or an unbounded set of reason
+// strings, so a sustained drift storm can't grow it without limit.
+
+// The zeroed shape returned when no tally is wired OR no rejection has been
+// recorded yet — identical to a fresh tally's snapshot(), so an idle receiver
+// reads the same zeroed `rejections` whether or not the tally is wired (parity
+// with today's empty-store /summary: no false alarm on a quiet receiver).
+const EMPTY_REJECTIONS = Object.freeze({
+  total: 0,
+  byStatus: {},
+  lastStatus: null,
+  lastReason: null,
+  lastSeen: null,
+});
+
+/**
+ * Build the rejection tally (WARDEN-591). Mirrors the injected-seam discipline of
+ * `createRetentionTrigger`: an OPTIONAL handler dep (no tally wired = today's
+ * behavior, exactly like an absent retention dep) with an injected `now` so the
+ * tally is unit-testable with a fake clock (no real Date in tests).
+ *
+ * @param {{ now?: () => number }} [opts]
+ * @returns {{
+ *   record(rec: { status: number, reason?: string }): void,
+ *   snapshot(): { total: number, byStatus: Record<string, number>, lastStatus: number | null, lastReason: string | null, lastSeen: number | null }
+ * }}
+ */
+export function createRejectionTally({ now = Date.now } = {}) {
+  let total = 0;
+  const byStatus = {};
+  let lastStatus = null;
+  let lastReason = null;
+  let lastSeen = null;
+
+  return {
+    /** Record one rejection. Bounded: accumulates a per-status COUNT and tracks
+     *  only the single most-recent {status, reason, ts} — never one entry per call. */
+    record({ status, reason } = {}) {
+      if (status == null) return;
+      const key = String(status);
+      total += 1;
+      byStatus[key] = (byStatus[key] ?? 0) + 1;
+      lastStatus = status;
+      lastReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
+      lastSeen = now();
+    },
+    /** A stable point-in-time copy of the aggregate (a later record does not mutate
+     *  a previously-returned snapshot). */
+    snapshot() {
+      return { total, byStatus: { ...byStatus }, lastStatus, lastReason, lastSeen };
+    },
+  };
+}
+
 /**
  * Build the request handler. `store` and `schema` are injected so the handler is
  * testable with a capturing store and WITHOUT a live port (tests call the handler
@@ -244,11 +316,31 @@ export function createRetentionTrigger(
  * `retention` dep = today's behavior (the handler is unchanged for callers that
  * don't wire retention).
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void } }} deps
+ * `rejections` (optional tally, WARDEN-591): at EVERY rejection site — the
+ * auth-gate 401, the 404 routing miss, the body-read 400, AND the 400/415/422
+ * returned from `ingest()` (the `!result.ok` branch) — the handler records
+ * `{ status, reason }` via `rejections.record(...)`. GET /summary reads
+ * `rejections.snapshot()` so a maintainer can tell "traffic is arriving and being
+ * hard-rejected" from "no traffic at all" (the two were indistinguishable before).
+ * This catches the auth-gate 401, which a naive "record on `!result.ok`" tally
+ * would silently MISS (the gate returns at server.mjs BEFORE `ingest()` runs).
+ * The reason is always the receiver's own short diagnostic string — never raw
+ * client payloads or extended-tier identifiers (the trust model is preserved). No
+ * `rejections` dep = a zeroed `rejections` field on /summary and no recording —
+ * today's behavior, exactly like an absent retention dep.
+ *
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object } }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
+
+  // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
+  // behavior — no recording, exactly like an absent retention dep). Every rejection
+  // site below reads `recordRejection(...)`; the tally dep is the single switch.
+  const recordRejection = (status, reason) => {
+    if (rejections) rejections.record({ status, reason });
+  };
   return async (req, res) => {
     // AUTH GATE — optional but, when authToken is set, the FIRST thing checked and
     // BEFORE routing. Placing it ahead of the route/404 dispatch keeps the gate
@@ -258,6 +350,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     if (authToken) {
       const provided = readBearerToken(req.headers);
       if (!provided || !tokensMatch(provided, authToken)) {
+        recordRejection(401, 'unauthorized');
         return sendJson(res, 401, { error: 'unauthorized' });
       }
     }
@@ -276,7 +369,17 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     if (req.method === 'GET' && pathname === SUMMARY_PATH) {
       try {
         const events = await store.readEvents();
-        return sendJson(res, 200, summarize(events));
+        // Compose the bounded `rejections` tally here — NOT inside summarize().
+        // summarize(events) stays a PURE single-arg function of the event array
+        // (documented + tested that way); the tally is handler-injected state,
+        // composed here exactly the way `retention` is handler-injected rather
+        // than summarize-injected. The field is ALWAYS present: the tally's
+        // snapshot when wired, or the zeroed EMPTY_REJECTIONS otherwise (so the
+        // shape is stable for every caller, wired or not).
+        return sendJson(res, 200, {
+          ...summarize(events),
+          rejections: rejections ? rejections.snapshot() : EMPTY_REJECTIONS,
+        });
       } catch (e) {
         return sendJson(res, 500, { error: `could not read summary: ${e?.message ?? e}` });
       }
@@ -285,6 +388,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // Route: only POST /ingest is ingest. Anything else is a 404 (so a maintainer
     // scanning logs can tell probe noise from a receiver bug).
     if (req.method !== 'POST' || pathname !== INGEST_PATH) {
+      recordRejection(404, 'not found');
       return sendJson(res, 404, { error: 'not found' });
     }
 
@@ -292,12 +396,24 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     try {
       body = await readBody(req);
     } catch (e) {
-      return sendJson(res, 400, { error: `could not read request body: ${e?.message ?? e}` });
+      const reason = `could not read request body: ${e?.message ?? e}`;
+      recordRejection(400, reason);
+      return sendJson(res, 400, { error: reason });
     }
 
     // ingest's own rejection discipline guarantees a non-retryable 4xx (or 202);
     // map the result straight onto the response.
     const result = await ingest({ headers: req.headers, body }, { ...schema, store });
+
+    // REJECTIONS (WARDEN-591) — record the ingest-result rejections (400/415/422)
+    // for the /summary tally. These are the rejections that come BACK from ingest()
+    // as a `result`; the auth-gate 401, the 404, and the body-read 400 were already
+    // recorded at their own early-return sites above. The sample reason is ingest's
+    // own diagnostic string (e.g. "unsupported telemetry schema version..."), never
+    // a raw client payload. Accepted traffic (result.ok) records nothing here.
+    if (!result.ok) {
+      recordRejection(result.status, result.body && result.body.error);
+    }
 
     // RETENTION (WARDEN-579) — fire-and-forget: AFTER a successful persist, tell
     // the maintenance trigger how many events landed so it can arm a DEBOUNCED,
@@ -337,7 +453,8 @@ export function createReceiver({
 } = {}) {
   const maxAgeMs = maxAgeHours > 0 ? maxAgeHours * HOUR_MS : 0;
   const retention = createRetentionTrigger(store, { maxEvents, maxAgeMs });
-  const handler = createRequestHandler({ store, schema, authToken, retention });
+  const rejections = createRejectionTally();
+  const handler = createRequestHandler({ store, schema, authToken, retention, rejections });
   const server = createServer(handler);
 
   // Periodic age-expiry sweep — ONLY when an age window is set. A quiet store
