@@ -51,9 +51,12 @@ export const EVENTS_LIMIT_MAX = 200;
  *
  * `limit` bounds the window to the NEWEST N events. The store is append-ordered
  * newest-last, so the newest N are the LAST N in arrival order. A missing /
- * non-finite / non-positive `limit` falls back to the default; a `limit` above
+ * non-finite / sub-1 `limit` falls back to the default; a `limit` above
  * the hard cap is clamped to the cap — so the response is always bounded
- * regardless of how full the store is.
+ * regardless of how full the store is. Sub-1 fractions are grouped with the
+ * fallback (not floored to 0) precisely because `slice(-0)` returns the WHOLE
+ * array: floor(0.5) is 0, and slicing the last 0 is the entire set, which would
+ * defeat the cap.
  *
  * `since` is an ABSOLUTE epoch-ms cutoff, so unlike `applyRetention`'s age window
  * this filter needs no reference clock; the helper stays pure and fs-free — the
@@ -82,11 +85,14 @@ export function selectEvents(events, { limit, type, since } = {}) {
     );
   }
 
-  // Resolve the bound: a missing / non-finite / non-positive limit → default;
+  // Resolve the bound: a missing / non-finite / sub-1 limit → default;
   // above the hard cap → clamped to the cap. A typo or absurd value can never
-  // unbound the response.
+  // unbound the response. The guard is `>= 1` (not `> 0`): a sub-1 fraction
+  // like 0.5 floors to 0, and `slice(-0)` === `slice(0)` returns the WHOLE
+  // array — which would bypass the cap on a large store. `>= 1` routes such a
+  // value to the default instead, keeping the response bounded for EVERY input.
   let n = EVENTS_LIMIT_DEFAULT;
-  if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0) {
+  if (typeof limit === 'number' && Number.isFinite(limit) && limit >= 1) {
     n = Math.min(Math.floor(limit), EVENTS_LIMIT_MAX);
   }
 

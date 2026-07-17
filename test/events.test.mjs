@@ -109,6 +109,25 @@ test('selectEvents: a fractional limit is floored (then clamped)', () => {
   assert.equal(selectEvents(events, { limit: 2.9 }).length, 2);
 });
 
+test('selectEvents: a SUB-1 fractional limit NEVER bypasses the hard cap (WARDEN-599 audit)', () => {
+  // Regression for the load-bearing bound invariant — the ticket's single stated
+  // risk mitigation ("an unbounded response bloating on a large store, mitigated
+  // by the hard-capped limit"). A fractional limit in (0,1) floors to 0, and
+  // `slice(-0)` === `slice(0)` returns the WHOLE array — which on a near-full
+  // store would yield exactly the multi-MB response the cap exists to prevent.
+  // The guard routes sub-1 fractions to the default instead. This test goes red
+  // on the `limit > 0` guard (whole array returned) and green on `limit >= 1`.
+  const events = Array.from({ length: 500 }, (_, i) => ({ type: 'error', timestamp: i }));
+  for (const bad of [0.5, 0.9, 5e-1, 0.001, 0.9999]) {
+    const out = selectEvents(events, { limit: bad });
+    assert.ok(
+      out.length <= EVENTS_LIMIT_MAX,
+      `limit=${bad} must not exceed the hard cap (got ${out.length}) — slice(-0) bypass`
+    );
+    assert.equal(out.length, EVENTS_LIMIT_DEFAULT, `limit=${bad} falls back to the default`);
+  }
+});
+
 test('selectEvents: a missing / non-finite / non-positive limit falls back to the default', () => {
   const events = Array.from({ length: 250 }, (_, i) => ({ type: 'error', timestamp: i }));
   assert.equal(selectEvents(events, { limit: undefined }).length, EVENTS_LIMIT_DEFAULT);
@@ -387,6 +406,27 @@ test('GET /events: ?limit=50000 is CAPPED at 200 (a near-full store cannot yield
   assert.equal(body.events.length, EVENTS_LIMIT_MAX, 'hard-capped at 200');
   assert.ok(body.events.length <= EVENTS_LIMIT_MAX);
   assert.equal(body.total, 500);
+});
+
+test('GET /events: ?limit=0.5 NEVER bypasses the cap (WARDEN-599 audit — sub-1 fraction end-to-end)', async () => {
+  // The handler parses ?limit= via Number(), so ?limit=0.5 reaches selectEvents
+  // as the number 0.5 — the bypass class. The bound must hold end-to-end, not
+  // just in the pure helper: a sub-1 fraction cannot return the whole store.
+  const events = Array.from({ length: 500 }, (_, i) => ({ type: 'error', timestamp: i }));
+  const store = readableStore(events);
+  const handler = createRequestHandler({ store });
+  for (const bad of ['0.5', '0.9', '5e-1', '0.001']) {
+    const res = fakeRes();
+    await handler(fakeReq({ url: `/events?limit=${bad}` }), res);
+    assert.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body);
+    assert.ok(
+      body.events.length <= EVENTS_LIMIT_MAX,
+      `?limit=${bad} must not exceed the hard cap (got ${body.events.length})`
+    );
+    assert.equal(body.events.length, EVENTS_LIMIT_DEFAULT, `?limit=${bad} falls back to the default`);
+    assert.equal(body.total, 500, 'total is still the full persisted count');
+  }
 });
 
 test('GET /events: ?limit=abc (non-numeric) falls back to the default window', async () => {
