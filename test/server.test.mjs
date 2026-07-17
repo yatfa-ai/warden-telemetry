@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, DEFAULT_MAX_EVENTS } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 
@@ -1272,4 +1272,266 @@ test('GET /summary WITHOUT a wired persistErrors tally still returns a zeroed pe
     lastReason: null,
     lastSeen: null,
   });
+});
+
+// ── INGEST BODY CAP (WARDEN-627) ─────────────────────────────────────────────
+// Retention (WARDEN-579) bounded the unbounded STORE; the body cap bounds the one
+// remaining unbounded INPUT — the POST /ingest request body, which readBody once
+// buffered fully into memory with no limit. A single oversized POST could exhaust
+// receiver RSS and take down a persistent service the self-hosting maintainer runs
+// (and the receiver is open by default in dev, so an unauthenticated attacker OR a
+// buggy client can trigger it). An oversized body is rejected with a non-retryable
+// 413 BEFORE it can be fully buffered, recorded at the existing rejection seam so it
+// surfaces on GET /summary.rejections.byStatus['413'] the same way 415s already do.
+//
+// Two pre-/mid-buffer checks: a Content-Length PRE-CHECK that 413's without reading a
+// byte, and a cap-aware readBody that 413's mid-read when an unknown-length (chunked)
+// body crosses the cap. A schema-handshake pre-check also runs before the body is
+// buffered (defense-in-depth alongside ingest()'s own check) so a wrong-version
+// request is 415'd without paying its body's memory cost. Still ZERO real fs, ZERO
+// real network — readBody is driven directly (it is exported for exactly this) and the
+// handler is driven with fake req/res like every block above.
+
+// ── readBody seam: the mid-read bound ─────────────────────────────────────────
+// A minimal readable-stream double: emits the given chunks then `end` on nextTick
+// (mimicking a real readable stream). readBody consumes via .on('data'|'end'|'error').
+function streamReq(chunks = []) {
+  const req = new EventEmitter();
+  process.nextTick(() => {
+    for (const c of chunks) req.emit('data', c);
+    req.emit('end');
+  });
+  return req;
+}
+
+test('readBody: default (maxBytes=0) is UNBOUNDED — reads a large body fully (today behavior preserved for any caller)', async () => {
+  // `0` is the unbounded escape hatch (INGEST_MAX_BODY_BYTES=0). A caller that does
+  // not wire a cap — including any future readBody caller outside /ingest — gets the
+  // original accumulate-the-whole-body behavior, unchanged.
+  const big = 'x'.repeat(100_000);
+  const body = await readBody(streamReq([big]));
+  assert.equal(body.length, 100_000);
+});
+
+test('readBody: maxBytes rejects with a TAGGED PAYLOAD_TOO_LARGE error when the body exceeds the cap', async () => {
+  // The tag is LOAD-BEARING: the handler maps PAYLOAD_TOO_LARGE → 413, whereas a plain
+  // read error stays the existing 400. Without the tag the cap case would silently
+  // fall into the 400 path. So the rejection MUST carry a distinguishable code.
+  await assert.rejects(
+    readBody(streamReq(['x'.repeat(100)]), { maxBytes: 10 }),
+    (err) => {
+      assert.ok(err instanceof Error, 'still an Error (interoperable with the existing read-error catch)');
+      assert.equal(err.code, 'PAYLOAD_TOO_LARGE', 'the tag the handler keys on to map → 413');
+      assert.equal(err.limit, 10, 'the limit is surfaced for diagnostics');
+      assert.match(err.message, /exceeds size limit/);
+      return true;
+    }
+  );
+});
+
+test('readBody: maxBytes resolves the full body when it is AT the cap (the bound is exclusive — size > maxBytes aborts)', async () => {
+  // The check is `size > maxBytes`, so a body of EXACTLY maxBytes bytes is accepted —
+  // an off-by-one that rejected an at-cap body would drop a legit batch sized to the cap.
+  const exact = 'x'.repeat(10);
+  const body = await readBody(streamReq([exact]), { maxBytes: 10 });
+  assert.equal(body, exact);
+});
+
+test('readBody: the cap counts BYTES not string chars — a multibyte payload over the byte cap still rejects (no under-count sneak-past)', async () => {
+  // Content-Length is in bytes, so the cap must measure bytes too. 'é' is 2 UTF-8
+  // bytes but 1 char: 2 chars = 4 bytes > a 3-byte cap → MUST reject. A char-counting
+  // cap would see "2 chars < 3" and wrongly resolve, letting an attacker sneak a
+  // multibyte payload past the byte limit.
+  await assert.rejects(
+    readBody(streamReq(['éé']), { maxBytes: 3 }),
+    (err) => { assert.equal(err.code, 'PAYLOAD_TOO_LARGE'); return true; }
+  );
+});
+
+test('readBody: a body split across CHUNKS accumulates — crossing the cap on a LATER chunk still aborts', async () => {
+  // Each chunk is independently under the cap, but the running total crosses it on the
+  // second chunk. readBody checks the accumulated size on every chunk, not just the first.
+  await assert.rejects(
+    readBody(streamReq(['x'.repeat(8), 'x'.repeat(8)]), { maxBytes: 10 }),
+    (err) => { assert.equal(err.code, 'PAYLOAD_TOO_LARGE'); return true; }
+  );
+});
+
+test('readBody: on cap exceed, the stream is RESUMED (drained) — NOT destroyed — so the shared socket stays alive for the 413 response', async () => {
+  // req and res share a socket: req.destroy() would abort the connection and the
+  // handler's 413 would NEVER reach the client (the client would see a connection
+  // reset, not the clean non-retryable 4xx it already drops on). resume() drains-and-
+  // discards the remainder (no buffering) while keeping the connection alive. When BOTH
+  // are present, resume is preferred and destroy is NOT called. (A live oversized
+  // chunked POST confirmed this: destroy lost the 413, resume delivers it.)
+  const req = new EventEmitter();
+  let resumed = 0;
+  let destroyed = false;
+  req.resume = () => { resumed += 1; };
+  req.destroy = () => { destroyed = true; };
+  process.nextTick(() => {
+    req.emit('data', 'x'.repeat(100)); // exceeds cap → abort + drain mid-read
+    req.emit('end');
+  });
+  await assert.rejects(readBody(req, { maxBytes: 10 }), /exceeds size limit/);
+  assert.equal(resumed, 1, 'resume() drained the remainder');
+  assert.equal(destroyed, false, 'destroy() NOT called — it would tear down the socket and lose the 413');
+});
+
+test('readBody: on cap exceed with a resume-less stream, falls back to destroy() (last-resort stop for a non-stream test double)', async () => {
+  // A stream with no resume (a minimal double) still must be stopped; destroy is the
+  // fallback. A real IncomingMessage always has resume, so this path is for unusual
+  // callers only. Either way the abort never throws.
+  const req = new EventEmitter();
+  let destroyed = false;
+  req.destroy = () => { destroyed = true; };
+  process.nextTick(() => {
+    req.emit('data', 'x'.repeat(100));
+  });
+  await assert.rejects(readBody(req, { maxBytes: 10 }), /exceeds size limit/);
+  assert.equal(destroyed, true, 'destroy() fallback fired (resume absent)');
+});
+
+test('readBody: a PLAIN read error (no PAYLOAD_TOO_LARGE tag) rejects with the raw error — stays distinguishable from the cap case', async () => {
+  // The handler maps PAYLOAD_TOO_LARGE → 413 and everything else → 400. So a plain
+  // transport error MUST reject WITHOUT the tag, or it would be mis-mapped to a 413.
+  const req = new EventEmitter();
+  process.nextTick(() => req.emit('error', new Error('ECONNRESET: socket hang up')));
+  await assert.rejects(readBody(req, { maxBytes: 10 }), (err) => {
+    assert.equal(err.code, undefined, 'no PAYLOAD_TOO_LARGE tag — this is a plain read error, not the cap');
+    assert.match(err.message, /ECONNRESET/);
+    return true;
+  });
+});
+
+// ── handler: the Content-Length pre-check + cap-aware readBody → clean 413 ─────
+// A fakeReq that records whether the handler began reading the body: it counts
+// `data` listener registrations. The pre-read 413 (Content-Length) and pre-read 415
+// (schema handshake) paths return WITHOUT attaching a `data` listener (the body is
+// never buffered — "don't buffer what you'll reject"). readBody is the ONLY code that
+// attaches a `data` listener, so a count of 0 means the body was never read.
+function bodySpyReq(opts) {
+  const req = fakeReq(opts);
+  let dataListeners = 0;
+  const origOn = req.on.bind(req);
+  req.on = (event, ...rest) => {
+    if (event === 'data') dataListeners += 1;
+    return origOn(event, ...rest);
+  };
+  req.bodyListenerCount = () => dataListeners;
+  return req;
+}
+
+// Wire a handler to a capturing store + rejection tally + a body cap. Mirrors the
+// existing wiring helpers; the cap is the WARDEN-627 addition.
+function wiringWithCap({ maxBodyBytes, rejections = createRejectionTally() } = {}) {
+  const captured = [];
+  const store = createNdjsonStore({ sink: async (l) => void captured.push(l) });
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    rejections,
+    maxBodyBytes,
+  });
+  return { handler, captured, rejections };
+}
+
+test('the body-cap DEFAULT is bounded — DEFAULT_MAX_BODY_BYTES is a finite positive byte cap (the oversized-POST OOM bug is fixed by default)', () => {
+  // Mirrors the retention-default test: the default IS bounded (unbounded input was
+  // the bug), never unbounded. A maintainer who runs the receiver bare gets the cap
+  // without opting in — they must explicitly set INGEST_MAX_BODY_BYTES=0 to unbind it.
+  assert.ok(
+    typeof DEFAULT_MAX_BODY_BYTES === 'number' && DEFAULT_MAX_BODY_BYTES > 0 && Number.isFinite(DEFAULT_MAX_BODY_BYTES),
+    'the default body cap must be a finite positive bound, never unbounded'
+  );
+});
+
+test('oversized body (no Content-Length) over the cap → 413 via the cap-aware readBody path + recorded in the tally', async () => {
+  // The chunked / unknown-length case: no Content-Length header to pre-check, so the
+  // bound fires MID-READ inside readBody (the tagged PAYLOAD_TOO_LARGE rejection → 413,
+  // NOT the 400 a plain read error records). The 413 lands in the rejection tally the
+  // same way a 415 does — so oversized traffic is distinguishable from no traffic.
+  const { handler, rejections } = wiringWithCap({ maxBodyBytes: 10 });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: 'x'.repeat(100) }), res);
+  assert.equal(res.statusCode, 413);
+  assert.deepEqual(JSON.parse(res.body), { error: 'request body too large' });
+  const snap = rejections.snapshot();
+  assert.equal(snap.byStatus['413'], 1, 'the 413 was recorded at the rejection seam');
+  assert.equal(snap.lastStatus, 413);
+  assert.equal(snap.lastReason, 'request body too large', 'the sample reason is the receiver diagnostic, not the payload');
+});
+
+test('Content-Length over the cap → 413 PRE-READ, the body is NEVER buffered (no data listener attached)', async () => {
+  // The cheapest bound: the header DECLARES a length over the cap, so 413 WITHOUT
+  // reading a byte. The declared length is the attack vector (a client can claim a
+  // huge body); the actual body content is irrelevant because it is never read.
+  const { handler } = wiringWithCap({ maxBodyBytes: 1024 });
+  const res = fakeRes();
+  const req = bodySpyReq({
+    headers: { ...headersV1, 'content-length': String(10 * 1024 * 1024) }, // 10 MiB declared
+    body: 'x'.repeat(100), // small actual body — never read anyway
+  });
+  await handler(req, res);
+  assert.equal(res.statusCode, 413);
+  assert.deepEqual(JSON.parse(res.body), { error: 'request body too large' });
+  assert.equal(req.bodyListenerCount(), 0, 'readBody was never called — no data listener attached, the body was not buffered');
+});
+
+test('Content-Length AT/UNDER the cap → 202 unchanged (a normal batch still ingests); no 413 recorded', async () => {
+  // A legit batch — tiny relative to the 1 MiB default — is unaffected: it ingests 202
+  // and the rejection tally records no 413. Guards against an over-eager cap dropping
+  // real traffic. (validBody is ASCII, so its char length == its byte length.)
+  const { handler, captured, rejections } = wiringWithCap({ maxBodyBytes: DEFAULT_MAX_BODY_BYTES });
+  const res = fakeRes();
+  await handler(
+    fakeReq({ headers: { ...headersV1, 'content-length': String(validBody.length) }, body: validBody }),
+    res
+  );
+  assert.equal(res.statusCode, 202);
+  assert.equal(captured.length, 1, 'the event was persisted — a normal batch is unaffected');
+  assert.equal(rejections.snapshot().byStatus['413'], undefined, 'no 413 recorded for an under-cap body');
+});
+
+test('maxBodyBytes=0 (the escape hatch) → an oversized body does NOT 413 (today behavior preserved)', async () => {
+  // INGEST_MAX_BODY_BYTES=0 disables the cap entirely. An oversized body is then read
+  // fully and reaches ingest — here it 400's as garbage JSON (proving the FULL body was
+  // buffered and reached the normal path), NOT 413'd. Guards the opt-out: a maintainer
+  // who explicitly unbounds the cap gets the original behavior back.
+  const { handler, rejections } = wiringWithCap({ maxBodyBytes: 0 });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: 'x'.repeat(100) }), res);
+  assert.equal(res.statusCode, 400, 'cap=0 → the body was fully read then 400’d by ingest (garbage JSON), NOT 413');
+  assert.equal(rejections.snapshot().byStatus['413'], undefined, 'the cap is off — no 413 is ever recorded');
+});
+
+test('wrong x-telemetry-schema → 415 WITHOUT buffering the body (pre-read handshake; data listener never attached)', async () => {
+  // Slice 5 (defense-in-depth, option b): the schema handshake is hoisted BEFORE
+  // readBody, so a wrong-version request — the WARDEN-591 chief-risk drift symptom (a
+  // flood of 415s under a schema mismatch) — is 415'd at ZERO body memory cost. The
+  // canonical check still lives in ingest() (its pure-function contract + suite assert
+  // there); this is an EARLY copy that collapses the drift case's memory cost to zero.
+  const { handler, rejections } = wiringWithCap({ maxBodyBytes: 1024 });
+  const res = fakeRes();
+  const req = bodySpyReq({ headers: { 'x-telemetry-schema': '2' }, body: 'GARBAGE NOT JSON' });
+  await handler(req, res);
+  assert.equal(res.statusCode, 415);
+  assert.equal(req.bodyListenerCount(), 0, 'the body was never buffered — the 415 fired pre-read');
+  const snap = rejections.snapshot();
+  assert.equal(snap.byStatus['415'], 1);
+  assert.match(snap.lastReason, /unsupported telemetry schema version/);
+});
+
+test('the 413 body is the receiver FIXED diagnostic, never the oversized payload (trust model preserved)', async () => {
+  // Parity with every other rejection site: the recorded reason + response body are the
+  // receiver's own short string, never the raw bytes that were rejected. readBody also
+  // discards the accumulated buffer on cap-exceed (it returns before `data += chunk`),
+  // so the oversized payload never reaches the handler at all.
+  const { handler } = wiringWithCap({ maxBodyBytes: 10 });
+  const res = fakeRes();
+  const payload = 'SECRET-' + 'x'.repeat(100); // oversized and carries a marker
+  await handler(fakeReq({ headers: headersV1, body: payload }), res);
+  assert.equal(res.statusCode, 413);
+  assert.equal(res.body.includes('SECRET'), false, 'the oversized payload is not echoed');
+  assert.deepEqual(JSON.parse(res.body), { error: 'request body too large' });
 });

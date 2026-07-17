@@ -21,6 +21,15 @@
 //                  epoch-ms `timestamp` is older than now minus this many hours are
 //                  dropped on compaction. `0` disables the age window. When set, a
 //                  periodic sweep expires old events even on a quiet store.
+//       INGEST_MAX_BODY_BYTES (default 1048576 = 1 MiB) — the body cap on POST
+//                  /ingest, the one remaining unbounded INPUT after retention
+//                  bounded the store (WARDEN-579). A single oversized POST is no
+//                  longer buffered fully into memory — it is 413'd at the
+//                  Content-Length pre-check (or mid-read by the cap-aware readBody)
+//                  so it can't exhaust receiver RSS. Legit traffic is tiny (the
+//                  client sends ONE redacted event per dispatch, ~1-2 KB), so 1 MiB
+//                  is ~500x the real payload. The DEFAULT IS BOUNDED; `0` disables
+//                  the cap (the unbounded escape hatch, matching STORE_MAX_EVENTS=0).
 //
 // The receiver owns its routes: POST /ingest (write), GET /summary (read —
 // the maintainer aggregate surface, WARDEN-567), GET /capabilities (the
@@ -86,6 +95,18 @@ export const RETENTION_DEBOUNCE_MS = 60_000;
 export const RETENTION_SWEEP_MS = 5 * 60_000; // 5-min cadence for age-expiry
 const HOUR_MS = 60 * 60 * 1000;
 
+// ── INGEST BODY CAP (WARDEN-627) ──────────────────────────────────────────────
+// Retention (WARDEN-579) bounded the unbounded STORE; this bounds the one remaining
+// unbounded INPUT — the POST /ingest request body, which readBody once buffered
+// fully into memory with no limit. A single oversized POST could exhaust receiver
+// RSS and take down a persistent service the self-hosting maintainer runs (and the
+// receiver is open by default in dev, so an unauthenticated attacker OR a buggy
+// client can trigger it). The default IS BOUNDED (1 MiB); `0` is the unbounded
+// escape hatch, mirroring the retention knobs' `0`-disables convention. Legit
+// traffic is tiny — the client sends ONE redacted event per dispatch (~1-2 KB) — so
+// 1 MiB is ~500x the real payload, ample headroom for any reasonable batch.
+export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB POST body cap — bounds the request input
+
 // Parse a non-negative number env override for retention. Unset/empty → fallback;
 // an explicit "0" disables that policy (the opt-out); a malformed/negative value
 // falls back to the (bounded) default so a typo can never silently unbound the
@@ -107,17 +128,85 @@ export const DEFAULT_SCHEMA = { SCHEMA_VERSION, validateEvent };
  * and fire-and-forget, so buffering the whole body is fine (no streaming parse).
  * Exported so the handler is unit-testable without binding a socket.
  *
+ * `maxBytes` (default 0 = unbounded, WARDEN-627): when > 0, the accumulated BYTE
+ * length is checked on every chunk; cross the cap and the read ABORTS — listeners
+ * are removed and the stream is RESUMED (drained-and-discarded) so its socket stays
+ * healthy for the handler's 413 response (destroying the request would tear down the
+ * SHARED req/res socket and the 413 would never reach the client) rather than pinned
+ * on backpressured data we will never read — and the promise rejects with a TAGGED
+ * error (`code: 'PAYLOAD_TOO_LARGE'`). The tag is load-
+ * bearing: the handler maps a PAYLOAD_TOO_LARGE rejection to a non-retryable 413
+ * (recorded at the rejection seam), whereas a plain read error stays the existing
+ * 400 — without the tag the cap case would silently fall into the 400 path. Bytes
+ * are counted (not string chars) because Content-Length is in bytes; measuring
+ * chars would under-count multibyte payloads and let an attacker sneak past the
+ * cap. `0` preserves today's behavior for any other caller.
+ *
  * @param {import('node:http').IncomingMessage} req
+ * @param {{ maxBytes?: number }} [opts]
  * @returns {Promise<string>}
  */
-export function readBody(req) {
+export function readBody(req, { maxBytes = 0 } = {}) {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (chunk) => {
-      data += chunk;
-    });
-    req.on('end', () => resolve(data));
-    req.on('error', reject);
+    let size = 0;
+    let settled = false;
+
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+    };
+
+    // Free the socket WITHOUT tearing it down: our listeners are already removed
+    // above (so we stop buffering into `data`), then we DRAIN-and-discard the
+    // remainder via resume(). The socket stays healthy so the handler's 413 response
+    // actually reaches the client. We deliberately do NOT destroy the request: req
+    // and res share a socket, so req.destroy() would abort the connection and the 413
+    // would NEVER be delivered — the client would see a connection reset instead of the
+    // clean non-retryable 4xx it already drops on (breaking the ticket's trust model).
+    // resume() discards the bytes (no memory growth) while keeping the connection
+    // alive; a non-stream test double without resume falls back to destroy, and one
+    // with neither is a harmless no-op — guarded so the abort never throws.
+    const stopStream = () => {
+      if (typeof req.resume === 'function') req.resume();
+      else if (typeof req.destroy === 'function') req.destroy();
+    };
+
+    const onData = (chunk) => {
+      if (settled) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      size += buf.byteLength;
+      if (maxBytes > 0 && size > maxBytes) {
+        settled = true;
+        cleanup();
+        stopStream();
+        reject(
+          Object.assign(new Error('request body exceeds size limit'), {
+            code: 'PAYLOAD_TOO_LARGE',
+            limit: maxBytes,
+          })
+        );
+        return;
+      }
+      data += buf.toString('utf8');
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(data);
+    };
+    const onError = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
   });
 }
 
@@ -452,10 +541,23 @@ export function createPersistErrorTally({ now = Date.now } = {}) {
  * computed (it is a pure read over persisted `timestamp`s, like `summarize()`),
  * so every /summary response carries the field whether or not `now` is wired.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, now?: () => number }} deps
+ * `maxBodyBytes` (optional body cap, WARDEN-627, default 0 = unbounded): bounds
+ * the POST /ingest request body — the one remaining unbounded INPUT after
+ * retention bounded the store. The handler rejects an oversized body with a
+ * non-retryable 413 (recorded at the rejection seam) BEFORE it can exhaust
+ * receiver RSS, via TWO pre-/mid-buffer checks: a Content-Length pre-check that
+ * 413's WITHOUT reading a byte when the declared length is over the cap, and a
+ * cap-aware readBody that 413's mid-read when an unknown-length (chunked) body
+ * crosses the cap. `0` (the default) preserves today's behavior — the cap is
+ * wired by createReceiver from INGEST_MAX_BODY_BYTES (default 1 MiB), mirroring
+ * how retention bounds flow in. A schema-handshake pre-check also runs before the
+ * body is buffered (defense-in-depth alongside ingest()'s own check) so a wrong-
+ * version request is 415'd without paying its body's memory cost.
+ *
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, maxBodyBytes?: number, now?: () => number }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, now = Date.now } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, maxBodyBytes = 0, now = Date.now } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
 
   // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
@@ -588,10 +690,59 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
       return sendJson(res, 404, { error: 'not found' });
     }
 
+    // ── PRE-READ BODY BOUNDS (WARDEN-627) ──────────────────────────────────────
+    // Two checks run BEFORE the body is buffered, so a request we'll reject never
+    // pays the memory cost of its body (the "don't buffer what you'll reject"
+    // discipline — the write-path twin of retention bounding the store). Both
+    // record at the existing rejection seam so the oversized/drift traffic surfaces
+    // on GET /summary.rejections.byStatus the same way 415s already do.
+
+    // (1) SCHEMA HANDSHAKE — a defense-in-depth EARLY copy; the canonical check
+    // still lives in ingest() (its pure-function contract + suite assert there).
+    // Hoisting a pre-read check here means a wrong-version request is 415'd
+    // WITHOUT buffering its body — the drift case (WARDEN-591's chief-risk
+    // symptom: a flood of 415s under a schema mismatch) collapses to ZERO memory
+    // cost instead of paying for its whole body before ingest() rejects it.
+    const declaredSchema = readHeader(req.headers, 'x-telemetry-schema');
+    if (declaredSchema !== String(schema.SCHEMA_VERSION)) {
+      const reason = `unsupported telemetry schema version: expected "${schema.SCHEMA_VERSION}", got ${JSON.stringify(declaredSchema)}`;
+      recordRejection(415, reason);
+      return sendJson(res, 415, { error: reason });
+    }
+
+    // (2) CONTENT-LENGTH PRE-CHECK — when the header declares a length over the
+    // cap, reject 413 WITHOUT reading a byte: the cheapest possible bound (no
+    // buffering, no parsing). Skipped when the cap is `0` (the unbounded escape
+    // hatch) or the header is absent (chunked/unknown-length) — the unknown-length
+    // case is handled mid-read by the cap-aware readBody below.
+    if (maxBodyBytes > 0) {
+      const contentLength = readHeader(req.headers, 'content-length');
+      if (contentLength != null) {
+        const declared = Number(contentLength);
+        if (Number.isFinite(declared) && declared > maxBodyBytes) {
+          const reason = 'request body too large';
+          recordRejection(413, reason);
+          return sendJson(res, 413, { error: reason });
+        }
+      }
+    }
+
     let body;
     try {
-      body = await readBody(req);
+      body = await readBody(req, { maxBytes: maxBodyBytes });
     } catch (e) {
+      // The cap-aware readBody rejects with a TAGGED PAYLOAD_TOO_LARGE error → a
+      // non-retryable 413 (recorded at the rejection seam). This MUST be mapped to
+      // 413 — NOT fall through to the 400 a plain read-error records below — so an
+      // unknown-length (chunked) oversized body is rejected as 413 too, matching the
+      // Content-Length path. A 413 is non-429 4xx, and the client ALREADY drops non-
+      // retryable 4xx (telemetry-send.js isTransientStatus = 429|5xx only), so an
+      // oversized batch is DROPPED, not retried forever.
+      if (e && e.code === 'PAYLOAD_TOO_LARGE') {
+        const reason = 'request body too large';
+        recordRejection(413, reason);
+        return sendJson(res, 413, { error: reason });
+      }
       const reason = `could not read request body: ${e?.message ?? e}`;
       recordRejection(400, reason);
       return sendJson(res, 400, { error: reason });
@@ -651,13 +802,15 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
 }
 
 /**
- * Create (and by default start) a receiver. Every dependency is injectable; the
+ * Create (and default-start) a receiver. Every dependency is injectable; the
  * defaults wire the real file-backed store + vendored schema. `authToken` mirrors
  * the PORT/STORE env pattern: read from AUTH_TOKEN when not passed explicitly.
  * Retention bounds (WARDEN-579) mirror the same pattern: read from
  * STORE_MAX_EVENTS / STORE_MAX_AGE_HOURS when not passed, defaulting to bounded.
+ * The ingest body cap (WARDEN-627) mirrors it again: read from
+ * INGEST_MAX_BODY_BYTES when not passed, defaulting to a bounded 1 MiB.
  *
- * @param {{ port?: number, storePath?: string, store?: object, schema?: object, authToken?: string, maxEvents?: number, maxAgeHours?: number }} [opts]
+ * @param {{ port?: number, storePath?: string, store?: object, schema?: object, authToken?: string, maxEvents?: number, maxAgeHours?: number, maxBodyBytes?: number }} [opts]
  * @returns {import('node:http').Server}
  */
 export function createReceiver({
@@ -672,12 +825,13 @@ export function createReceiver({
   authToken = process.env.AUTH_TOKEN,
   maxEvents = envRetentionInt('STORE_MAX_EVENTS', DEFAULT_MAX_EVENTS),
   maxAgeHours = envRetentionInt('STORE_MAX_AGE_HOURS', DEFAULT_MAX_AGE_HOURS),
+  maxBodyBytes = envRetentionInt('INGEST_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES),
 } = {}) {
   const maxAgeMs = maxAgeHours > 0 ? maxAgeHours * HOUR_MS : 0;
   const retention = createRetentionTrigger(store, { maxEvents, maxAgeMs });
   const rejections = createRejectionTally();
   const persistErrors = createPersistErrorTally();
-  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors });
+  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors, maxBodyBytes });
   const server = createServer(handler);
 
   // Periodic age-expiry sweep — ONLY when an age window is set. A quiet store
@@ -712,8 +866,13 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       maxEv > 0 || maxAh > 0
         ? `retention: max ${maxEv} events${maxAh > 0 ? `, ${maxAh}h age` : ''}`
         : 'retention: OFF (unbounded — not recommended)';
+    const maxBody = envRetentionInt('INGEST_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES);
+    const bodyCap =
+      maxBody > 0
+        ? `body cap: ${maxBody} bytes`
+        : 'body cap: OFF (unbounded — not recommended)';
     console.log(
-      `warden-telemetry receiver listening on :${port} (POST ${INGEST_PATH}, GET ${SUMMARY_PATH}, GET ${CAPABILITIES_PATH}, GET ${EVENTS_PATH}; store: ${storePath}; ${authed}; ${retention})`
+      `warden-telemetry receiver listening on :${port} (POST ${INGEST_PATH}, GET ${SUMMARY_PATH}, GET ${CAPABILITIES_PATH}, GET ${EVENTS_PATH}; store: ${storePath}; ${authed}; ${retention}; ${bodyCap})`
     );
   });
 }
