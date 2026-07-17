@@ -22,14 +22,17 @@
 //                  dropped on compaction. `0` disables the age window. When set, a
 //                  periodic sweep expires old events even on a quiet store.
 //
-// The receiver owns its routes: POST /ingest (write) and GET /summary (read —
-// the maintainer aggregate surface, WARDEN-567). The GET /summary aggregate also
-// carries a bounded `rejections` tally (WARDEN-591) — counts by status of the
-// rejections that already happen at every rejection site, so a maintainer can
-// tell "traffic is arriving and being hard-rejected" from "no traffic at all."
-// The client POSTs the batch verbatim to its configured endpointUrl (e.g.
-// http://host:7421/ingest) and never rewrites the host, so these route paths are
-// the receiver's to define.
+// The receiver owns its routes: POST /ingest (write), GET /summary (read —
+// the maintainer aggregate surface, WARDEN-567), and GET /capabilities (the
+// config-time verification surface, WARDEN-595 — a client's Settings "Test
+// connection" probe reads it to confirm reachability + schema match + auth
+// before relying on the receiver). The GET /summary aggregate also carries a
+// bounded `rejections` tally (WARDEN-591) — counts by status of the rejections
+// that already happen at every rejection site, so a maintainer can tell
+// "traffic is arriving and being hard-rejected" from "no traffic at all." The
+// client POSTs the batch verbatim to its configured endpointUrl (e.g.
+// http://host:7421/ingest) and never rewrites the host, so these route paths
+// are the receiver's to define.
 
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
@@ -43,6 +46,12 @@ export const DEFAULT_PORT = 7421;
 export const DEFAULT_STORE_PATH = new URL('./telemetry.ndjson', import.meta.url).pathname;
 export const INGEST_PATH = '/ingest';
 export const SUMMARY_PATH = '/summary';
+// The config-time verification surface (WARDEN-595). A warden client probes
+// GET /capabilities from its Settings "Test connection" button to confirm the
+// receiver is reachable + schema-matched + authed BEFORE relying on it. Pure
+// read: returns the receiver's SCHEMA_VERSION + whether auth is required; reads
+// no body, persists nothing.
+export const CAPABILITIES_PATH = '/capabilities';
 
 // ── RETENTION CONFIG (WARDEN-579) ────────────────────────────────────────────
 // The persisted store is bounded by default (unbounded growth was the bug). The
@@ -385,6 +394,30 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
       }
     }
 
+    // GET /capabilities — the config-time verification surface (WARDEN-595). Lets
+    // a warden client confirm the receiver is reachable + schema-matched + authed
+    // BEFORE relying on it, via its Settings "Test connection" probe. Returns the
+    // receiver's SCHEMA_VERSION (so the client can detect cross-repo drift
+    // against its own vendored copy) and `authRequired` (whether AUTH_TOKEN is
+    // set). No request body is read; nothing is persisted — the verdict is a LIVE,
+    // on-demand probe, never a cached "connected" that could go stale (receiver
+    // down, token rotated) and become a false trust signal.
+    //
+    // Gated by the auth block above like every other route — DO NOT bypass the
+    // gate for this route. The gate is what makes the auth verdict meaningful: a
+    // receiver with AUTH_TOKEN set 401s an unauthenticated probe BEFORE this body
+    // is returned, and that 401 ITSELF communicates "auth required" (no
+    // special-casing). A probe carrying a valid token gets the 200, so
+    // `authRequired: true` is only ever observed once the caller is authenticated
+    // (an open receiver returns `authRequired: false`). Unknown method on this
+    // path still falls through to the 404 below.
+    if (req.method === 'GET' && pathname === CAPABILITIES_PATH) {
+      return sendJson(res, 200, {
+        schemaVersion: schema.SCHEMA_VERSION,
+        authRequired: Boolean(authToken),
+      });
+    }
+
     // Route: only POST /ingest is ingest. Anything else is a 404 (so a maintainer
     // scanning logs can tell probe noise from a receiver bug).
     if (req.method !== 'POST' || pathname !== INGEST_PATH) {
@@ -490,7 +523,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
         ? `retention: max ${maxEv} events${maxAh > 0 ? `, ${maxAh}h age` : ''}`
         : 'retention: OFF (unbounded — not recommended)';
     console.log(
-      `warden-telemetry receiver listening on :${port} (POST ${INGEST_PATH}, GET ${SUMMARY_PATH}; store: ${storePath}; ${authed}; ${retention})`
+      `warden-telemetry receiver listening on :${port} (POST ${INGEST_PATH}, GET ${SUMMARY_PATH}, GET ${CAPABILITIES_PATH}; store: ${storePath}; ${authed}; ${retention})`
     );
   });
 }

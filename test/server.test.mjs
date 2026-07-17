@@ -278,6 +278,95 @@ test('GET /summary on a write-only (source-less) store → 500, not a crash', as
   assert.match(JSON.parse(res.body).error, /source|summary/);
 });
 
+// ── GET /capabilities — the config-time verification surface (WARDEN-595) ───────
+// A client's Settings "Test connection" probe reads this to confirm the receiver
+// is reachable + schema-matched before relying on it. It returns the receiver's
+// SCHEMA_VERSION (sourced from the vendored schema — never a parallel literal) and
+// whether auth is required. Same zero-real-socket discipline: fake req/res, a bare
+// store (the path touches neither readEvents nor appendEvents).
+
+test('GET /capabilities → 200 + JSON with the receiver schemaVersion and authRequired:false (open receiver)', async () => {
+  const store = createNdjsonStore({ sink: async () => {} });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['content-type'], 'application/json');
+  // schemaVersion is sourced from the vendored schema, NOT a parallel literal —
+  // assert it equals the canonical SCHEMA_VERSION so a future bump can't drift here.
+  assert.equal(JSON.parse(res.body).schemaVersion, SCHEMA_VERSION);
+  assert.equal(JSON.parse(res.body).authRequired, false, 'an open receiver reports authRequired:false');
+});
+
+test('GET /capabilities schemaVersion tracks the injected schema (drift would surface here, not via a parallel literal)', async () => {
+  // If a future receiver schema bump forgets to update the vendored SCHEMA_VERSION,
+  // the capabilities body must still reflect whatever the injected schema declares —
+  // there is no second literal to fall out of sync with.
+  const store = createNdjsonStore({ sink: async () => {} });
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION: 999, validateEvent },
+  });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
+  assert.equal(JSON.parse(res.body).schemaVersion, 999);
+});
+
+test('GET /capabilities does NOT read the store (a probe touches no persisted data)', async () => {
+  let reads = 0;
+  const store = { readEvents: () => { reads += 1; return []; } };
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(reads, 0, 'capabilities never calls readEvents — it is a pure self-description');
+});
+
+test('GET /capabilities?foo=bar still routes (query string ignored, like /ingest and /summary)', async () => {
+  const store = createNdjsonStore({ sink: async () => {} });
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities?foo=bar' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).schemaVersion, SCHEMA_VERSION);
+});
+
+test('POST /capabilities → 404 (only GET /capabilities is wired; POST is not ingest)', async () => {
+  const { handler } = wiring();
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'POST', url: '/capabilities', body: validBody }), res);
+  assert.equal(res.statusCode, 404);
+});
+
+test('PUT /capabilities → 404 (only GET is wired)', async () => {
+  const { handler } = wiring();
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'PUT', url: '/capabilities', body: validBody }), res);
+  assert.equal(res.statusCode, 404);
+});
+
+test('all three GET read routes are served by the SAME createRequestHandler (no route drift between /summary and /capabilities)', async () => {
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+
+  const capsRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), capsRes);
+  assert.equal(capsRes.statusCode, 200, 'GET /capabilities is wired through the handler');
+  assert.equal(JSON.parse(capsRes.body).schemaVersion, SCHEMA_VERSION);
+
+  const summaryRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), summaryRes);
+  assert.equal(summaryRes.statusCode, 200, 'GET /summary is still wired (not displaced)');
+
+  const ingestRes = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), ingestRes);
+  assert.equal(ingestRes.statusCode, 202, 'POST /ingest still routes through the handler');
+});
+
 // ── RETENTION (WARDEN-579) ────────────────────────────────────────────────────
 // The maintenance trigger keeps the persisted store bounded. It runs prune OFF
 // the request path on a debounced (>=1 min), re-entrancy-guarded cadence — never
