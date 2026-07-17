@@ -31,10 +31,15 @@
 // also carries a bounded `rejections` tally (WARDEN-591) — counts by status of
 // the rejections that already happen at every rejection site, so a maintainer
 // can tell "traffic is arriving and being hard-rejected" from "no traffic at
-// all" — AND a bounded `timeline` distribution (WARDEN-603) — event counts per
-// time bucket over a rolling recent window, so a maintainer can distinguish a
-// recent volume spike (a regression / deploy) from a long-running baseline.
-// The client POSTs the batch verbatim to its configured endpointUrl (e.g.
+// all" — a bounded `persistErrors` tally (WARDEN-607) — count + most-recent
+// sample of the persist failures that already happen when the store refuses a
+// write, so a maintainer can tell "traffic is arriving, validating, but
+// un-storable" from "no traffic at all" (and the ingest handler returns a clean
+// retryable 503 on a persist failure instead of hanging the socket) — AND a
+// bounded `timeline` distribution (WARDEN-603) — event counts per time bucket
+// over a rolling recent window, so a maintainer can distinguish a recent volume
+// spike (a regression / deploy) from a long-running baseline. The client POSTs
+// the batch verbatim to its configured endpointUrl (e.g.
 // http://host:7421/ingest) and never rewrites the host, so these route paths
 // are the receiver's to define.
 
@@ -316,6 +321,77 @@ export function createRejectionTally({ now = Date.now } = {}) {
   };
 }
 
+// ── PERSIST-ERROR TALLY (WARDEN-607) ─────────────────────────────────────────
+// A bounded, in-memory, receiver-local tally of the persist failures that ALREADY
+// happen when `store.appendEvents()` throws (disk full / EACCES / EISDIR / a
+// missing or rewritten store file / a sink rejection). Before WARDEN-607 such a
+// failure was invisible twice over — the exact "silent signal-loss" WARDEN-591
+// closed on the READ/reject path, still open on the WRITE/persist path:
+//   - Client side (hung socket): the ingest request handler awaited ingest() with
+//     NO try/catch, so a persist throw rejected the handler promise and Node never
+//     called res.end() — the client's fetch HUNG until socket timeout, then
+//     surfaced as a network error (recovered only slowly + noisily via the client's
+//     accidental transient-retry path).
+//   - Maintainer side (invisible): the `rejections` tally is documented + tested to
+//     cover ONLY HTTP rejection sites (401/404/400/415/422) — a persist throw is
+//     not a `!result.ok` branch, so a receiver that received + validated events but
+//     could not write them returned the SAME empty /summary as an idle receiver.
+// This tally closes both gaps on the WRITE/persist path. It is a SEPARATE signal
+// from `rejections` by design: a persist failure is a distinct "validated but
+// un-storable" class (the events passed the schema check; the store refused them),
+// not an HTTP rejection, so it must not overload the rejection tally's documented
+// HTTP-rejection-sites-only contract.
+//
+// Bounded means: a total count + a SINGLE most-recent sample {reason, ts}. It does
+// NOT keep one record per failure, so a sustained store outage can't grow it. Like
+// the rejections tally, it "persists nothing" — it is in-memory and receiver-local
+// (a misconfiguration signal need not survive a restart), and ADDITIVE ONLY: it
+// records failures that already happen, relaxes no check, mirrors no invariant,
+// routes nothing.
+
+// The zeroed shape returned when no tally is wired OR no failure has been recorded
+// yet — identical to a fresh tally's snapshot(), so a healthy receiver reads the
+// same zeroed `persistErrors` whether or not the tally is wired (parity with
+// EMPTY_REJECTIONS: no false alarm on a quiet receiver).
+const EMPTY_PERSIST_ERRORS = Object.freeze({
+  total: 0,
+  lastReason: null,
+  lastSeen: null,
+});
+
+/**
+ * Build the persist-error tally (WARDEN-607). Mirrors the injected-seam discipline
+ * of `createRejectionTally`: an OPTIONAL handler dep (no tally wired = today's
+ * behavior, exactly like an absent rejections dep) with an injected `now` so the
+ * tally is unit-testable with a fake clock (no real Date in tests).
+ *
+ * @param {{ now?: () => number }} [opts]
+ * @returns {{
+ *   record(rec: { reason?: string }): void,
+ *   snapshot(): { total: number, lastReason: string | null, lastSeen: number | null }
+ * }}
+ */
+export function createPersistErrorTally({ now = Date.now } = {}) {
+  let total = 0;
+  let lastReason = null;
+  let lastSeen = null;
+
+  return {
+    /** Record one persist failure. Bounded: accumulates a total COUNT and tracks
+     *  only the single most-recent {reason, ts} — never one entry per call. */
+    record({ reason } = {}) {
+      total += 1;
+      lastReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
+      lastSeen = now();
+    },
+    /** A stable point-in-time copy of the aggregate (a later record does not mutate
+     *  a previously-returned snapshot). */
+    snapshot() {
+      return { total, lastReason, lastSeen };
+    },
+  };
+}
+
 /**
  * Build the request handler. `store` and `schema` are injected so the handler is
  * testable with a capturing store and WITHOUT a live port (tests call the handler
@@ -351,6 +427,23 @@ export function createRejectionTally({ now = Date.now } = {}) {
  * `rejections` dep = a zeroed `rejections` field on /summary and no recording —
  * today's behavior, exactly like an absent retention dep.
  *
+ * `persistErrors` (optional tally, WARDEN-607): a SEPARATE signal from
+ * `rejections`. When `await ingest(...)` THROWS — a persist failure
+ * (`store.appendEvents()` rejecting: disk full / EACCES / EISDIR / a missing or
+ * rewritten store file / a sink rejection; the one path that escapes ingest's
+ * rejection discipline as a throw rather than a `result`) — the handler catches
+ * it, returns a clean retryable 503 (no hung socket), AND records the failure via
+ * `persistErrors.record(...)`. GET /summary reads `persistErrors.snapshot()` so a
+ * maintainer can tell "traffic is arriving, validating, but the store is refusing
+ * writes" from "no traffic at all" (the two were indistinguishable before — a
+ * persist throw bypassed the `!result.ok` recording entirely). Like `rejections`,
+ * the recorded reason is the store/sink's OWN diagnostic (an OS errno such as
+ * ENOSPC / EACCES, or a sink error) — never a raw client payload: by the time the
+ * sink runs the store has already JSON.stringified each event, so a sink throw
+ * carries system info, not event bytes or extended-tier identifiers. No
+ * `persistErrors` dep = a zeroed `persistErrors` field on /summary and no
+ * recording — today's behavior, exactly like an absent rejections dep.
+ *
  * `now` (optional clock, WARDEN-603): the GET /summary `timeline` distribution
  * is a rolling recent window measured back from `now`, so the handler — the
  * testable seam — takes an injectable `now` (default `Date.now`) to stay
@@ -359,10 +452,10 @@ export function createRejectionTally({ now = Date.now } = {}) {
  * computed (it is a pure read over persisted `timestamp`s, like `summarize()`),
  * so every /summary response carries the field whether or not `now` is wired.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, now?: () => number }} deps
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, now?: () => number }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, now = Date.now } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, now = Date.now } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
 
   // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
@@ -370,6 +463,13 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
   // site below reads `recordRejection(...)`; the tally dep is the single switch.
   const recordRejection = (status, reason) => {
     if (rejections) rejections.record({ status, reason });
+  };
+  // Centralized persist-error recorder: a guarded no-op when no tally is wired
+  // (today's behavior — no recording, exactly like an absent rejections dep). The
+  // single persist-failure site below reads `recordPersistError(...)`; the tally
+  // dep is the single switch.
+  const recordPersistError = (reason) => {
+    if (persistErrors) persistErrors.record({ reason });
   };
   return async (req, res) => {
     // AUTH GATE — optional but, when authToken is set, the FIRST thing checked and
@@ -400,19 +500,21 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     if (req.method === 'GET' && pathname === SUMMARY_PATH) {
       try {
         const events = await store.readEvents();
-        // Compose the bounded `rejections` tally AND the bounded `timeline`
-        // distribution here — NOT inside summarize(). summarize(events) stays a
-        // PURE single-arg function of the event array (documented + tested that
-        // way); both are handler-composed, exactly the way `retention` is
-        // handler-injected rather than summarize-injected. `rejections` is the
-        // tally's snapshot when wired, or the zeroed EMPTY_REJECTIONS otherwise
-        // (stable shape for every caller). `timeline` is ALWAYS computed — a pure
-        // read over the events' `timestamp`s measured back from the injected `now`
-        // (default Date.now) — so the field is present for every caller, wired or
-        // not. Counts only; never raw events or extended-tier names.
+        // Compose the bounded `rejections` tally, the bounded `persistErrors`
+        // tally, AND the bounded `timeline` distribution here — NOT inside
+        // summarize(). summarize(events) stays a PURE single-arg function of the
+        // event array (documented + tested that way); all three are handler-
+        // composed, exactly the way `retention` is handler-injected rather than
+        // summarize-injected. `rejections` and `persistErrors` are each the tally's
+        // snapshot when wired, or their zeroed EMPTY_* shape otherwise (stable shape
+        // for every caller). `timeline` is ALWAYS computed — a pure read over the
+        // events' `timestamp`s measured back from the injected `now` (default
+        // Date.now) — so the field is present for every caller, wired or not.
+        // Counts only; never raw events or extended-tier names.
         return sendJson(res, 200, {
           ...summarize(events),
           rejections: rejections ? rejections.snapshot() : EMPTY_REJECTIONS,
+          persistErrors: persistErrors ? persistErrors.snapshot() : EMPTY_PERSIST_ERRORS,
           timeline: summarizeTimeline(events, { now }),
         });
       } catch (e) {
@@ -496,15 +598,41 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     }
 
     // ingest's own rejection discipline guarantees a non-retryable 4xx (or 202);
-    // map the result straight onto the response.
-    const result = await ingest({ headers: req.headers, body }, { ...schema, store });
+    // those come back as a `result` mapped straight onto the response. The ONE path
+    // that escapes that discipline as a THROW is a persist failure —
+    // `store.appendEvents()` rejecting (disk full / EACCES / EISDIR / a missing or
+    // rewritten store file / a sink rejection): ingest awaits the store, so a store
+    // throw rejects the ingest promise. Without this catch that rejection propagates
+    // → the handler promise rejects → Node never calls res.end() → the client's
+    // fetch HANGS until socket timeout (the WARDEN-607 bug). Catch it and return a
+    // clean RETRYABLE 503 (mirroring the /summary catch→clean-5xx handler above):
+    // the events were already schema-valid; the store may recover — so the client's
+    // existing isTransientStatus (5xx) bounded-retry path handles it WITHOUT a
+    // protocol change, instead of the today's hang→socket-timeout→network-error
+    // path. 4xx would be WRONG: ingest's rejection discipline reserves 4xx for the
+    // non-retryable "drop the batch" verdicts, and the client fails fast on those.
+    let result;
+    try {
+      result = await ingest({ headers: req.headers, body }, { ...schema, store });
+    } catch (e) {
+      // The recorded reason is the store/sink's OWN diagnostic — an OS errno
+      // (ENOSPC / EACCES / EISDIR) or a sink error — NEVER a raw client payload:
+      // by the time the sink runs the store has already JSON.stringified each event
+      // (store.mjs), so a sink throw carries system info, not event bytes or
+      // extended-tier identifiers (the trust model is preserved). Bounded by the
+      // tally: a total count + this single most-recent sample only.
+      recordPersistError(e?.message ?? String(e));
+      return sendJson(res, 503, { error: 'could not persist telemetry batch' });
+    }
 
     // REJECTIONS (WARDEN-591) — record the ingest-result rejections (400/415/422)
     // for the /summary tally. These are the rejections that come BACK from ingest()
     // as a `result`; the auth-gate 401, the 404, and the body-read 400 were already
     // recorded at their own early-return sites above. The sample reason is ingest's
     // own diagnostic string (e.g. "unsupported telemetry schema version..."), never
-    // a raw client payload. Accepted traffic (result.ok) records nothing here.
+    // a raw client payload. Accepted traffic (result.ok) records nothing here. A
+    // persist failure (caught above) records into the SEPARATE persistErrors tally,
+    // NOT here — a store throw never reaches this `!result.ok` branch.
     if (!result.ok) {
       recordRejection(result.status, result.body && result.body.error);
     }
@@ -548,7 +676,8 @@ export function createReceiver({
   const maxAgeMs = maxAgeHours > 0 ? maxAgeHours * HOUR_MS : 0;
   const retention = createRetentionTrigger(store, { maxEvents, maxAgeMs });
   const rejections = createRejectionTally();
-  const handler = createRequestHandler({ store, schema, authToken, retention, rejections });
+  const persistErrors = createPersistErrorTally();
+  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors });
   const server = createServer(handler);
 
   // Periodic age-expiry sweep — ONLY when an age window is set. A quiet store

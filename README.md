@@ -112,6 +112,11 @@ curl http://localhost:7421/summary
 #     "lastReason": "unsupported telemetry schema version...",  # receiver diagnostic, not a payload
 #     "lastSeen": 1720000099000
 #   },
+#   "persistErrors": {
+#     "total": 2,                            # count of accepted batches that failed to persist
+#     "lastReason": "ENOSPC: no space left on device, write",   # store/sink diagnostic, not a payload
+#     "lastSeen": 1720000099000
+#   },
 #   "timeline": {
 #     "buckets": [
 #       { "bucketStart": 1719913600000, "bucketEnd": 1719915400000, "count": 2 },   # earlier baseline
@@ -141,6 +146,21 @@ tally is receiver-local and **does not survive a restart** (a misconfiguration d
 purely additive: it records rejections that already happen, relaxes no check, and routes nothing anywhere.
 When `AUTH_TOKEN` is set, add the bearer header (e.g. `-H "Authorization: Bearer <token>"`) to this and
 every other request — see below.
+
+`persistErrors` is the write-path twin of `rejections`: a bounded, in-memory tally of the accepted batches
+that **validated but could not be persisted** — a persist failure (`store.appendEvents()` throwing: disk
+full, `EACCES`, `EISDIR`, a missing/rewritten store file, a sink rejection). It reports a `total` count and
+the single most-recent sample (`lastReason` / `lastSeen`). It exists so you can tell **traffic is arriving,
+validating, but the store is refusing writes** apart from **no traffic at all**: an idle receiver returns a
+zeroed `persistErrors`, identical to the healthy shape. It is a **separate signal** from `rejections` by
+design — a persist failure is a distinct "validated but un-storable" class, not an HTTP rejection, so it does
+not overload `rejections`' rejection-sites-only contract. `lastReason` is the store/sink's own diagnostic
+(an OS `errno` such as `ENOSPC` / `EACCES`, or a sink error) — never a raw event payload or extended-tier
+identifier (by the time the sink runs, each event is already serialized to a line, so a sink throw carries
+system info, not event bytes). Like `rejections`, it is receiver-local, does not survive a restart, and is
+purely additive. A persist failure is also returned to the client as a clean **retryable `503`** (not a hung
+socket): the events were already schema-valid, the store may recover, and the client's existing 5xx
+bounded-retry path handles it without a protocol change.
 
 `timeline` is a bounded temporal distribution — event **counts per time bucket** over a rolling recent
 window (the last 24h, split into at most 48 buckets of 30 min each) — so you can distinguish a **recent
