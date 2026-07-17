@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, createRejectionTally, DEFAULT_MAX_EVENTS } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, DEFAULT_MAX_EVENTS } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 
@@ -1018,6 +1018,257 @@ test('GET /summary WITHOUT a wired tally still returns a zeroed rejections field
     total: 0,
     byStatus: {},
     lastStatus: null,
+    lastReason: null,
+    lastSeen: null,
+  });
+});
+
+// ── PERSIST-ERROR TALLY (WARDEN-607) ─────────────────────────────────────────
+// The WRITE-path twin of the rejections tally. Before WARDEN-607, a persist
+// failure (store.appendEvents() throwing — disk full / EACCES / EISDIR / a missing
+// store file / a sink rejection) was invisible twice over: the ingest handler
+// awaited ingest() with NO try/catch, so a persist throw rejected the handler
+// promise and res.end() was NEVER called (the client's fetch hung until socket
+// timeout), AND no tally covered the persist path (the rejections tally is
+// HTTP-rejection-sites-only), so an all-un-storable receiver returned the SAME
+// empty /summary as an idle one. Below: the tally is driven directly with an
+// INJECTED fake clock (mirroring the rejections tally unit tests), then the
+// handler is proven to (1) catch a persist throw → a clean retryable 503 with no
+// hung socket, (2) surface a BOUNDED persistErrors aggregate on GET /summary, and
+// (3) keep it a SEPARATE signal from rejections. Still ZERO real fs, ZERO real
+// network — driven with fake req/res and a capturing-but-throwing sink.
+
+// A store whose appendEvents() THROWS on every write (a persist failure),
+// mirroring the production case (disk full / EACCES / a sink rejection). A source
+// is wired too so a follow-up GET /summary can read the persistErrors tally on the
+// SAME handler. `makeError` controls the throw (varied messages for the bounded
+// test); it defaults to a single 'disk full'.
+function failingPersistStore(makeError = () => new Error('disk full')) {
+  const lines = [];
+  return createNdjsonStore({
+    sink: async () => {
+      throw makeError();
+    },
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+}
+
+// Wire a handler to a store whose appendEvents() throws + a persistErrors tally
+// with an INJECTED clock (so lastSeen is deterministic). Mirrors wiringWithTally.
+function wiringWithPersistErrors({ now, makeError } = {}) {
+  const store = failingPersistStore(makeError);
+  const persistErrors = createPersistErrorTally(now != null ? { now } : {});
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    persistErrors,
+  });
+  return { handler, persistErrors, store };
+}
+
+// Drive GET /summary on the handler and return just the `persistErrors` aggregate.
+async function summaryPersistErrors(handler) {
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200, 'summary read must succeed to inspect the tally');
+  return JSON.parse(res.body).persistErrors;
+}
+
+test('persistErrors tally: a fresh tally snapshots to the zeroed shape (parity with a healthy receiver)', () => {
+  const tally = createPersistErrorTally({ now: () => 0 });
+  assert.deepEqual(tally.snapshot(), {
+    total: 0,
+    lastReason: null,
+    lastSeen: null,
+  });
+});
+
+test('persistErrors tally: record() accumulates the total + tracks the most-recent occurrence', () => {
+  let clock = 1000;
+  const tally = createPersistErrorTally({ now: () => clock });
+  tally.record({ reason: 'ENOSPC: no space left on device, write' });
+  clock = 2000;
+  tally.record({ reason: "EACCES: permission denied, open '/var/lib/warden/events.ndjson'" });
+
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 2);
+  assert.equal(
+    snap.lastReason,
+    "EACCES: permission denied, open '/var/lib/warden/events.ndjson'",
+    'lastReason is the single most-recent sample (the receiver/store diagnostic)'
+  );
+  assert.equal(snap.lastSeen, 2000, 'lastSeen is the injected now() of the most-recent record');
+});
+
+test('persistErrors tally: snapshot() is a stable point-in-time copy — a later record does not mutate it', () => {
+  let clock = 5000;
+  const tally = createPersistErrorTally({ now: () => clock });
+  tally.record({ reason: 'disk full' });
+  const snap = tally.snapshot();
+  clock = 6000;
+  tally.record({ reason: 'EISDIR: illegal operation on a directory, write' });
+  // the earlier snapshot is unchanged by the later record
+  assert.deepEqual(snap, { total: 1, lastReason: 'disk full', lastSeen: 5000 });
+  // a fresh snapshot reflects the new state
+  assert.equal(tally.snapshot().total, 2);
+  assert.equal(tally.snapshot().lastReason, 'EISDIR: illegal operation on a directory, write');
+});
+
+test('persistErrors tally: BOUNDED — many records with varied reasons never grow unbounded (one count, one sample)', () => {
+  // Mirrors "rejections tally: BOUNDED". 1000 distinct reasons must accumulate to
+  // a single COUNT + the single most-recent sample, never one entry per failure.
+  const tally = createPersistErrorTally({ now: () => 0 });
+  for (let i = 0; i < 1000; i++) {
+    tally.record({ reason: `outage reason #${i}` }); // 1000 distinct reasons
+  }
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 1000);
+  assert.equal(snap.lastReason, 'outage reason #999', 'only the single most-recent sample reason is retained');
+  assert.deepEqual(Object.keys(snap).sort(), ['lastReason', 'lastSeen', 'total'], 'shape stays bounded — no per-failure growth');
+});
+
+test('persistErrors tally: record() with a non-string/missing reason stores null (no unbounded/garbage reason)', () => {
+  const tally = createPersistErrorTally({ now: () => 0 });
+  tally.record({ reason: 12345 }); // wrong type — not a diagnostic string
+  tally.record({}); // missing reason
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 2);
+  assert.equal(snap.lastReason, null, 'a non-string/missing reason is not retained');
+});
+
+// ── PERSIST-ERROR AGGREGATE surfaced in GET /summary + clean 503 (WARDEN-607) ──
+// A persist failure is caught → clean retryable 503 (no hung socket) AND recorded
+// into a tally whose snapshot GET /summary reads. Driven through the handler with
+// a throwing sink; the tally persists across requests on the SAME handler closure.
+
+test('a persist failure (store.appendEvents throws) → clean retryable 503, no hung/rejected response', async () => {
+  // The WARDEN-607 bug: before the fix, a persist throw rejected the handler
+  // promise and res.end() was never called — the client's fetch hung until socket
+  // timeout. The handler must now RESOLVE with a clean 503 (res.ended === true).
+  const { handler } = wiringWithPersistErrors();
+  const res = fakeRes();
+  // This await RESOLVES — today's bug made it reject. (If it rejected, node:test
+  // surfaces the rejection as a failure before the assertions below run.)
+  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  assert.equal(res.ended, true, 'the response is ended — no hung socket');
+  assert.equal(res.statusCode, 503, 'a persist failure is a clean retryable 503 (5xx, not a 4xx drop)');
+  assert.equal(res.headers['content-type'], 'application/json');
+  assert.deepEqual(JSON.parse(res.body), { error: 'could not persist telemetry batch' });
+});
+
+test('a persist failure 503 never echoes the raw event payload (trust model preserved)', async () => {
+  // The 503 body is the receiver's own FIXED diagnostic — never the event bytes
+  // that failed to persist. The seeded event is schema-VALID (so ingest reaches the
+  // sink and the throw fires) yet carries a raw message + an extended-tier name;
+  // neither must reach the response (parity with the rejection-tally trust tests).
+  const secretBody = JSON.stringify({
+    schemaVersion: 1,
+    events: [{ ...validError, name: 'SecretErrorName', message: 'super secret stack detail', chatName: 'Refactor auth' }],
+  });
+  const { handler } = wiringWithPersistErrors();
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: secretBody }), res);
+  assert.equal(res.statusCode, 503, 'the valid event reached the sink and tripped the persist failure');
+  const json = res.body;
+  assert.equal(json.includes('super secret stack detail'), false, 'no raw message in the 503');
+  assert.equal(json.includes('Refactor auth'), false, 'no extended-tier identifier in the 503');
+  assert.equal(json.includes('SecretErrorName'), false, 'no error name in the 503');
+});
+
+test('a persist failure is surfaced in GET /summary — "validated but un-storable" made visible', async () => {
+  const { handler } = wiringWithPersistErrors({ now: () => 12345 });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  assert.equal(res.statusCode, 503);
+
+  const pe = await summaryPersistErrors(handler);
+  assert.ok(pe.total >= 1, 'the persist failure was recorded');
+  assert.equal(pe.lastReason, 'disk full', 'sample reason is the store diagnostic, not a payload');
+  assert.equal(pe.lastSeen, 12345, 'lastSeen is the injected now() of the failure');
+});
+
+test('persistErrors stay BOUNDED across many failures with varied reasons — one count + single most-recent sample', async () => {
+  // Drive many persist failures with varied sink-throw messages; the tally must
+  // accumulate a COUNT and retain only the single most-recent sample (mirroring the
+  // "rejections tally: BOUNDED" test). lastSeen advances via the injected clock.
+  let clock = 0;
+  let i = 0;
+  const { handler } = wiringWithPersistErrors({
+    now: () => (clock += 1000),
+    makeError: () => new Error(`outage #${i++}`),
+  });
+  for (let n = 0; n < 50; n++) {
+    await handler(fakeReq({ headers: headersV1, body: validBody }), fakeRes());
+  }
+  const pe = await summaryPersistErrors(handler);
+  assert.equal(pe.total, 50);
+  assert.equal(pe.lastReason, 'outage #49', 'only the single most-recent sample reason is retained');
+  assert.equal(pe.lastSeen, 50_000, 'lastSeen is the injected now() of the most-recent failure');
+  assert.deepEqual(Object.keys(pe).sort(), ['lastReason', 'lastSeen', 'total'], 'shape stays bounded — no per-failure growth');
+});
+
+test('a persist failure records into persistErrors, NOT into the rejections tally (separate signals)', async () => {
+  // A persist failure is a distinct "validated but un-storable" class — it must not
+  // overload the rejection tally's HTTP-rejection-sites-only contract. Wire BOTH
+  // tallies; a persist throw bumps persistErrors and leaves rejections at zero.
+  let clock = 7000;
+  const store = failingPersistStore();
+  const rejections = createRejectionTally({ now: () => clock });
+  const persistErrors = createPersistErrorTally({ now: () => clock });
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    rejections,
+    persistErrors,
+  });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  assert.equal(res.statusCode, 503);
+
+  const summaryRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), summaryRes);
+  const body = JSON.parse(summaryRes.body);
+  assert.equal(body.persistErrors.total, 1, 'the persist failure was recorded in its own tally');
+  assert.deepEqual(
+    body.rejections,
+    { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null },
+    'rejections untouched — a persist failure is not an HTTP rejection'
+  );
+});
+
+test('a successful ingest (202) does NOT increment persistErrors (a healthy write is never a failure)', async () => {
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const persistErrors = createPersistErrorTally({ now: () => 0 });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, persistErrors });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  assert.equal(res.statusCode, 202);
+
+  const pe = await summaryPersistErrors(handler);
+  assert.deepEqual(pe, { total: 0, lastReason: null, lastSeen: null });
+});
+
+test('an idle receiver (no traffic) returns zeroed persistErrors in GET /summary (parity with today — no false alarm)', async () => {
+  const { handler } = wiringWithPersistErrors();
+  const pe = await summaryPersistErrors(handler);
+  assert.deepEqual(pe, { total: 0, lastReason: null, lastSeen: null });
+});
+
+test('GET /summary WITHOUT a wired persistErrors tally still returns a zeroed persistErrors field (backward-compatible additive shape)', async () => {
+  // A caller that does not pass a persistErrors tally (e.g. the existing test
+  // wirings) still gets the field, zeroed — the handler is unchanged for callers
+  // that don't wire the tally, exactly like an absent rejections dep.
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store }); // no persistErrors, no schema override
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res.body).persistErrors, {
+    total: 0,
     lastReason: null,
     lastSeen: null,
   });
