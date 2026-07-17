@@ -271,6 +271,61 @@ test('AUTH_TOKEN set: GET /summary WITH a valid token → 200 (authenticated rea
   assert.equal(JSON.parse(res.body).total, 1);
 });
 
+// ── The config-time verification surface GET /capabilities (WARDEN-595) is gated too ──
+// The capabilities route is the one a client probes BEFORE it trusts the receiver, so
+// the auth gate covering it is what makes the "auth verdict" meaningful: a gated
+// receiver 401s an unauthenticated probe (the 401 IS the "auth required" signal — no
+// special-casing), and only a probe carrying a valid token observes authRequired:true.
+// These pin that the gate runs before the capabilities route, mirroring the /summary
+// assertions. A bare fake store: the capabilities path touches neither readEvents nor
+// appendEvents, and the reject path must touch neither.
+
+test('AUTH_TOKEN set: unauthenticated GET /capabilities → 401 (the gate covers the probe route too)', async () => {
+  let reads = 0;
+  const store = { readEvents: () => { reads += 1; return []; } };
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, authToken: SECRET });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
+  assert.equal(res.statusCode, 401, 'the capabilities probe is rejected before routing');
+  assert.equal(reads, 0, 'the store was never touched on a reject');
+});
+
+test('AUTH_TOKEN set: GET /capabilities WITH a valid token → 200 + authRequired:true (a gated receiver declares it)', async () => {
+  const store = { readEvents: () => [] };
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, authToken: SECRET });
+  const res = fakeRes();
+  await handler(
+    fakeReq({ method: 'GET', url: '/capabilities', headers: { authorization: `Bearer ${SECRET}` } }),
+    res
+  );
+  assert.equal(res.statusCode, 200, 'a valid token lets the probe proceed past the gate');
+  const body = JSON.parse(res.body);
+  assert.equal(body.schemaVersion, SCHEMA_VERSION);
+  assert.equal(body.authRequired, true, 'a gated receiver reports authRequired:true (only observable once authenticated)');
+});
+
+test('AUTH_TOKEN set: GET /capabilities with a WRONG token → 401 (a probe that fails auth does not reach the body)', async () => {
+  const store = { readEvents: () => [] };
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, authToken: SECRET });
+  const res = fakeRes();
+  await handler(
+    fakeReq({ method: 'GET', url: '/capabilities', headers: { authorization: 'Bearer totally-wrong-token' } }),
+    res
+  );
+  assert.equal(res.statusCode, 401);
+});
+
+test('AUTH_TOKEN unset: GET /capabilities → 200 + authRequired:false (an open receiver is reachable without a token)', async () => {
+  const store = { readEvents: () => [] };
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } }); // no authToken
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.schemaVersion, SCHEMA_VERSION);
+  assert.equal(body.authRequired, false, 'an open receiver reports authRequired:false');
+});
+
 // ── Constant-time compare is rejection-safe (never throws on edge inputs) ────────
 
 test('tokensMatch path: an empty provided token against a set secret is rejected without throwing', async () => {
