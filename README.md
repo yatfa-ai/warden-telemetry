@@ -15,12 +15,14 @@ server that accepts those events.
 > event against the shared schema, hard-reject anything outside it, and durably persist accepted events —
 > is in place (`server.mjs`), alongside a maintainer **`GET /summary`** read surface that aggregates the
 > persisted events into act-on-able signal (totals, per-type counts, top error names, schema-version
-> distribution) and a **`GET /capabilities`** config-time verification surface a client probes to confirm
-> reachability + schema match + auth before relying on the receiver. **Every route — `/ingest`, `/summary`,
-> and `/capabilities` — is gated behind an optional shared-secret bearer token (`AUTH_TOKEN`).** The persisted
-> store is bounded by a maintainer-configurable **retention** policy (a count cap and/or an age window) so
-> events don't accumulate without limit over the receiver's lifetime. Multi-version schema support is a later
-> slice. See [Running](#running-the-receiver) below and the design reference at the bottom.
+> distribution), a **`GET /capabilities`** config-time verification surface a client probes to confirm
+> reachability + schema match + auth before relying on the receiver, and a **`GET /events`** drill-down
+> that returns the recent events themselves at full fidelity (the diagnostic payloads `/summary` only
+> counts), bounded to a newest-N window with type/since filters. **Every route — `/ingest`, `/summary`,
+> `/capabilities`, and `/events` — is gated behind an optional shared-secret bearer token (`AUTH_TOKEN`).**
+> The persisted store is bounded by a maintainer-configurable **retention** policy (a count cap and/or an
+> age window) so events don't accumulate without limit over the receiver's lifetime. Multi-version schema
+> support is a later slice. See [Running](#running-the-receiver) below and the design reference at the bottom.
 
 ## Why a separate repo
 
@@ -78,7 +80,7 @@ Requires **Node ≥ 22.6** (target 24, to match the Warden backend) for native t
 vendored `schema.ts`.
 
 ```bash
-node server.mjs            # listens on :7421, POST /ingest + GET /summary + GET /capabilities, persists ./telemetry.ndjson
+node server.mjs            # listens on :7421, POST /ingest + GET /summary + GET /capabilities + GET /events, persists ./telemetry.ndjson
 PORT=8080 STORE=/var/lib/warden/events.ndjson node server.mjs
 AUTH_TOKEN=cpy0kr3v... node server.mjs   # gate every route behind a shared secret
 STORE_MAX_EVENTS=50000 STORE_MAX_AGE_HOURS=168 node server.mjs   # retain newest 50k events / 7 days
@@ -175,6 +177,53 @@ receiver returns `authRequired: false`. The client drives this from its Settings
 connected / schema-drift / auth-required / no-receiver — that is **never persisted**: a cached "connected"
 would go stale (receiver down, token rotated) and become a false trust signal, so it stays an on-demand probe.
 
+### Drilling into individual events — `GET /events`
+
+`/summary` tells you *how many*; `GET /events` lets you inspect the *actual* recent events at **full
+fidelity** — the diagnostic payloads `/summary` deliberately discards: an error's `message` + `frames`, a
+crash's `reason`, a stall's `lagMs`. It is the drill-down that turns `/summary`'s counts into inspectable,
+act-on-able events, in-product — without SSH-ing to the receiver host to hand-parse `telemetry.ndjson` with
+`jq`.
+
+```bash
+curl 'http://localhost:7421/events?type=error&limit=3'
+# {
+#   "events": [
+#     {
+#       "schemaVersion": 1, "type": "error", "runtime": "main",
+#       "timestamp": 1720000000000, "name": "TypeError",
+#       "message": "Cannot read properties of undefined",   # /summary drops this
+#       "frames": [{ "function": "foo", "file": "app.js", "line": 42 }]
+#     },
+#     ...
+#   ],
+#   "total": 42                                          # full persisted count (pre-window)
+# }
+```
+
+The response is **bounded and filterable**:
+
+- **`?limit=N`** (default `100`, hard-capped at `200`) — returns the **newest N** persisted events by arrival
+  order. The hard cap means a near-full store (up to the 10000-event retention cap) can never yield a
+  multi-megabyte response; a request for `limit=50000` returns at most `200`. A missing/non-numeric/
+  non-positive `limit` falls back to the default.
+- **`?type=`** — filter to one base type (`error` | `crash` | `performance-stall`). Exact match; a value that
+  matches nothing returns an empty `events` array.
+- **`?since=`** — keep only events whose epoch-ms `timestamp` is `>= since` (an absolute cutoff, inclusive).
+  Useful for "what landed since I last looked."
+
+Filters are conjunctive (an event must match all that apply), and the newest-N window is taken from the
+*filtered* set. `total` is always the **full persisted count** (before the window/filter), so you can see how
+much the window is a window *of*. A fresh receiver with no traffic returns `{ "events": [], "total": 0 }`
+with `200` (parity with `/summary`'s empty-store shape).
+
+The trust posture is identical to `/summary`: the route reads **only already-persisted, already-schema-
+validated, already-client-redacted** events via the existing store read seam. It introduces no new
+collection, re-collects nothing, routes to no third party, performs no server-side redaction, and expands no
+tier — it returns exactly what consent + redaction already allowed to land, full-fidelity instead of
+aggregate. When `AUTH_TOKEN` is set, `GET /events` inherits that gate (add the bearer header) the same as
+every other route — it is not re-implemented per route.
+
 ### Keeping the store bounded — retention
 
 Accepted events are appended to one NDJSON file. Without a bound that file grows for as long as the
@@ -212,11 +261,11 @@ AUTH_TOKEN=$(openssl rand -hex 32) node server.mjs   # generate a strong secret,
 ```
 
 When `AUTH_TOKEN` is set, **every** route requires an `Authorization: Bearer <AUTH_TOKEN>` header, checked
-before routing — so neither `/ingest`, `/summary`, nor `/capabilities` can be reached without the secret. A
-request missing a valid token is rejected with **401** (a non-retryable 4xx; the client drops the batch rather
-than looping). When `AUTH_TOKEN` is **unset**, behavior is unchanged (open) — the keystone stays runnable bare
-for local dev. The secret is compared in constant time. Set the matching token on the Warden client side via
-the Settings "Receiver auth token" field (sent as the same `Authorization: Bearer` header).
+before routing — so none of `/ingest`, `/summary`, `/capabilities`, or `/events` can be reached without the
+secret. A request missing a valid token is rejected with **401** (a non-retryable 4xx; the client drops the
+batch rather than looping). When `AUTH_TOKEN` is **unset**, behavior is unchanged (open) — the keystone stays
+runnable bare for local dev. The secret is compared in constant time. Set the matching token on the Warden
+client side via the Settings "Receiver auth token" field (sent as the same `Authorization: Bearer` header).
 
 ## Design reference
 

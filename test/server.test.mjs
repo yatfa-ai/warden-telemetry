@@ -345,7 +345,19 @@ test('PUT /capabilities → 404 (only GET is wired)', async () => {
   assert.equal(res.statusCode, 404);
 });
 
-test('all three GET read routes are served by the SAME createRequestHandler (no route drift between /summary and /capabilities)', async () => {
+// ── GET /events — routing integration (WARDEN-599) ────────────────────────────
+// The full-fidelity drill-down surface is wired through createRequestHandler
+// ALONGSIDE /ingest, /summary, and /capabilities (no route drift), inherits the
+// auth gate, and does not swallow the 404 fall-through. The selectEvents matrix +
+// the full GET /events handler behavior (filters, bound, DONE criterion,
+// readEvents-never-runs on reject) lives in test/events.test.mjs; THIS block pins
+// the ROUTING properties that are this file's concern: cross-route wiring through
+// one handler + the inherited gate + the preserved 404.
+
+test('every route is served by the SAME createRequestHandler (no route drift across /ingest, /summary, /capabilities, /events)', async () => {
+  // Drift-style: every route is wired THROUGH createRequestHandler — one handler
+  // serves them all, proving none displaced or shadowed another. WARDEN-595 added
+  // /capabilities and WARDEN-599 added /events; both coexist with the originals.
   const lines = [];
   const store = createNdjsonStore({
     sink: async (line) => void lines.push(line),
@@ -353,18 +365,44 @@ test('all three GET read routes are served by the SAME createRequestHandler (no 
   });
   const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
 
-  const capsRes = fakeRes();
-  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), capsRes);
-  assert.equal(capsRes.statusCode, 200, 'GET /capabilities is wired through the handler');
-  assert.equal(JSON.parse(capsRes.body).schemaVersion, SCHEMA_VERSION);
+  const ingestRes = fakeRes();
+  await handler(fakeReq({ headers: headersV1, body: validBody }), ingestRes);
+  assert.equal(ingestRes.statusCode, 202, 'POST /ingest still routes through the handler');
 
   const summaryRes = fakeRes();
   await handler(fakeReq({ method: 'GET', url: '/summary' }), summaryRes);
   assert.equal(summaryRes.statusCode, 200, 'GET /summary is still wired (not displaced)');
 
-  const ingestRes = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), ingestRes);
-  assert.equal(ingestRes.statusCode, 202, 'POST /ingest still routes through the handler');
+  // WARDEN-595: /capabilities coexists with the originals.
+  const capsRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), capsRes);
+  assert.equal(capsRes.statusCode, 200, 'GET /capabilities is wired through the handler');
+  assert.equal(JSON.parse(capsRes.body).schemaVersion, SCHEMA_VERSION);
+
+  // WARDEN-599: /events coexists too — and returns the ingested event at full fidelity.
+  const eventsRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events' }), eventsRes);
+  assert.equal(eventsRes.statusCode, 200, 'GET /events is wired through the same handler');
+  const body = JSON.parse(eventsRes.body);
+  assert.equal(body.total, 1, 'the ingested event is readable at full fidelity via /events');
+  assert.equal(body.events[0].name, 'E', 'the diagnostic name /summary would also surface');
+});
+
+test('GET /events inherits the auth gate — no token with AUTH_TOKEN set → 401', async () => {
+  // The gate runs BEFORE routing, so /events inherits it with zero new auth code.
+  const store = readableStore([errorEvent]);
+  const handler = createRequestHandler({ store, authToken: 'server-test-secret' });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events' }), res);
+  assert.equal(res.statusCode, 401);
+});
+
+test('GET /events does NOT swallow the 404 fall-through — an unknown path still 404s', async () => {
+  const store = readableStore([errorEvent]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events-typo' }), res);
+  assert.equal(res.statusCode, 404);
 });
 
 // ── TIMELINE DISTRIBUTION (WARDEN-603) ────────────────────────────────────────
