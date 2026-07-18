@@ -3,7 +3,8 @@
 // They take the events read back via the store and return the AGGREGATE object a
 // self-hosting maintainer can act on (counts / histograms only):
 //   - `summarize(events)`        → flat aggregates (total / byType / topErrorNames
-//                                  / schemaVersions / appVersions / platforms / firstSeen / lastSeen).
+//                                  / topSignatures / schemaVersions / appVersions
+//                                  / platforms / firstSeen / lastSeen).
 //   - `summarizeTimeline(events)` → a bounded temporal distribution (event counts
 //                                  per time bucket over a rolling recent window,
 //                                  WARDEN-603) so a maintainer can distinguish a
@@ -14,9 +15,11 @@
 // validated by `ingest` AND redacted client-side pre-collection before it ever
 // reached disk. They introduce NO new data, re-collect nothing, and route to no
 // third party (a local read on the self-hosted receiver). Return aggregates only:
-// counts, per-type totals, non-identifying error `name`s, a schema-version
-// histogram, an app-release `appVersion` histogram, an OS `platform` histogram,
-// and a counts-only time distribution. NEVER echo raw events or extended-tier
+// counts, per-type totals, non-identifying error `name`s, a non-identifying
+// failure `signature` histogram (error name + top stack frame / crash reason /
+// stall source), a schema-version histogram, an app-release `appVersion`
+// histogram, an OS `platform` histogram, and a counts-only time distribution.
+// NEVER echo raw events or extended-tier
 // names (chatName /
 // sessionName) — those are the only identifiers ever present, and a summary has
 // no need of them.
@@ -34,11 +37,29 @@
 // answer "is this crash/error spike Mac / Windows / Linux-specific?" instead of
 // staring at un-attributable volume. Same COUNTS-only histogram shape, same trust
 // posture, same skip-robust bucketing as `appVersions`.
+//
+// `topSignatures` (WARDEN-707) is the failure axis `topErrorNames` cannot show:
+// `topErrorNames` groups by `Error#name` ONLY, so `TypeError: 847` is unreadable
+// (one regression × 847, or 847 distinct bugs?). `topSignatures` ranks DISTINCT
+// failures via a per-type `signatureOf(event)` derivation built ONLY from
+// schema-deemed-non-identifying structured fields — error `name` + the FIRST
+// stack frame's `function`/`file`/`line`, crash `reason`+`exitCode`, stall
+// `source`. It is a counts-only histogram of those bucket keys, identical in
+// posture to `topErrorNames`/`appVersions`/`platforms`: it incorporates NO free
+// text and NO extended-tier identifier. It MUST NOT read `message` (redacted free
+// text — the field most likely to carry residual identifying fragments) nor
+// `chatName`/`sessionName` (the only identifiers ever present); an error whose
+// frames are empty / lack the location fields degrades to the bare `name` (exactly
+// the `topErrorNames` bucket), so nothing regresses.
 
 import { BASE_EVENT_TYPES } from './schema.ts';
 
 // Cap the top-error-names list so a runaway variety of names stays readable.
 const TOP_ERROR_NAMES_CAP = 10;
+
+// Cap the top-signatures list at the same bound so a wide variety of distinct
+// failures stays readable on the summary surface (mirrors TOP_ERROR_NAMES_CAP).
+const TOP_SIGNATURES_CAP = 10;
 
 // ── TEMPORAL DISTRIBUTION config (WARDEN-603) ────────────────────────────────
 // The rolling recent window a maintainer reads to spot a RECENT volume spike
@@ -54,6 +75,94 @@ export const DEFAULT_TIMELINE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h
 export const DEFAULT_TIMELINE_MAX_BUCKETS = 48;
 
 /**
+ * Derive a deterministic, NON-IDENTIFYING failure `signature` for an event, by
+ * `type`, so `topSignatures` can rank DISTINCT failures (one regression × N vs N
+ * distinct bugs) — the axis `topErrorNames` (Error#name only) cannot show.
+ *
+ * Pure and total: a non-object, or an event whose type yields no signature (an
+ * unknown type, an error with no `name`, a crash with no `reason`, a stall with
+ * no `source`), returns `null` — skipped by the aggregator, never fatal.
+ *
+ * TRUST MODEL (load-bearing for roadmap WARDEN-446 — do not erode): built ONLY
+ * from schema-deemed-non-identifying structured fields. It MUST NOT incorporate
+ * `message` (redacted free text — the field most likely to carry residual
+ * identifying fragments, schema.ts) nor any extended-tier identifier
+ * (`chatName` / `sessionName`). It reads at most: error `name` + the FIRST stack
+ * frame's `function`/`file`/`line` (frames[0] — the top of the stack, closest to
+ * where it threw; there is no "in-app" marker in `StackFrame`); crash `reason`
+ * (Electron's fixed enum — `oom`/`crashed`/`killed`… — not identifying) +
+ * optional `exitCode`; stall `source` (`'event-loop' | 'unresponsive'`).
+ *
+ * An error with empty `frames`, or whose `frames[0]` lacks ALL of
+ * `function`/`file`/`line`, degrades to the bare `name` — exactly today's
+ * `topErrorNames` bucket — so this is a graceful superset and nothing regresses.
+ *
+ * @param {unknown} event
+ * @returns {string | null} the signature, or `null` if the event yields none
+ */
+export function signatureOf(event) {
+  if (!event || typeof event !== 'object') return null;
+  const e = event;
+  const type = e.type;
+
+  if (type === 'error') {
+    const name = e.name;
+    // A nameless error yields no signature (it would also be skipped by
+    // topErrorNames); skip rather than emit a junk key.
+    if (typeof name !== 'string' || name.length === 0) return null;
+    const seg = _frameSegment(Array.isArray(e.frames) ? e.frames[0] : undefined);
+    return seg === null ? name : `${name}${seg}`;
+  }
+
+  if (type === 'crash') {
+    const reason = e.reason;
+    if (typeof reason !== 'string' || reason.length === 0) return null;
+    const exitCode = e.exitCode;
+    // Omit the `:exit=N` segment when exitCode is absent (an optional field).
+    if (typeof exitCode === 'number' && Number.isFinite(exitCode)) {
+      return `crash:${reason}:exit=${exitCode}`;
+    }
+    return `crash:${reason}`;
+  }
+
+  if (type === 'performance-stall') {
+    const source = e.source;
+    if (typeof source !== 'string' || source.length === 0) return null;
+    return `stall:${source}`;
+  }
+
+  return null;
+}
+
+/**
+ * Render the FIRST stack frame as a readable, non-identifying ` @ …` suffix
+ * (e.g. ` @ App.tsx:142 (renderChat)`) for an error signature. Returns `null`
+ * when the frame carries none of `function`/`file`/`line` so the caller degrades
+ * to the bare error `name` (the `topErrorNames` bucket). Reads no other field.
+ *
+ * @param {unknown} frame
+ * @returns {string | null}
+ * @private
+ */
+function _frameSegment(frame) {
+  if (!frame || typeof frame !== 'object') return null;
+  const f = frame;
+  const hasFile = typeof f.file === 'string' && f.file.length > 0;
+  const hasFn = typeof f.function === 'string' && f.function.length > 0;
+  const hasLine = typeof f.line === 'number' && Number.isFinite(f.line);
+  // Identifying only if it carries at least one location/symbol field.
+  if (!hasFile && !hasFn && !hasLine) return null;
+  let loc = '';
+  if (hasFile) {
+    loc = hasLine ? `${f.file}:${f.line}` : f.file;
+  } else if (hasLine) {
+    loc = `:${f.line}`;
+  }
+  const fn = hasFn ? (loc ? ` (${f.function})` : `(${f.function})`) : '';
+  return ` @ ${loc}${fn}`;
+}
+
+/**
  * Summarize a batch of persisted telemetry events into aggregate signal.
  *
  * Pure and total: a non-array (or empty) input yields a fully-zeroed summary so
@@ -67,6 +176,7 @@ export const DEFAULT_TIMELINE_MAX_BUCKETS = 48;
  *   total: number,
  *   byType: Record<string, number>,
  *   topErrorNames: { name: string, count: number }[],
+ *   topSignatures: { signature: string, type: BaseEventType, count: number }[],
  *   schemaVersions: Record<string, number>,
  *   appVersions: Record<string, number>,
  *   platforms: Record<string, number>,
@@ -86,6 +196,12 @@ export function summarize(events) {
   const schemaVersions = {};
   const appVersions = {};
   const platforms = {};
+  // Failure signatures (WARDEN-707). Keyed by `${type} ${signature}` so two
+  // events of different types can NEVER collide into one bucket even if their
+  // signature strings happened to match (defensive — in practice each type's
+  // signature lives in its own namespace). Value carries the bare signature + the
+  // event type for the ranked output.
+  const signatureCounts = new Map();
   let total = 0;
   let firstSeen = null;
   let lastSeen = null;
@@ -123,6 +239,17 @@ export function summarize(events) {
     if (typeof platform === 'string' && platform.length > 0) {
       platforms[platform] = (platforms[platform] ?? 0) + 1;
     }
+    // Failure signature (WARDEN-707): rank DISTINCT failures across ALL base
+    // types in one list. `signatureOf` is skip-robust (returns null for an
+    // unknown type or a type-specific field gap) — null yields no bucket, never
+    // throws. The composite key guarantees no cross-type merge.
+    const signature = signatureOf(event);
+    if (signature !== null) {
+      const key = `${type} ${signature}`;
+      const existing = signatureCounts.get(key);
+      if (existing) existing.count += 1;
+      else signatureCounts.set(key, { signature, type, count: 1 });
+    }
     if (typeof timestamp === 'number' && Number.isFinite(timestamp)) {
       if (firstSeen === null || timestamp < firstSeen) firstSeen = timestamp;
       if (lastSeen === null || timestamp > lastSeen) lastSeen = timestamp;
@@ -136,10 +263,24 @@ export function summarize(events) {
     .sort((a, b) => b.count - a.count || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
     .slice(0, TOP_ERROR_NAMES_CAP);
 
+  // Rank DISTINCT failures by count desc, then signature asc for a deterministic
+  // order on ties — mirrors topErrorNames so the aggregate is stable and trivially
+  // assertable. Each entry carries its `type` so a maintainer can read a mixed
+  // error/crash/stall ranking in one list.
+  const topSignatures = [...signatureCounts.values()]
+    .sort(
+      (a, b) =>
+        b.count - a.count ||
+        (a.signature < b.signature ? -1 : a.signature > b.signature ? 1 : 0)
+    )
+    .slice(0, TOP_SIGNATURES_CAP)
+    .map(({ signature, type, count }) => ({ signature, type, count }));
+
   return {
     total,
     byType,
     topErrorNames,
+    topSignatures,
     schemaVersions,
     appVersions,
     platforms,
