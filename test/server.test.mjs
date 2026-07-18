@@ -120,6 +120,65 @@ test('POST to a path other than /ingest → 404', async () => {
   assert.equal(captured.length, 0);
 });
 
+// ── Malformed request-target → 400 (WARDEN-673) ───────────────────────────────
+// llhttp accepts the origin-form targets `///` and `//` (common scanner probes:
+// GET //etc/passwd) and delivers them as req.url, but `new URL('///', ...)` throws
+// ERR_INVALID_URL. Pre-fix, that throw escaped the async handler as an unhandled
+// rejection and terminated the receiver process. Now it is a clean 400.
+
+test('a malformed request-target (///) → 400 invalid request-target; no rejection, no socket hang', async () => {
+  const { handler } = wiring();
+  const res = fakeRes();
+  // `await` proves no rejection escapes: a thrown handler would reject here and
+  // fail the test (the pre-fix crash). The response must be ended (res.end called)
+  // so the socket does not hang.
+  await handler(fakeReq({ method: 'GET', url: '///' }), res);
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.ended, true, 'response is ended — the socket does not hang');
+  assert.deepEqual(JSON.parse(res.body), { error: 'invalid request-target' });
+});
+
+test('a malformed request-target (//) → 400 too (both scanner forms reproduce)', async () => {
+  const { handler } = wiring();
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '//' }), res);
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.ended, true);
+  assert.deepEqual(JSON.parse(res.body), { error: 'invalid request-target' });
+});
+
+test('a malformed request-target is recorded in the rejections tally (scanner noise is visible, fixed-string reason)', async () => {
+  // The 400 feeds the WARDEN-591 tally so a maintainer sees scanner noise in
+  // GET /summary.rejections.byStatus. The recorded reason is a FIXED string
+  // (never the raw client request-target) — the rejection-seam trust model.
+  const rejections = createRejectionTally();
+  const handler = createRequestHandler({
+    store: createNdjsonStore({ sink: async () => {} }),
+    rejections,
+  });
+  await handler(fakeReq({ method: 'GET', url: '///' }), fakeRes());
+  const snap = rejections.snapshot();
+  assert.ok(snap.byStatus['400'] >= 1, 'the 400 was recorded');
+  assert.equal(snap.lastStatus, 400);
+  assert.equal(snap.lastReason, 'invalid request-target');
+});
+
+test('a malformed request-target still 400s when auth is set (the throw is after the gate, reachable by a token-holder)', async () => {
+  // The parse runs AFTER the auth gate, so a valid token reaches it; auth does
+  // not accidentally mask the 400 (nor the pre-fix crash).
+  const handler = createRequestHandler({
+    store: createNdjsonStore({ sink: async () => {} }),
+    authToken: 'sekret',
+  });
+  const res = fakeRes();
+  await handler(
+    fakeReq({ method: 'GET', url: '///', headers: { authorization: 'Bearer sekret' } }),
+    res
+  );
+  assert.equal(res.statusCode, 400);
+  assert.deepEqual(JSON.parse(res.body), { error: 'invalid request-target' });
+});
+
 test('POST /ingest?foo=bar still routes to ingest (query string ignored)', async () => {
   const { handler, captured } = wiring();
   const res = fakeRes();
