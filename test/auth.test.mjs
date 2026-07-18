@@ -43,7 +43,7 @@ function fakeRes() {
 }
 
 const validError = {
-  schemaVersion: 1,
+  schemaVersion: SCHEMA_VERSION,
   type: 'error',
   runtime: 'main',
   timestamp: 1,
@@ -51,8 +51,8 @@ const validError = {
   message: 'm',
   frames: [],
 };
-const validBody = JSON.stringify({ schemaVersion: 1, events: [validError] });
-const headersV1 = { 'x-telemetry-schema': '1' };
+const validBody = JSON.stringify({ schemaVersion: SCHEMA_VERSION, events: [validError] });
+const schemaHeaders = { 'x-telemetry-schema': String(SCHEMA_VERSION) };
 
 const SECRET = 's3cret-shared-token';
 
@@ -74,7 +74,7 @@ function wiring(authToken) {
 test('AUTH_TOKEN set: POST /ingest with no Authorization header → 401, nothing persisted', async () => {
   const { handler, captured } = wiring(SECRET);
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 401);
   assert.equal(captured.length, 0, 'ingest() never ran → store untouched');
 });
@@ -83,7 +83,7 @@ test('AUTH_TOKEN set: same request WITH a valid Authorization: Bearer → 202 + 
   const { handler, captured } = wiring(SECRET);
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, authorization: `Bearer ${SECRET}` }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, authorization: `Bearer ${SECRET}` }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 202);
@@ -98,7 +98,7 @@ test('AUTH_TOKEN set: wrong token → 401, nothing persisted', async () => {
   const { handler, captured } = wiring(SECRET);
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, authorization: 'Bearer totally-wrong-token' }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, authorization: 'Bearer totally-wrong-token' }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 401);
@@ -109,7 +109,7 @@ test('AUTH_TOKEN set: header without the "Bearer " scheme → 401', async () => 
   const { handler, captured } = wiring(SECRET);
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, authorization: SECRET }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, authorization: SECRET }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 401);
@@ -120,7 +120,7 @@ test('AUTH_TOKEN set: "Bearer " with an empty token → 401', async () => {
   const { handler, captured } = wiring(SECRET);
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, authorization: 'Bearer ' }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, authorization: 'Bearer ' }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 401);
@@ -134,7 +134,7 @@ test('AUTH_TOKEN set: valid token but wrong-length variant → 401 (no length le
   const { handler, captured } = wiring(SECRET);
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, authorization: 'Bearer xx' }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, authorization: 'Bearer xx' }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 401);
@@ -145,7 +145,7 @@ test('AUTH_TOKEN set: the scheme match is case-insensitive (bearer TOKEN → 202
   const { handler, captured } = wiring(SECRET);
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, authorization: `bearer ${SECRET}` }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, authorization: `bearer ${SECRET}` }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 202);
@@ -156,7 +156,7 @@ test('AUTH_TOKEN set: the Authorization header lookup is case-insensitive', asyn
   const { handler, captured } = wiring(SECRET);
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, Authorization: `Bearer ${SECRET}` }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, Authorization: `Bearer ${SECRET}` }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 202);
@@ -168,7 +168,7 @@ test('AUTH_TOKEN set: the Authorization header lookup is case-insensitive', asyn
 test('the auth-reject status is 401 — never 429, never 5xx (client drops, never retries)', async () => {
   const { handler } = wiring(SECRET);
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.ok(res.statusCode >= 400 && res.statusCode <= 499, 'is a 4xx');
   assert.notEqual(res.statusCode, 429, 'never 429 (the client would retry that)');
   assert.ok(res.statusCode < 500, 'never 5xx (the client would retry that)');
@@ -179,7 +179,7 @@ test('the auth-reject status is 401 — never 429, never 5xx (client drops, neve
 test('AUTH_TOKEN unset: no Authorization header required → 202 + persisted (open behavior)', async () => {
   const { handler, captured } = wiring(undefined); // no authToken → gate disabled
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 202);
   assert.equal(captured.length, 1);
 });
@@ -188,7 +188,7 @@ test('AUTH_TOKEN unset: a stray Authorization header is ignored (still 202)', as
   const { handler, captured } = wiring(undefined);
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, authorization: 'Bearer whatever' }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, authorization: 'Bearer whatever' }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 202);
@@ -203,7 +203,7 @@ test('backward-compat: createRequestHandler({ store }) with no authToken stays o
   const store = createNdjsonStore({ sink: async (l) => void captured.push(l) });
   const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 202);
   assert.equal(captured.length, 1);
 });
@@ -333,6 +333,6 @@ test('tokensMatch path: an empty provided token against a set secret is rejected
   // before any compare — but assert the handler never throws on auth edge cases.
   const { handler } = wiring(SECRET);
   const res = fakeRes();
-  await assert.doesNotReject(async () => handler(fakeReq({ headers: { ...headersV1, authorization: '' } }), res));
+  await assert.doesNotReject(async () => handler(fakeReq({ headers: { ...schemaHeaders, authorization: '' } }), res));
   assert.equal(res.statusCode, 401);
 });

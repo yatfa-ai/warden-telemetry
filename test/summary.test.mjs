@@ -44,6 +44,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.deepEqual(s.byType, ZEROED_BY_TYPE);
   assert.deepEqual(s.topErrorNames, []);
   assert.deepEqual(s.schemaVersions, {});
+  assert.deepEqual(s.appVersions, {});
   assert.equal(s.firstSeen, null);
   assert.equal(s.lastSeen, null);
 });
@@ -133,6 +134,50 @@ test('schemaVersions is a histogram keyed by stringified schemaVersion', () => {
 test('schemaVersions is empty when no events carry a version', () => {
   const s = summarize([{ type: 'error' }]);
   assert.deepEqual(s.schemaVersions, {});
+});
+
+// ── APP-VERSION HISTOGRAM (WARDEN-665) ────────────────────────────────────────
+// Mirrors the schemaVersions histogram: bucket event counts by the non-identifying
+// `appVersion` release label. Only a PRESENT non-empty string is bucketed — absent
+// / null / non-string / empty is skipped (a v2 source that cannot read the version
+// emits no field, and a malformed value must never crash or make a junk bucket).
+
+test('appVersions is a histogram keyed by the appVersion release label', () => {
+  const events = [
+    { ...validError, appVersion: '0.1.19' },
+    { ...validCrash, appVersion: '0.1.19' },
+    { ...validStall, appVersion: '0.1.20' },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.appVersions, { '0.1.19': 2, '0.1.20': 1 });
+});
+
+test('appVersions accumulates counts for events sharing a release', () => {
+  const events = [
+    { ...validError, appVersion: '0.1.19' },
+    { ...validError, appVersion: '0.1.19' },
+    { ...validError, appVersion: '0.1.19' },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.appVersions, { '0.1.19': 3 });
+});
+
+test('appVersions skips absent / null / non-string / empty values (skip-robust, never a bucket)', () => {
+  const events = [
+    { ...validError }, // no appVersion field
+    { ...validError, appVersion: null },
+    { ...validError, appVersion: 2 },
+    { ...validError, appVersion: '' },
+    { ...validError, appVersion: { x: 1 } },
+    { ...validError, appVersion: '0.1.19' }, // the only bucketable one
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.appVersions, { '0.1.19': 1 });
+});
+
+test('appVersions is empty when no events carry a release label', () => {
+  const s = summarize([{ ...validError }, { ...validCrash }]);
+  assert.deepEqual(s.appVersions, {});
 });
 
 // ── TIME WINDOW ───────────────────────────────────────────────────────────────

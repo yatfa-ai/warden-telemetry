@@ -25,7 +25,7 @@ const deps = (store) => ({ SCHEMA_VERSION, validateEvent, store });
 
 // Canonical valid events (one per base-tier type).
 const validError = {
-  schemaVersion: 1,
+  schemaVersion: SCHEMA_VERSION,
   type: 'error',
   runtime: 'main',
   timestamp: 123,
@@ -34,7 +34,7 @@ const validError = {
   frames: [],
 };
 const validCrash = {
-  schemaVersion: 1,
+  schemaVersion: SCHEMA_VERSION,
   type: 'crash',
   runtime: 'renderer',
   timestamp: 9,
@@ -42,7 +42,7 @@ const validCrash = {
   exitCode: 133,
 };
 const validStall = {
-  schemaVersion: 1,
+  schemaVersion: SCHEMA_VERSION,
   type: 'performance-stall',
   runtime: 'main',
   timestamp: 3,
@@ -50,15 +50,15 @@ const validStall = {
   source: 'event-loop',
 };
 
-const bodyOf = (events) => JSON.stringify({ schemaVersion: 1, events });
-const headersV1 = { 'x-telemetry-schema': '1' };
+const bodyOf = (events) => JSON.stringify({ schemaVersion: SCHEMA_VERSION, events });
+const schemaHeaders = { 'x-telemetry-schema': String(SCHEMA_VERSION) };
 
-// ── SUCCESS CRITERION 1: accept a schemaVersion:1 batch + durably persist ─────
+// ── SUCCESS CRITERION 1: accept a schemaVersion-matched batch + durably persist ─
 
-test('accepts a schemaVersion:1 batch of valid events → 2xx and durably persists them', async () => {
+test('accepts a schemaVersion-matched batch of valid events → 2xx and durably persists them', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: headersV1, body: bodyOf([validError, validCrash, validStall]) },
+    { headers: schemaHeaders, body: bodyOf([validError, validCrash, validStall]) },
     deps(store)
   );
   assert.equal(res.ok, true);
@@ -73,13 +73,13 @@ test('accepts a schemaVersion:1 batch of valid events → 2xx and durably persis
 
 test('persists each event as a separate record (one per accepted event)', async () => {
   const store = memoryStore();
-  await ingest({ headers: headersV1, body: bodyOf([validError, validStall]) }, deps(store));
+  await ingest({ headers: schemaHeaders, body: bodyOf([validError, validStall]) }, deps(store));
   assert.equal(store.appended.length, 2);
 });
 
 test('accepts an empty events batch with 2xx and persists nothing', async () => {
   const store = memoryStore();
-  const res = await ingest({ headers: headersV1, body: bodyOf([]) }, deps(store));
+  const res = await ingest({ headers: schemaHeaders, body: bodyOf([]) }, deps(store));
   assert.equal(res.ok, true);
   assert.equal(res.body.accepted, 0);
   assert.equal(store.appended.length, 0);
@@ -91,7 +91,7 @@ test('rejects an unknown x-telemetry-schema version WITHOUT parsing the body or 
   const store = memoryStore();
   // A body that is not even valid JSON — proving we never parsed it.
   const res = await ingest(
-    { headers: { 'x-telemetry-schema': '2' }, body: '}{ not json at all' },
+    { headers: { 'x-telemetry-schema': String(SCHEMA_VERSION + 1) }, body: '}{ not json at all' },
     deps(store)
   );
   assert.equal(res.ok, false);
@@ -114,7 +114,7 @@ test('hard-rejects a batch containing an out-of-schema event (bad runtime) and p
   const store = memoryStore();
   const badRuntime = { ...validError, runtime: 'worker' };
   const res = await ingest(
-    { headers: headersV1, body: bodyOf([validError, badRuntime, validStall]) },
+    { headers: schemaHeaders, body: bodyOf([validError, badRuntime, validStall]) },
     deps(store)
   );
   assert.equal(res.ok, false);
@@ -125,7 +125,7 @@ test('hard-rejects a batch containing an out-of-schema event (bad runtime) and p
 test('hard-rejects an out-of-schema event with a non-finite timestamp', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: headersV1, body: bodyOf([{ ...validError, timestamp: NaN }]) },
+    { headers: schemaHeaders, body: bodyOf([{ ...validError, timestamp: NaN }]) },
     deps(store)
   );
   assert.equal(res.status, 422);
@@ -135,7 +135,7 @@ test('hard-rejects an out-of-schema event with a non-finite timestamp', async ()
 test('hard-rejects an out-of-schema event with a wrong type', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: headersV1, body: bodyOf([{ ...validError, type: 'bogus' }]) },
+    { headers: schemaHeaders, body: bodyOf([{ ...validError, type: 'bogus' }]) },
     deps(store)
   );
   assert.equal(res.status, 422);
@@ -145,7 +145,7 @@ test('hard-rejects an out-of-schema event with a wrong type', async () => {
 test('hard-rejects an out-of-schema event with a non-string extended field', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: headersV1, body: bodyOf([{ ...validError, chatName: 42 }]) },
+    { headers: schemaHeaders, body: bodyOf([{ ...validError, chatName: 42 }]) },
     deps(store)
   );
   assert.equal(res.status, 422);
@@ -154,12 +154,12 @@ test('hard-rejects an out-of-schema event with a non-string extended field', asy
 
 test('hard-rejects an event whose own schemaVersion disagrees with the header', async () => {
   const store = memoryStore();
-  // header says 1, but the event carries schemaVersion 999 — validateEvent catches it
+  // header declares the current version, but the event carries schemaVersion 999 — validateEvent catches it
   const res = await ingest(
     {
-      headers: headersV1,
+      headers: schemaHeaders,
       body: JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: SCHEMA_VERSION,
         events: [{ schemaVersion: 999, type: 'error', runtime: 'main', timestamp: 1, name: 'E', message: 'm', frames: [] }],
       }),
     },
@@ -173,7 +173,7 @@ test('hard-rejects an event whose own schemaVersion disagrees with the header', 
 
 test('rejects a malformed JSON body with a non-retryable 4xx', async () => {
   const store = memoryStore();
-  const res = await ingest({ headers: headersV1, body: 'not json' }, deps(store));
+  const res = await ingest({ headers: schemaHeaders, body: 'not json' }, deps(store));
   assert.equal(res.status, 400);
   assert.equal(store.appended.length, 0);
 });
@@ -181,7 +181,7 @@ test('rejects a malformed JSON body with a non-retryable 4xx', async () => {
 test('rejects a body whose `events` is not an array', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: headersV1, body: JSON.stringify({ schemaVersion: 1, events: 'nope' }) },
+    { headers: schemaHeaders, body: JSON.stringify({ schemaVersion: SCHEMA_VERSION, events: 'nope' }) },
     deps(store)
   );
   assert.equal(res.status, 400);
@@ -190,7 +190,7 @@ test('rejects a body whose `events` is not an array', async () => {
 
 test('rejects a non-object JSON body', async () => {
   const store = memoryStore();
-  const res = await ingest({ headers: headersV1, body: '42' }, deps(store));
+  const res = await ingest({ headers: schemaHeaders, body: '42' }, deps(store));
   assert.equal(res.status, 400);
 });
 
@@ -205,7 +205,7 @@ test('validates EVERY event before persisting any (a bad event never reaches the
   };
   // first event valid, second invalid → store must never be called
   const res = await ingest(
-    { headers: headersV1, body: bodyOf([validError, { ...validStall, source: 'gpu' }]) },
+    { headers: schemaHeaders, body: bodyOf([validError, { ...validStall, source: 'gpu' }]) },
     { SCHEMA_VERSION, validateEvent, store: countingStore }
   );
   assert.equal(res.ok, false);
@@ -215,7 +215,7 @@ test('validates EVERY event before persisting any (a bad event never reaches the
 test('header lookup is case-insensitive (robust to proxy/transport casing)', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: { 'X-Telemetry-Schema': '1' }, body: bodyOf([validError]) },
+    { headers: { 'X-Telemetry-Schema': String(SCHEMA_VERSION) }, body: bodyOf([validError]) },
     deps(store)
   );
   assert.equal(res.ok, true);
@@ -225,11 +225,11 @@ test('header lookup is case-insensitive (robust to proxy/transport casing)', asy
 test('EVERY rejection is a non-retryable 4xx — the client drops, never retries', async () => {
   const store = memoryStore();
   const badCases = [
-    { headers: { 'x-telemetry-schema': '2' }, body: 'x' }, // unknown schema
+    { headers: { 'x-telemetry-schema': String(SCHEMA_VERSION + 1) }, body: 'x' }, // unknown schema
     { headers: {}, body: bodyOf([validError]) }, // missing schema header
-    { headers: headersV1, body: 'x' }, // malformed JSON
-    { headers: headersV1, body: '{"events":1}' }, // bad shape
-    { headers: headersV1, body: bodyOf([{ ...validError, type: 'bogus' }]) }, // invalid event
+    { headers: schemaHeaders, body: 'x' }, // malformed JSON
+    { headers: schemaHeaders, body: '{"events":1}' }, // bad shape
+    { headers: schemaHeaders, body: bodyOf([{ ...validError, type: 'bogus' }]) }, // invalid event
   ];
   for (const c of badCases) {
     const res = await ingest(c, deps(store));
