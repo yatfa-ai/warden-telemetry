@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 
@@ -1593,4 +1593,117 @@ test('the 413 body is the receiver FIXED diagnostic, never the oversized payload
   assert.equal(res.statusCode, 413);
   assert.equal(res.body.includes('SECRET'), false, 'the oversized payload is not echoed');
   assert.deepEqual(JSON.parse(res.body), { error: 'request body too large' });
+});
+
+// ── IDEMPOTENT INGEST / SEEN-KEY DEDUP (WARDEN-666) ───────────────────────────
+// A retried batch whose 2xx was lost would otherwise be appended AGAIN (the client
+// reuses the identical bytes). createSeenKeys remembers an accepted batch's key;
+// the handler threads it into ingest(), which answers a retry 202 {accepted:0,
+// deduped:true} WITHOUT re-persisting. These prove the wiring end-to-end AND that
+// the maintainer read surfaces (/summary, /events) reflect the deduplicated count.
+
+test('(WARDEN-666) a retried batch (same idempotency-key) is deduped: ONE store copy; /summary + /events reflect ONE event, not N', async () => {
+  // sink + source share one array: appends become visible to subsequent reads, so
+  // the read surfaces reflect exactly what was persisted.
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const seenKeys = createSeenKeys();
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, seenKeys });
+  const headers = { ...headersV1, 'idempotency-key': 'batch-xyz' };
+
+  // First POST: accepted + persisted normally.
+  const r1 = fakeRes();
+  await handler(fakeReq({ headers, body: validBody }), r1);
+  assert.equal(r1.statusCode, 202);
+  assert.deepEqual(JSON.parse(r1.body), { accepted: 1 });
+
+  // Second POST — the retry (same key, identical bytes): a 202 SUCCESS so the client
+  // stops retrying, but DEDUPED — the store is NOT appended again.
+  const r2 = fakeRes();
+  await handler(fakeReq({ headers, body: validBody }), r2);
+  assert.equal(r2.statusCode, 202, 'a dedup is still a 2xx so the client stops retrying');
+  assert.deepEqual(JSON.parse(r2.body), { accepted: 0, deduped: true });
+  assert.equal(lines.length, 1, 'the store holds ONE copy — the retry did not double-count');
+
+  // /summary reflects the DEDUPLICATED count (1 crash, not 2–4).
+  const summary = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), summary);
+  assert.equal(JSON.parse(summary.body).total, 1, '/summary total is the real count, not inflated by the lost-2xx retry');
+
+  // /events lists the payload ONCE.
+  const events = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events' }), events);
+  const evBody = JSON.parse(events.body);
+  assert.equal(evBody.events.length, 1, '/events lists one event, not the retried duplicate');
+  assert.equal(evBody.total, 1);
+});
+
+test('(WARDEN-666) a handler with NO seenKeys dep does NOT dedup (backward-compatible — today behavior)', async () => {
+  // wiring() wires NO seenKeys, so the key header is ignored — both posts persist.
+  // An unwired receiver (or an old client that sends no key header) is unchanged.
+  const { handler, captured } = wiring();
+  const headers = { ...headersV1, 'idempotency-key': 'dup' };
+  await handler(fakeReq({ headers, body: validBody }), fakeRes());
+  await handler(fakeReq({ headers, body: validBody }), fakeRes());
+  assert.equal(captured.length, 2, 'no seenKeys wired → no dedup → both stored (today behavior)');
+});
+
+test('(WARDEN-666) distinct idempotency-keys are distinct batches (both persist through the handler)', async () => {
+  const seenKeys = createSeenKeys();
+  const handler = createRequestHandler({ store: createNdjsonStore({ sink: async () => {} }), schema: { SCHEMA_VERSION, validateEvent }, seenKeys });
+  const r1 = fakeRes();
+  await handler(fakeReq({ headers: { ...headersV1, 'idempotency-key': 'A' }, body: validBody }), r1);
+  const r2 = fakeRes();
+  await handler(fakeReq({ headers: { ...headersV1, 'idempotency-key': 'B' }, body: validBody }), r2);
+  assert.deepEqual(JSON.parse(r1.body), { accepted: 1 });
+  assert.deepEqual(JSON.parse(r2.body), { accepted: 1 }, 'a distinct key is a distinct batch — never deduped');
+});
+
+// ── createSeenKeys unit contract (the dedup factory) ──────────────────────────
+
+test('createSeenKeys: has() is false before record and true after', () => {
+  const keys = createSeenKeys({ now: () => 0 });
+  assert.equal(keys.has('k'), false);
+  keys.record('k');
+  assert.equal(keys.has('k'), true);
+  assert.equal(keys.snapshot().size, 1);
+});
+
+test('createSeenKeys: a key expires after ttlMs (fake clock) and can be re-recorded fresh', () => {
+  // The injected `now` makes the TTL unit-testable with no real timer (mirrors the
+  // tally factories' fake-clock discipline).
+  let t = 1000;
+  const keys = createSeenKeys({ ttlMs: 5000, maxKeys: 100, now: () => t });
+  keys.record('k'); // expires at 6000
+  t = 5000;
+  assert.equal(keys.has('k'), true, 'within the TTL window the key is still seen');
+  t = 6000;
+  assert.equal(keys.has('k'), false, 'at/after ttlMs the key has expired (dedup window closed)');
+  // Lazy purge lets an expired key be recorded fresh again.
+  keys.record('k'); // now expires at 11000
+  t = 7000;
+  assert.equal(keys.has('k'), true, 'a re-recorded key is seen again');
+});
+
+test('createSeenKeys: a FIFO cap evicts the oldest distinct key (bounded — a flood of distinct keys cannot grow it)', () => {
+  const keys = createSeenKeys({ ttlMs: 1e9, maxKeys: 2, now: () => 0 });
+  keys.record('a');
+  keys.record('b');
+  keys.record('c'); // exceeds maxKeys=2 → evicts the OLDEST ('a')
+  assert.equal(keys.snapshot().size, 2, 'the set stays at the cap, never unbounded');
+  assert.equal(keys.has('a'), false, 'the oldest key was evicted');
+  assert.equal(keys.has('b'), true);
+  assert.equal(keys.has('c'), true);
+});
+
+test('createSeenKeys: a non-string/empty key is a no-op (an absent header never dedups)', () => {
+  const keys = createSeenKeys({ now: () => 0 });
+  keys.record('');
+  keys.record(undefined);
+  assert.equal(keys.has(''), false);
+  assert.equal(keys.has(undefined), false);
+  assert.equal(keys.snapshot().size, 0);
 });

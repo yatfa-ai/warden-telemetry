@@ -7,8 +7,13 @@
 //   2. PARSE             — the { schemaVersion, events } JSON body.
 //   3. VALIDATE          — run the shared validateEvent on EVERY event; hard-
 //                          reject the whole batch if ANY is out-of-schema.
-//   4. PERSIST           — append the accepted batch via the injected store.
-//   5. RESPOND           — 2xx on success.
+//   4. IDEMPOTENCY DEDUP — (opt-in via seenKeys, WARDEN-666) a request whose
+//                          idempotency-key was already accepted returns 202
+//                          {accepted:0, deduped:true} WITHOUT re-persisting, so a
+//                          retried batch whose 2xx was lost doesn't double-count.
+//   5. PERSIST           — append the accepted batch via the injected store; then
+//                          record the key (only on success) so future retries dedup.
+//   6. RESPOND           — 2xx on success.
 //
 // It is factored for injection (the client's discipline, telemetry-send.js) so
 // the suite asserts on inputs/outputs with ZERO real network and a store that
@@ -43,12 +48,13 @@ function reject(status, error) {
  * Ingest one telemetry batch.
  *
  * @param {{ headers: Record<string, string>, body: string }} request
- * @param {{ SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean, store: { appendEvents: (e: unknown[]) => Promise<void> } }} deps
+ * @param {{ SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean, store: { appendEvents: (e: unknown[]) => Promise<void> }, seenKeys?: { has(key: string): boolean, record(key: string): void } }} deps
  * @returns {Promise<{ ok: boolean, status: number, body: object }>}
  *   - success: `{ ok: true, status: 202, body: { accepted: <n> } }`
+ *   - dedup:   `{ ok: true, status: 202, body: { accepted: 0, deduped: true } }` (nothing persisted — a retried batch whose 2xx was lost; WARDEN-666)
  *   - rejection: `{ ok: false, status: 4xx, body: { error: string } }` (nothing persisted)
  */
-export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent, store }) {
+export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent, store, seenKeys } = {}) {
   if (typeof SCHEMA_VERSION !== 'number') {
     throw new TypeError('ingest: `SCHEMA_VERSION` dependency is required (number)');
   }
@@ -69,6 +75,14 @@ export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent,
       `unsupported telemetry schema version: expected "${SCHEMA_VERSION}", got ${JSON.stringify(declared)}`
     );
   }
+
+  // IDEMPOTENCY KEY (WARDEN-666) — read ONCE here, after the handshake (a wrong
+  // version is still 415'd first; dedup never relaxes the handshake). It is used
+  // for both the dedup HIT check before persist and the record after. undefined
+  // when no seenKeys set is wired (no dedup — today's behavior) OR when an old
+  // client sends no idempotency-key header (also unchanged) — either way the two
+  // sites below are no-ops.
+  const idempotencyKey = seenKeys ? readHeader(headers, 'idempotency-key') : undefined;
 
   // 2. PARSE the { schemaVersion, events } body.
   let parsed;
@@ -96,11 +110,33 @@ export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent,
     }
   }
 
-  // 4. PERSIST — only reached once EVERY event validated (atomicity: a bad event
-  //    anywhere in the batch means nothing is stored).
+  // 4a. IDEMPOTENCY DEDUP (WARDEN-666) — guard the PERSIST. This runs AFTER
+  //     handshake + parse + validate, so NO check is relaxed: a wrong version is
+  //     415'd, a malformed body is 400'd, an out-of-schema event is 422'd — all
+  //     BEFORE this point — and only a batch that would otherwise be ACCEPTED can
+  //     be a HIT. A HIT means the receiver already accepted this exact batch: the
+  //     warden client generates ONE idempotency-key per batch and reuses it across
+  //     retries of the same bytes, so a retry whose 2xx was lost (network reset /
+  //     read timeout under disk pressure) carries a key the receiver already
+  //     recorded on the prior successful persist. Return 202 {accepted:0,
+  //     deduped:true} WITHOUT calling store.appendEvents, so a single crash retried
+  //     ≤3× lands as ONE event, not 2–4 — keeping /summary (counts + timeline) and
+  //     /events honest. OPT-IN via seenKeys: absent (or no header) → no dedup.
+  if (idempotencyKey && seenKeys.has(idempotencyKey)) {
+    return { ok: true, status: 202, body: { accepted: 0, deduped: true } };
+  }
+
+  // 4b. PERSIST — only reached once EVERY event validated (atomicity: a bad event
+  //     anywhere in the batch means nothing is stored).
   if (events.length > 0) {
     await store.appendEvents(events);
   }
+
+  // 4c. RECORD the idempotency key ONLY on this successful-persist path — so a
+  //     batch that was rejected above (4xx) or that failed to store
+  //     (appendEvents throws, caught by the handler) is NEVER cached, and a retry
+  //     is processed normally rather than wrongly dedup'd. (WARDEN-666)
+  if (idempotencyKey) seenKeys.record(idempotencyKey);
 
   // 5. 2xx — delivered. 202 Accepted: the receiver owns the events now.
   return { ok: true, status: 202, body: { accepted: events.length } };
