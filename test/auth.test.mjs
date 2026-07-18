@@ -89,7 +89,13 @@ test('AUTH_TOKEN set: same request WITH a valid Authorization: Bearer → 202 + 
   assert.equal(res.statusCode, 202);
   assert.deepEqual(JSON.parse(res.body), { accepted: 1 });
   assert.equal(captured.length, 1, 'authenticated request persisted normally');
-  assert.deepEqual(JSON.parse(captured[0]), validError);
+  // The persisted record is the verbatim client payload PLUS the receiver's
+  // receivedAt stamp (WARDEN-692). Assert the stamp is finite and the client
+  // payload round-trips verbatim alongside it.
+  const persisted = JSON.parse(captured[0]);
+  assert.equal(Number.isFinite(persisted.receivedAt), true, 'receiver stamps a finite receivedAt');
+  const { receivedAt, ...clientPayload } = persisted;
+  assert.deepEqual(clientPayload, validError);
 });
 
 // ── SUCCESS CRITERION 1b: wrong / malformed token → 401 ──────────────────────────

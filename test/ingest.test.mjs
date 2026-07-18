@@ -21,7 +21,14 @@ function memoryStore() {
   };
 }
 
-const deps = (store) => ({ SCHEMA_VERSION, validateEvent, store });
+// A fixed server clock so the receivedAt stamp (WARDEN-692) is deterministic and
+// assertable — ingest() stamps every accepted event with `now()` once per batch
+// (the batch arrived at one instant). Mirrors the fake-clock discipline of
+// summarizeTimeline({ now }) and applyRetention({ now }).
+const RECEIVED_AT = 5_000_000;
+const fakeNow = () => RECEIVED_AT;
+
+const deps = (store) => ({ SCHEMA_VERSION, validateEvent, store, now: fakeNow });
 
 // A capturing seen-key set double for the ingest dedup dep (WARDEN-666). Mirrors
 // createSeenKeys' {has, record} contract so ingest() is tested in isolation from
@@ -83,11 +90,12 @@ test('accepts a schemaVersion-matched batch of valid events → 2xx and durably 
   assert.equal(res.ok, true);
   assert.ok(res.status >= 200 && res.status <= 299, `status is 2xx (got ${res.status})`);
   assert.equal(res.body.accepted, 3);
-  // Readable back via the store, verbatim, in order.
+  // Readable back via the store, in order. Each carries the receiver's receivedAt
+  // stamp (WARDEN-692) alongside the verbatim client payload.
   assert.equal(store.appended.length, 3);
-  assert.deepEqual(store.appended[0], validError);
-  assert.deepEqual(store.appended[1], validCrash);
-  assert.deepEqual(store.appended[2], validStall);
+  assert.deepEqual(store.appended[0], { ...validError, receivedAt: RECEIVED_AT });
+  assert.deepEqual(store.appended[1], { ...validCrash, receivedAt: RECEIVED_AT });
+  assert.deepEqual(store.appended[2], { ...validStall, receivedAt: RECEIVED_AT });
 });
 
 test('persists each event as a separate record (one per accepted event)', async () => {
@@ -358,4 +366,79 @@ test('dedup never relaxes validation: an out-of-schema event with an already-see
   const res = await ingest({ headers: { ...headersV1, 'idempotency-key': 'prime' }, body: bodyOf([{ ...validError, runtime: 'worker' }]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
   assert.equal(res.status, 422, 'validate runs before dedup — an invalid body is rejected regardless of the key');
   assert.equal(store.appended.length, 1, 'only the valid prime batch is stored');
+});
+
+// ── SERVER RECEIPT STAMP — receivedAt (WARDEN-692) ────────────────────────────
+// ingest() stamps each ACCEPTED event with the receiver's own `receivedAt`
+// (when IT saw the batch) AFTER the dedup-HIT early-return and BEFORE persist, so
+// the three time-sensitive read surfaces can prefer the receiver's clock over the
+// client's (robust to skewed client clocks). The stamp is receiver-owned metadata
+// added after the client's redacted payload lands — it changes nothing about what
+// the client sends or what consent covers.
+//
+// NOTE: these use `schemaHeaders` (not `headersV1`) so they RUN — the WARDEN-666
+// dedup block above references an undefined `headersV1` (a pre-existing main bug,
+// flagged separately, deliberately left unfixed per project norm).
+
+test('stamps every accepted event with a finite receivedAt epoch-ms (one `now()` read shared across the batch)', async () => {
+  const store = memoryStore();
+  const res = await ingest(
+    { headers: schemaHeaders, body: bodyOf([validError, validCrash, validStall]) },
+    deps(store)
+  );
+  assert.equal(res.ok, true);
+  assert.equal(store.appended.length, 3);
+  // Every persisted event carries the stamp...
+  for (const e of store.appended) {
+    assert.equal(Number.isFinite(e.receivedAt), true, 'receivedAt is a finite epoch-ms');
+  }
+  // ...and the batch arrived at one instant, so one `now()` stamps them identically.
+  assert.deepEqual(
+    store.appended.map((e) => e.receivedAt),
+    [RECEIVED_AT, RECEIVED_AT, RECEIVED_AT],
+    'a single now() read stamps the whole batch'
+  );
+});
+
+test('receivedAt is stamped AFTER validate — a 422 rejection persists (and stamps) NOTHING', async () => {
+  const store = memoryStore();
+  // An out-of-schema event → 422 before the stamp loop runs; nothing is persisted,
+  // so nothing carries a receivedAt.
+  const res = await ingest(
+    { headers: schemaHeaders, body: bodyOf([{ ...validError, type: 'bogus' }]) },
+    deps(store)
+  );
+  assert.equal(res.status, 422);
+  assert.equal(store.appended.length, 0, 'a rejected batch stamps + persists nothing');
+});
+
+test('a default `now` (Date.now) stamps a finite receivedAt when no clock is injected', async () => {
+  const store = memoryStore();
+  // No `now` in the deps object — ingest() falls back to its Date.now default, so a
+  // production wiring (or any caller) that omits the clock still stamps every event.
+  const res = await ingest(
+    { headers: schemaHeaders, body: bodyOf([validError]) },
+    { SCHEMA_VERSION, validateEvent, store }
+  );
+  assert.equal(res.ok, true);
+  assert.equal(store.appended.length, 1);
+  assert.equal(Number.isFinite(store.appended[0].receivedAt), true, 'the default clock still stamps receivedAt');
+});
+
+test('a dedup HIT stamps NOTHING — the 202 {accepted:0,deduped:true} path persists and stamps no receivedAt (ordering refinement)', async () => {
+  // The stamp loop sits AFTER the dedup-HIT early-return (WARDEN-692 ordering
+  // refinement): a retried batch whose 2xx was lost returns 202 {accepted:0,
+  // deduped:true} WITHOUT persisting, so it stamps nothing. Pass a DISTINCT now to
+  // the retry to prove its clock is never read — the persisted event keeps the
+  // FIRST (accepted) call's receivedAt.
+  const store = memoryStore();
+  const keys = seenKeysSet();
+  const headers = { ...schemaHeaders, 'idempotency-key': 'stamp-dedup' };
+  const first = await ingest({ headers, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys, now: fakeNow });
+  const second = await ingest({ headers, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys, now: () => RECEIVED_AT + 999 });
+  assert.equal(first.body.accepted, 1);
+  assert.equal(second.body.accepted, 0);
+  assert.equal(second.body.deduped, true);
+  assert.equal(store.appended.length, 1, 'the retry did not double-count');
+  assert.deepEqual(store.appended[0], { ...validError, receivedAt: RECEIVED_AT }, 'only the first call stamped; the dedup HIT stamped nothing');
 });

@@ -3,8 +3,10 @@
 // unbounded over the lifetime of a self-hosted receiver (WARDEN-579 / roadmap
 // WARDEN-446).
 //
-// Minimal v1 (WARDEN-547): one NDJSON record per accepted event, stored VERBATIM
-// (exactly what `ingest` schema-validated is what lands). The maintainer read
+// Minimal v1 (WARDEN-547): one NDJSON record per accepted event, stored as the
+// VERBATIM client payload PLUS a receiver-owned `receivedAt` annotation stamped by
+// `ingest` (WARDEN-692) — exactly what `ingest` schema-validated and annotated is
+// what lands. The maintainer read
 // surface — fileSource + readEvents (WARDEN-567) — is in place. Retention
 // (WARDEN-579) trims the persisted set to a count cap and/or an age window by
 // REWRITING the file through an injected `rewrite` seam (the persisted-seam
@@ -139,10 +141,11 @@ export function fileRewrite(path) {
  * The PURE, fs-free retention policy core (so the count-cap / age-window
  * discipline is unit-testable with plain arrays — no seams, no disk). A retention
  * bound REMOVES events only (never reorders, never invents):
- *   - Age window (`maxAgeMs` > 0): drop any event whose finite epoch-ms
- *     `timestamp` is older than `now - maxAgeMs`. An event WITHOUT a finite
- *     timestamp is KEPT (age can't be judged — prefer retaining over silently
- *     dropping a record the schema otherwise accepted).
+ *   - Age window (`maxAgeMs` > 0): drop any event whose finite epoch-ms effective
+ *     time — `receivedAt` if present (WARDEN-692), else the client's `timestamp` —
+ *     is older than `now - maxAgeMs`. An event WITHOUT a finite effective time is
+ *     KEPT (age can't be judged — prefer retaining over silently dropping a record
+ *     the schema otherwise accepted).
  *   - Count cap (`maxEvents` > 0): keep the LAST `maxEvents` events (newest by
  *     arrival/append order — the store is append-ordered), dropping the older
  *     excess off the front.
@@ -160,9 +163,14 @@ export function applyRetention(events, { maxEvents = 0, maxAgeMs = 0, now = 0 } 
   if (maxAgeMs > 0 && Number.isFinite(maxAgeMs)) {
     const cutoff = now - maxAgeMs;
     kept = kept.filter((e) => {
-      // No finite timestamp → age is unknowable → retain (never silently drop).
-      if (!e || typeof e.timestamp !== 'number' || !Number.isFinite(e.timestamp)) return true;
-      return e.timestamp >= cutoff;
+      // Prefer the RECEIVER's receipt time (receivedAt, WARDEN-692) and fall back
+      // to the client's `timestamp`, so the retention bound is judged off the
+      // receiver's clock (deterministic per-receiver) rather than each client's
+      // skewed clock. No finite effective time → age is unknowable → retain (never
+      // silently drop a record the schema otherwise accepted).
+      const when = e && (e.receivedAt ?? e.timestamp);
+      if (typeof when !== 'number' || !Number.isFinite(when)) return true;
+      return when >= cutoff;
     });
   }
 
@@ -180,6 +188,8 @@ export function applyRetention(events, { maxEvents = 0, maxAgeMs = 0, now = 0 } 
 // Round-tripping through JSON.stringify is stable for these records: they are
 // plain JSON objects with string keys, and V8 preserves insertion order through
 // parse → stringify, so the bytes are unchanged by a compaction that drops lines.
+// (Each record is the verbatim client payload + the receiver's `receivedAt`
+// annotation stamped at ingest, WARDEN-692; both round-trip identically.)
 function serializeNdjson(events) {
   if (!Array.isArray(events) || events.length === 0) return '';
   let text = '';
@@ -232,8 +242,9 @@ export function createNdjsonStore({ sink, source, rewrite } = {}) {
   return {
     /**
      * Persist every event in an accepted batch as its own NDJSON line, in order.
-     * The events are already schema-validated by `ingest` before this is called,
-     * so each line is the JSON-serialized event verbatim.
+     * The events are already schema-validated AND `receivedAt`-annotated by
+     * `ingest` before this is called, so each line is the JSON-serialized event
+     * verbatim — the client's redacted payload plus the receiver's receipt stamp.
      *
      * @param {unknown[]} events
      */
@@ -241,8 +252,12 @@ export function createNdjsonStore({ sink, source, rewrite } = {}) {
       // Serialized: a concurrent prune can't rename the file out from under us.
       return runSerialized(async () => {
         for (const event of events) {
-          // JSON.stringify is the exact bytes a maintainer reads back; the sink
-          // appends the newline on write so captured test lines are pure records.
+          // JSON.stringify is the exact bytes a maintainer reads back. There is NO
+          // field allow-list / whitelist here — every field the event carries
+          // (including the receiver's `receivedAt` annotation, WARDEN-692) is
+          // serialized as-is and survives the writer (no JSONB / strong-params gate
+          // strips it). The sink appends the newline on write so captured test
+          // lines are pure records.
           await sink(JSON.stringify(event));
         }
       });

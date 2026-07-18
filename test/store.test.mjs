@@ -205,6 +205,57 @@ test('applyRetention never mutates its input', () => {
   assert.deepEqual(events, [{ i: 1 }, { i: 2 }, { i: 3 }]); // untouched
 });
 
+// ── applyRetention — clock-skew robustness via receivedAt (WARDEN-692) ────────
+// The age-prune keys off the RECEIVER's `receivedAt` (with a `timestamp` fallback)
+// so the retention bound is deterministic per-receiver, not governed by each
+// client's skewed clock.
+
+test('applyRetention age-prune keys off receivedAt: a slow-clock client (stale timestamp) survives via a fresh receivedAt', () => {
+  // Server now = 10000, maxAgeMs = 1000 → cutoff = 9000. The client's `timestamp`
+  // is far in the past (a slow clock) — under timestamp-only keying that PRUNES it
+  // prematurely (timestamp < cutoff). receivedAt = NOW-50 (the receiver saw it
+  // recently) → it survives, judged off the receiver's clock.
+  const NOW = 10_000;
+  const events = [{ i: 'slow-clock', timestamp: NOW - 9999, receivedAt: NOW - 50 }];
+  assert.deepEqual(applyRetention(events, { maxAgeMs: 1000, now: NOW }), [
+    { i: 'slow-clock', timestamp: NOW - 9999, receivedAt: NOW - 50 },
+  ]);
+});
+
+test('applyRetention: a fast-clock event with a fresh receivedAt survives the age-prune (success criterion #2)', () => {
+  // The fast-clock spike from the timeline test must ALSO survive retention: its
+  // receivedAt is recent, so it is retained (consistent with a real recent event).
+  const NOW = 10_000;
+  const events = [{ i: 'fast-clock', timestamp: NOW + 300_000, receivedAt: NOW - 50 }];
+  assert.deepEqual(applyRetention(events, { maxAgeMs: 1000, now: NOW }), [
+    { i: 'fast-clock', timestamp: NOW + 300_000, receivedAt: NOW - 50 },
+  ]);
+});
+
+test('applyRetention: an event lacking receivedAt is age-pruned on the timestamp fallback (graceful backfill)', () => {
+  // Pre-annotation events (no receivedAt): the client timestamp governs, unchanged.
+  const NOW = 10_000;
+  const events = [
+    { i: 'old-no-receivedAt', timestamp: NOW - 4000 },
+    { i: 'fresh-no-receivedAt', timestamp: NOW - 100 },
+  ];
+  assert.deepEqual(applyRetention(events, { maxAgeMs: 1000, now: NOW }), [
+    { i: 'fresh-no-receivedAt', timestamp: NOW - 100 },
+  ]);
+});
+
+test('applyRetention: receivedAt is PREFERRED — an aged-out timestamp with no receivedAt is pruned, with one is kept', () => {
+  // Same stale client timestamp; only the event WITH a fresh receivedAt survives.
+  const NOW = 10_000;
+  const events = [
+    { i: 'no-stamp', timestamp: NOW - 9999 }, // no receivedAt → pruned (timestamp < cutoff)
+    { i: 'stamped', timestamp: NOW - 9999, receivedAt: NOW - 50 }, // receivedAt → kept
+  ];
+  assert.deepEqual(applyRetention(events, { maxAgeMs: 1000, now: NOW }), [
+    { i: 'stamped', timestamp: NOW - 9999, receivedAt: NOW - 50 },
+  ]);
+});
+
 // ── prune — the persisted-seam compaction (in-memory rewrite) ────────────────
 
 test('prune with a count cap rewrites the file to the newest N retained events', async () => {

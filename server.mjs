@@ -659,6 +659,14 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * `createSeenKeys()`; no `seenKeys` dep = no dedup (backward-compatible with an old
  * client that sends no idempotency-key header).
  *
+ * `now` (optional clock, default Date.now): passed THROUGH to `ingest()` as the
+ * `receivedAt` stamp source (WARDEN-692). ingest() stamps each accepted event
+ * with `now()` so the time-sensitive read surfaces (timeline / retention /
+ * /events) can key off the RECEIVER's clock (with a `timestamp` fallback) and stay
+ * robust to skewed client clocks. Injecting it here (mirroring the tally /
+ * seenKeys / retention-trigger factories) keeps the stamp unit-testable with a
+ * fake clock; absent it defaults to Date.now.
+ *
  * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void }, maxBodyBytes?: number, now?: () => number }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
@@ -886,7 +894,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // non-retryable "drop the batch" verdicts, and the client fails fast on those.
     let result;
     try {
-      result = await ingest({ headers: req.headers, body }, { ...schema, store, seenKeys });
+      result = await ingest({ headers: req.headers, body }, { ...schema, store, seenKeys, now });
     } catch (e) {
       // The recorded reason is the store/sink's OWN diagnostic — an OS errno
       // (ENOSPC / EACCES / EISDIR) or a sink error — NEVER a raw client payload:
