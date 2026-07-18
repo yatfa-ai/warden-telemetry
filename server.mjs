@@ -587,8 +587,25 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
       }
     }
 
-    const url = new URL(req.url, 'http://localhost');
-    const { pathname, searchParams } = url;
+    // Parse the request-target. llhttp accepts origin-form targets like `//` and
+    // `///` (common automated-scanner probes: `GET //etc/passwd`) and delivers them
+    // as `req.url`, but `new URL('///', ...)` throws ERR_INVALID_URL. Because this
+    // handler is `async`, an unguarded throw becomes a rejected promise the HTTP
+    // server never awaits → unhandled rejection → process termination on the
+    // default --unhandled-rejections=throw. Guard it: a malformed request-target is
+    // a clean 400 (not a crash), feeding the rejections tally so the scanner noise
+    // surfaces in GET /summary. This is the same hardening vein as the readBody cap
+    // (WARDEN-627) and the persist catch (WARDEN-607) — the one remaining unguarded
+    // throw at handler entry. Fixed string reason (no raw client payload in the
+    // tally sample), consistent with the rejection-seam trust model.
+    let pathname, searchParams;
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      ({ pathname, searchParams } = url);
+    } catch {
+      recordRejection(400, 'invalid request-target');
+      return sendJson(res, 400, { error: 'invalid request-target' });
+    }
 
     // GET /summary — the maintainer read surface (WARDEN-567). Returns AGGREGATES
     // of the already-validated, already-redacted events persisted by POST /ingest
