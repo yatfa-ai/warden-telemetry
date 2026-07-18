@@ -138,9 +138,9 @@ export function summarize(events) {
  * Sibling of `summarize()`: a PURE function of an event array + an injected
  * `now` (no fs, no network, no deps). The injected `now` mirrors
  * `createRejectionTally({ now })` so this is unit-testable with a fake clock —
- * no real `Date` in tests. Like `summarize()`, it is computed on-the-fly from
- * `timestamp`s on ALREADY-persisted, ALREADY-redacted events; it introduces no
- * new collection, no schema change, and no new identifier.
+ * no real `Date` in tests. Like `summarize()`, it is computed on-the-fly from the
+ * `receivedAt`/`timestamp` on ALREADY-persisted, ALREADY-redacted events; it
+ * introduces no new collection, no schema change, and no new identifier.
  *
  * Pure and total: a non-array (or empty) input, or a store with no events in
  * the window, yields a zeroed shape (`buckets: []`) so a quiet receiver reads
@@ -150,10 +150,10 @@ export function summarize(events) {
  * JSON-validated first, but a partial read or shape drift is defended against
  * here so one bad record can never blank the whole distribution.
  *
- * TRUST MODEL: identical to `summarize()` — this reads ONLY `event.timestamp`
- * and emits COUNTS. It never echoes raw events or extended-tier names
- * (`chatName` / `sessionName`); it touches no other field, so there is no path
- * by which an identifier could reach the distribution.
+ * TRUST MODEL: identical to `summarize()` — this reads ONLY `event.receivedAt`
+ * / `event.timestamp` (both epoch-ms) and emits COUNTS. It never echoes raw
+ * events or extended-tier names (`chatName` / `sessionName`); it touches no other
+ * field, so there is no path by which an identifier could reach the distribution.
  *
  * @param {object[]} [events]
  * @param {{ now?: () => number, maxBuckets?: number, windowMs?: number }} [opts]
@@ -183,20 +183,25 @@ export function summarizeTimeline(
   const bucketMs = windowMs / maxBuckets;
   const windowStart = currentTime - windowMs;
 
-  // Accumulate a COUNT per bucket index over events whose FINITE timestamp falls
-  // in the rolling window [windowStart, currentTime]. An event older than the
-  // window (or timestamped in the future via client/server clock skew) is
-  // excluded from the distribution — it is still counted by `summarize()`'s
-  // `total` / `byType` / `firstSeen` / `lastSeen`, which span the full retained set.
+  // Accumulate a COUNT per bucket index over events whose FINITE effective time
+  // falls in the rolling window [windowStart, currentTime]. The effective time
+  // PREFERS the receiver's `receivedAt` (when IT saw the batch, WARDEN-692) and
+  // falls back to the client's `timestamp` — so NEW events are bucketed by the
+  // receiver's clock (robust to skewed client clocks: a fast-clock client whose
+  // `timestamp` is minutes in the future no longer vanishes from the "did this just
+  // spike?" window) and OLD persisted events (pre-annotation, no receivedAt) still
+  // read correctly via the fallback. An event older than the window is excluded
+  // from the distribution — it is still counted by `summarize()`'s `total` /
+  // `byType` / `firstSeen` / `lastSeen`, which span the full retained set.
   const counts = new Map();
   for (const event of list) {
     // Skip-robust: a non-object entry must not crash the distribution.
     if (!event || typeof event !== 'object') continue;
-    const { timestamp } = event;
-    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) continue;
-    if (timestamp < windowStart || timestamp > currentTime) continue;
-    let idx = Math.floor((timestamp - windowStart) / bucketMs);
-    // The `timestamp === currentTime` edge lands exactly on the top boundary;
+    const when = event.receivedAt ?? event.timestamp;
+    if (typeof when !== 'number' || !Number.isFinite(when)) continue;
+    if (when < windowStart || when > currentTime) continue;
+    let idx = Math.floor((when - windowStart) / bucketMs);
+    // The `when === currentTime` edge lands exactly on the top boundary;
     // fold it into the newest bucket rather than dropping it or overflowing.
     if (idx >= maxBuckets) idx = maxBuckets - 1;
     if (idx < 0) idx = 0;

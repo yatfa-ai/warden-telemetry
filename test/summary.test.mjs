@@ -301,7 +301,10 @@ test('timeline: events older than the rolling window are EXCLUDED from the distr
   assert.deepEqual(t.buckets, [{ bucketStart: 150, bucketEnd: 160, count: 1 }]);
 });
 
-test('timeline: future timestamps (client/server clock skew) are excluded from the distribution', () => {
+test('timeline: future CLIENT timestamps with no receivedAt are excluded via the timestamp fallback', () => {
+  // These events predate the receivedAt annotation (WARDEN-692), so the effective
+  // time falls back to the client `timestamp`; a future one is still excluded
+  // (when > currentTime). The receivedAt-present skew case is covered below.
   const t = summarizeTimeline(
     [{ timestamp: 250 }, { timestamp: 150 }],
     { now: () => 200, windowMs: 100, maxBuckets: 10 }
@@ -371,4 +374,43 @@ test('timeline: a degenerate config (non-positive window / maxBuckets) collapses
     summarizeTimeline([{ timestamp: 5 }], { now: () => 100, windowMs: 100, maxBuckets: 0 }),
     { buckets: [], bucketMs: 0 }
   );
+});
+
+// ── TIMELINE — clock-skew robustness via receivedAt (WARDEN-692) ──────────────
+// The effective time PREFERS the receiver's `receivedAt` and falls back to the
+// client's `timestamp`. The headline fix: a fast-clock client whose `timestamp`
+// is minutes in the future no longer VANISHES from the "did this just spike?"
+// window — the receiver saw the batch in-window, so receivedAt places it there.
+
+test('timeline: a fast-clock client (future timestamp) still appears in the recent window via receivedAt', () => {
+  // Server now = 200, window [100, 200]. The client's `timestamp` is 5 MINUTES in
+  // the future (a fast clock) — under the timestamp-only keying that EXCLUDES it
+  // (when > currentTime), so a regression spike vanishes at the moment it matters.
+  // receivedAt = 150 (the receiver saw it in-window) → it still lands in the
+  // recent window keyed off the RECEIVER's clock.
+  const t = summarizeTimeline(
+    [{ timestamp: 200 + 300_000, receivedAt: 150 }],
+    { now: () => 200, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [{ bucketStart: 150, bucketEnd: 160, count: 1 }]);
+});
+
+test('timeline: receivedAt is PREFERRED — an in-window receivedAt wins over an out-of-window timestamp', () => {
+  // timestamp = 50 (before windowStart = 100 → would be excluded); receivedAt = 150
+  // (in window). receivedAt wins, so the event is included.
+  const t = summarizeTimeline(
+    [{ timestamp: 50, receivedAt: 150 }],
+    { now: () => 200, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [{ bucketStart: 150, bucketEnd: 160, count: 1 }]);
+});
+
+test('timeline: an event lacking receivedAt still reads via the timestamp fallback (graceful backfill, no migration)', () => {
+  // A pre-annotation persisted event (no receivedAt): the client timestamp
+  // governs, unchanged from before — old surfaces never go blank.
+  const t = summarizeTimeline(
+    [{ timestamp: 150 }],
+    { now: () => 200, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [{ bucketStart: 150, bucketEnd: 160, count: 1 }]);
 });

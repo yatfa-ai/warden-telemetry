@@ -44,9 +44,10 @@ export const EVENTS_LIMIT_MAX = 200;
  * that apply):
  *   - `type`  — keep only events whose `type` matches (e.g. 'error' | 'crash' |
  *     'performance-stall'). A non-string / empty `type` applies no type filter.
- *   - `since` — keep only events whose finite epoch-ms `timestamp` is `>= since`
- *     (an ABSOLUTE cutoff). A non-finite `since` applies no time filter; an event
- *     without a finite timestamp does not satisfy the window (dropped by the
+ *   - `since` — keep only events whose effective epoch-ms time — `receivedAt` if
+ *     present (WARDEN-692), else the client's `timestamp` — is `>= since` (an
+ *     ABSOLUTE cutoff). A non-finite `since` applies no time filter; an event
+ *     without a finite effective time does not satisfy the window (dropped by the
  *     filter, never a crash).
  *
  * `limit` bounds the window to the NEWEST N events. The store is append-ordered
@@ -78,11 +79,15 @@ export function selectEvents(events, { limit, type, since } = {}) {
     list = list.filter((e) => e.type === type);
   }
 
-  // Since filter — keep finite-timestamp events at/after the absolute cutoff.
+  // Since filter — keep events whose effective time (receivedAt if present,
+  // WARDEN-692, else the client's `timestamp`) is finite and at/after the absolute
+  // cutoff. Keying off the receiver's receipt time makes "show me events since the
+  // deploy" robust to skewed client clocks.
   if (typeof since === 'number' && Number.isFinite(since)) {
-    list = list.filter(
-      (e) => typeof e.timestamp === 'number' && Number.isFinite(e.timestamp) && e.timestamp >= since
-    );
+    list = list.filter((e) => {
+      const when = e.receivedAt ?? e.timestamp;
+      return typeof when === 'number' && Number.isFinite(when) && when >= since;
+    });
   }
 
   // Resolve the bound: a missing / non-finite / sub-1 limit → default;

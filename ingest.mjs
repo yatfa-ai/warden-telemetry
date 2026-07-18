@@ -11,9 +11,15 @@
 //                          idempotency-key was already accepted returns 202
 //                          {accepted:0, deduped:true} WITHOUT re-persisting, so a
 //                          retried batch whose 2xx was lost doesn't double-count.
-//   5. PERSIST           — append the accepted batch via the injected store; then
+//   5. STAMP RECEIVEDAT  — annotate each accepted event with the receiver's own
+//                          `receivedAt` epoch-ms (when IT saw the batch), so the
+//                          time-sensitive read surfaces can key off the receiver's
+//                          clock instead of the client's (clock-skew robustness,
+//                          WARDEN-692). Runs ONLY on the persist path — a dedup HIT
+//                          (step 4) persists nothing, so it stamps nothing.
+//   6. PERSIST           — append the accepted batch via the injected store; then
 //                          record the key (only on success) so future retries dedup.
-//   6. RESPOND           — 2xx on success.
+//   7. RESPOND           — 2xx on success.
 //
 // It is factored for injection (the client's discipline, telemetry-send.js) so
 // the suite asserts on inputs/outputs with ZERO real network and a store that
@@ -48,13 +54,13 @@ function reject(status, error) {
  * Ingest one telemetry batch.
  *
  * @param {{ headers: Record<string, string>, body: string }} request
- * @param {{ SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean, store: { appendEvents: (e: unknown[]) => Promise<void> }, seenKeys?: { has(key: string): boolean, record(key: string): void } }} deps
+ * @param {{ SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean, store: { appendEvents: (e: unknown[]) => Promise<void> }, seenKeys?: { has(key: string): boolean, record(key: string): void }, now?: () => number }} deps
  * @returns {Promise<{ ok: boolean, status: number, body: object }>}
  *   - success: `{ ok: true, status: 202, body: { accepted: <n> } }`
  *   - dedup:   `{ ok: true, status: 202, body: { accepted: 0, deduped: true } }` (nothing persisted — a retried batch whose 2xx was lost; WARDEN-666)
  *   - rejection: `{ ok: false, status: 4xx, body: { error: string } }` (nothing persisted)
  */
-export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent, store, seenKeys } = {}) {
+export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent, store, seenKeys, now = Date.now } = {}) {
   if (typeof SCHEMA_VERSION !== 'number') {
     throw new TypeError('ingest: `SCHEMA_VERSION` dependency is required (number)');
   }
@@ -126,13 +132,30 @@ export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent,
     return { ok: true, status: 202, body: { accepted: 0, deduped: true } };
   }
 
-  // 4b. PERSIST — only reached once EVERY event validated (atomicity: a bad event
+  // 4b. STAMP RECEIVEDAT (WARDEN-692) — annotate each accepted event with the
+  //     epoch-ms the RECEIVER saw the batch, AFTER the dedup-HIT early-return
+  //     above (a deduped retry persists nothing → it stamps nothing) and BEFORE
+  //     appendEvents, so the annotation lands in the persisted record. This is
+  //     receiver-owned operational metadata — when the batch arrived — added after
+  //     the client's redacted payload is in memory and before it touches disk, so
+  //     it changes NOTHING about what the client sends or what consent covers. The
+  //     three time-sensitive read surfaces (summarizeTimeline / applyRetention /
+  //     selectEvents) prefer `receivedAt` with a `timestamp` fallback, so a skewed
+  //     client clock can no longer make a real volume spike vanish from the
+  //     maintainer's signal. The batch arrived at one instant, so a single `now()`
+  //     stamps every event identically (no N clock reads). validateBaseEvent checks
+  //     required fields only and is tolerant of extra fields, and validation
+  //     already ran at step 3, so this never re-trips validation.
+  const receivedAt = now();
+  for (const event of events) event.receivedAt = receivedAt;
+
+  // 4c. PERSIST — only reached once EVERY event validated (atomicity: a bad event
   //     anywhere in the batch means nothing is stored).
   if (events.length > 0) {
     await store.appendEvents(events);
   }
 
-  // 4c. RECORD the idempotency key ONLY on this successful-persist path — so a
+  // 4d. RECORD the idempotency key ONLY on this successful-persist path — so a
   //     batch that was rejected above (4xx) or that failed to store
   //     (appendEvents throws, caught by the handler) is NEVER cached, and a retry
   //     is processed normally rather than wrongly dedup'd. (WARDEN-666)

@@ -241,6 +241,43 @@ test('selectEvents: since drops events without a finite timestamp (they do not s
   assert.equal(out[0].timestamp, 300);
 });
 
+// ── SINCE FILTER — clock-skew robustness via receivedAt (WARDEN-692) ──────────
+// The ?since cutoff keys off the RECEIVER's `receivedAt` (with a `timestamp`
+// fallback), so "show me events since the deploy" is robust to skewed client
+// clocks: an event the receiver saw after the cutoff is returned even if the
+// client's own timestamp predates it.
+
+test('selectEvents: ?since= keys off receivedAt — a skewed-old timestamp with a fresh receivedAt is KEPT', () => {
+  // Client timestamp = 100 (before the cutoff); receivedAt = 300 (the receiver saw
+  // it after the cutoff). Under timestamp-only keying this event would be DROPPED
+  // (timestamp < since); receivedAt wins → it is kept.
+  const events = [{ type: 'error', timestamp: 100, receivedAt: 300 }];
+  const out = selectEvents(events, { since: 200 });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].receivedAt, 300);
+});
+
+test('selectEvents: ?since= prefers receivedAt over an out-of-window timestamp', () => {
+  // since=250: timestamp=100 is below it, receivedAt=300 is above it → kept.
+  const out = selectEvents([{ type: 'error', timestamp: 100, receivedAt: 300 }], { since: 250 });
+  assert.equal(out.length, 1);
+  // ...but when receivedAt is below the cutoff too, the event is dropped (the
+  // effective time — receivedAt — does not satisfy the window).
+  assert.equal(selectEvents([{ type: 'error', timestamp: 100, receivedAt: 200 }], { since: 250 }).length, 0);
+});
+
+test('selectEvents: ?since= on events lacking receivedAt reads via the timestamp fallback (graceful backfill)', () => {
+  // Pre-annotation events (no receivedAt): the client timestamp governs, unchanged.
+  const events = [
+    { type: 'error', timestamp: 100 },
+    { type: 'error', timestamp: 300 },
+  ];
+  assert.deepEqual(
+    selectEvents(events, { since: 200 }).map((e) => e.timestamp),
+    [300]
+  );
+});
+
 // ── COMBINED FILTERS (conjunctive) + newest-N ─────────────────────────────────
 
 test('selectEvents: type + since are conjunctive, then newest-N is taken from the matches', () => {
