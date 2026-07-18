@@ -3,7 +3,7 @@
 // They take the events read back via the store and return the AGGREGATE object a
 // self-hosting maintainer can act on (counts / histograms only):
 //   - `summarize(events)`        → flat aggregates (total / byType / topErrorNames
-//                                  / schemaVersions / appVersions / firstSeen / lastSeen).
+//                                  / schemaVersions / appVersions / platforms / firstSeen / lastSeen).
 //   - `summarizeTimeline(events)` → a bounded temporal distribution (event counts
 //                                  per time bucket over a rolling recent window,
 //                                  WARDEN-603) so a maintainer can distinguish a
@@ -15,8 +15,9 @@
 // reached disk. They introduce NO new data, re-collect nothing, and route to no
 // third party (a local read on the self-hosted receiver). Return aggregates only:
 // counts, per-type totals, non-identifying error `name`s, a schema-version
-// histogram, an app-release `appVersion` histogram, and a counts-only time
-// distribution. NEVER echo raw events or extended-tier names (chatName /
+// histogram, an app-release `appVersion` histogram, an OS `platform` histogram,
+// and a counts-only time distribution. NEVER echo raw events or extended-tier
+// names (chatName /
 // sessionName) — those are the only identifiers ever present, and a summary has
 // no need of them.
 //
@@ -25,6 +26,14 @@
 // an identifier, not content) — so a maintainer can attribute volume to a release.
 // It is a COUNTS-only histogram keyed by the release label string; like the other
 // aggregates it echoes no raw event and touches no identifier.
+//
+// `platforms` (WARDEN-684) is the OS sibling of `appVersions`: it buckets event
+// counts by the client's non-identifying `platform` OS label (one of
+// `darwin` / `win32` / `linux` from process.platform — a value identical for
+// millions of users on an OS, not an identifier, not content) so a maintainer can
+// answer "is this crash/error spike Mac / Windows / Linux-specific?" instead of
+// staring at un-attributable volume. Same COUNTS-only histogram shape, same trust
+// posture, same skip-robust bucketing as `appVersions`.
 
 import { BASE_EVENT_TYPES } from './schema.ts';
 
@@ -60,6 +69,7 @@ export const DEFAULT_TIMELINE_MAX_BUCKETS = 48;
  *   topErrorNames: { name: string, count: number }[],
  *   schemaVersions: Record<string, number>,
  *   appVersions: Record<string, number>,
+ *   platforms: Record<string, number>,
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
@@ -75,6 +85,7 @@ export function summarize(events) {
   const errorNameCounts = {};
   const schemaVersions = {};
   const appVersions = {};
+  const platforms = {};
   let total = 0;
   let firstSeen = null;
   let lastSeen = null;
@@ -85,7 +96,7 @@ export function summarize(events) {
     if (!event || typeof event !== 'object') continue;
     total += 1;
 
-    const { type, name, schemaVersion, timestamp, appVersion } = event;
+    const { type, name, schemaVersion, timestamp, appVersion, platform } = event;
 
     if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(byType, type)) {
       byType[type] += 1;
@@ -104,6 +115,13 @@ export function summarize(events) {
     // malformed value never crashes or produces a junk bucket.
     if (typeof appVersion === 'string' && appVersion.length > 0) {
       appVersions[appVersion] = (appVersions[appVersion] ?? 0) + 1;
+    }
+    // platform OS label (WARDEN-684). Skip-robust exactly like appVersions: only
+    // bucket a PRESENT, non-empty string — absent / null / non-string / empty is
+    // ignored (a v3 source that cannot read process.platform emits no field), so a
+    // malformed value never crashes or produces a junk bucket.
+    if (typeof platform === 'string' && platform.length > 0) {
+      platforms[platform] = (platforms[platform] ?? 0) + 1;
     }
     if (typeof timestamp === 'number' && Number.isFinite(timestamp)) {
       if (firstSeen === null || timestamp < firstSeen) firstSeen = timestamp;
@@ -124,6 +142,7 @@ export function summarize(events) {
     topErrorNames,
     schemaVersions,
     appVersions,
+    platforms,
     firstSeen,
     lastSeen,
   };
