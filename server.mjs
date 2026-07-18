@@ -107,6 +107,31 @@ const HOUR_MS = 60 * 60 * 1000;
 // 1 MiB is ~500x the real payload, ample headroom for any reasonable batch.
 export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB POST body cap — bounds the request input
 
+// ── IDEMPOTENT INGEST / SEEN-KEY DEDUP (WARDEN-666) ───────────────────────────
+// The pipeline is at-least-once: the warden client retries a batch (bounded ≤3)
+// when its 2xx was LOST — a network reset, or a read timeout while the receiver
+// does synchronous appendFile I/O under disk pressure. Without idempotency the
+// receiver stores the retried batch AGAIN, so a single crash retried ≤3× becomes
+// 2–4 identical NDJSON rows — plausible-looking duplicates that silently inflate
+// the maintainer's /summary (counts + timeline spike) and /events (repeated
+// payloads) read surfaces, and undermine appVersion-attribution slicing. The
+// client now sends a per-batch `idempotency-key` header (a random UUID, reused
+// across retries of the same bytes); this set remembers the keys the receiver has
+// ALREADY accepted a batch for, so a retry is recognized and answered 202
+// {accepted:0, deduped:true} WITHOUT re-persisting. Bounded by BOTH a TTL (each
+// key expires `ttlMs` after it was recorded, observed lazily on access — no
+// timers, so no setTimer/clearTimer dep) and a COUNT cap (FIFO eviction when
+// exceeded), so neither a long-lived receiver nor a flood of distinct keys grows
+// it without limit. In-memory + receiver-local: need not survive a restart (the
+// tallies' posture) — the known residual edge is a restart mid-retry-window.
+// ADDITIVE ONLY: dedup AVOIDS a duplicate write, never expands collection, relaxes
+// no check (handshake / validate / auth / retention / body cap all still run),
+// routes to no third party, persists nothing.
+// The TTL comfortably spans any client retry window (≤3 jittered attempts ≈
+// seconds) plus receiver-side slack; the count cap mirrors the retention default.
+export const DEFAULT_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 min — ~300x the client retry window
+export const DEFAULT_DEDUP_MAX_KEYS = 10000; // FIFO cap — mirrors STORE_MAX_EVENTS default
+
 // Parse a non-negative number env override for retention. Unset/empty → fallback;
 // an explicit "0" disables that policy (the opt-out); a malformed/negative value
 // falls back to the (bounded) default so a typo can never silently unbound the
@@ -481,6 +506,73 @@ export function createPersistErrorTally({ now = Date.now } = {}) {
   };
 }
 
+// ── SEEN-KEY DEDUP SET (WARDEN-666) ───────────────────────────────────────────
+// The receiver-local twin of the client's per-batch idempotency-key header. A
+// bounded, in-memory set of keys the receiver has ALREADY accepted a batch for,
+// consulted in ingest()'s pure pipeline (it receives this set as an OPTIONAL
+// injected dep alongside store/validateEvent). On a HIT (the key was recorded on
+// a PRIOR successful persist and has not expired) ingest() returns 202
+// {accepted:0, deduped:true} WITHOUT calling store.appendEvents — so a retried
+// batch whose 2xx was lost does not double-count. Mirrors the injected-seam
+// discipline of createRejectionTally / createPersistErrorTally: an OPTIONAL dep
+// (no set wired = today's behavior — no dedup, exactly like an absent tally) with
+// an injected `now` so the TTL is unit-testable with a fake clock.
+
+/**
+ * Build the seen-key dedup set (WARDEN-666).
+ *
+ * Bounded by BOTH a TTL (each key expires `ttlMs` after it was recorded; expiry
+ * is observed LAZILY on access, so no timers are needed) and a COUNT cap (when a
+ * new key would exceed `maxKeys`, the OLDEST insertion-ordered entry is evicted —
+ * FIFO via Map insertion order). Neither a long-lived receiver nor a sustained
+ * flood of distinct keys can grow it without limit.
+ *
+ * @param {{ ttlMs?: number, maxKeys?: number, now?: () => number }} [opts]
+ * @returns {{
+ *   has(key: string): boolean,
+ *   record(key: string): void,
+ *   snapshot(): { size: number }
+ * }}
+ */
+export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT_DEDUP_MAX_KEYS, now = Date.now } = {}) {
+  // key -> expiresAt (a Map preserves insertion order, giving O(1)-amortized FIFO
+  // eviction via keys().next()).
+  const seen = new Map();
+  return {
+    /** True if a non-empty `key` was recorded and has not yet expired (a dedup
+     *  HIT). Read-only with a lazy purge: an expired entry looked up here is
+     *  dropped so it can be re-recorded fresh. A non-string/empty key (no header)
+     *  is never a hit — an old client that sends no idempotency-key is unchanged. */
+    has(key) {
+      if (typeof key !== 'string' || key.length === 0) return false;
+      const expiresAt = seen.get(key);
+      if (expiresAt === undefined) return false;
+      if (expiresAt <= now()) {
+        seen.delete(key); // lazy purge of a single expired entry
+        return false;
+      }
+      return true;
+    },
+    /** Record a key as seen (refreshing its expiry if already present). Call this
+     *  ONLY after a successful persist — so a batch that was rejected (4xx) or
+     *  failed to store is never cached and a retry is processed normally rather
+     *  than wrongly dedup'd. FIFO cap evicts the OLDEST entry while over the bound. */
+    record(key) {
+      if (typeof key !== 'string' || key.length === 0) return;
+      seen.set(key, now() + ttlMs);
+      while (seen.size > maxKeys) {
+        const oldest = seen.keys().next().value;
+        seen.delete(oldest);
+      }
+    },
+    /** Point-in-time size (observability; expired entries are purged only lazily,
+     *  so this is an upper bound on live keys). */
+    snapshot() {
+      return { size: seen.size };
+    },
+  };
+}
+
 /**
  * Build the request handler. `store` and `schema` are injected so the handler is
  * testable with a capturing store and WITHOUT a live port (tests call the handler
@@ -554,10 +646,23 @@ export function createPersistErrorTally({ now = Date.now } = {}) {
  * body is buffered (defense-in-depth alongside ingest()'s own check) so a wrong-
  * version request is 415'd without paying its body's memory cost.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, maxBodyBytes?: number, now?: () => number }} deps
+ * `seenKeys` (optional dedup set, WARDEN-666): a bounded, in-memory, receiver-local
+ * set of idempotency keys the receiver has ALREADY accepted a batch for. It is
+ * passed THROUGH to `ingest()` as an optional dep (absent = today's behavior — no
+ * dedup, exactly like an absent tally). Inside ingest(), a request whose
+ * `idempotency-key` header is already in the set returns 202 {accepted:0,
+ * deduped:true} WITHOUT calling store.appendEvents — so a retried batch whose 2xx
+ * was lost (the client reuses one key across retries of the same bytes) does not
+ * double-count and silently inflate /summary + /events. ADDITIVE ONLY: dedup avoids
+ * a duplicate write, never expands collection, relaxes no check (handshake /
+ * validate / auth / retention / body cap all still run), persists nothing. Built by
+ * `createSeenKeys()`; no `seenKeys` dep = no dedup (backward-compatible with an old
+ * client that sends no idempotency-key header).
+ *
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void }, maxBodyBytes?: number, now?: () => number }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, maxBodyBytes = 0, now = Date.now } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, maxBodyBytes = 0, now = Date.now } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
 
   // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
@@ -781,7 +886,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // non-retryable "drop the batch" verdicts, and the client fails fast on those.
     let result;
     try {
-      result = await ingest({ headers: req.headers, body }, { ...schema, store });
+      result = await ingest({ headers: req.headers, body }, { ...schema, store, seenKeys });
     } catch (e) {
       // The recorded reason is the store/sink's OWN diagnostic — an OS errno
       // (ENOSPC / EACCES / EISDIR) or a sink error — NEVER a raw client payload:
@@ -848,7 +953,8 @@ export function createReceiver({
   const retention = createRetentionTrigger(store, { maxEvents, maxAgeMs });
   const rejections = createRejectionTally();
   const persistErrors = createPersistErrorTally();
-  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors, maxBodyBytes });
+  const seenKeys = createSeenKeys();
+  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors, seenKeys, maxBodyBytes });
   const server = createServer(handler);
 
   // Periodic age-expiry sweep — ONLY when an age window is set. A quiet store
