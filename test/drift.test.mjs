@@ -24,7 +24,7 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 3,
+  SCHEMA_VERSION: 4,
   BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall'],
   RUNTIME: { MAIN: 'main', RENDERER: 'renderer' },
 };
@@ -125,9 +125,30 @@ test('the vendored validator is the REAL one — it still rejects out-of-schema 
     false,
     'wrong schemaVersion rejected'
   );
+  // WARDEN-687: a main-runtime crash is now ACCEPTED (was rejected pre-v4). A
+  // main-process hard kill is detected on the next launch by the crash sentinel
+  // and emitted as { type:'crash', runtime:'main', reason:'unexpected-termination' };
+  // the relaxation is a shape change (runtime was already a non-identifying enum),
+  // not new data collection. Proven on BOTH validators the receiver uses
+  // (validateBaseEvent is the core shape check ingest runs; validateEvent wraps it).
   assert.equal(
-    validateBaseEvent({ ...crashFixture, runtime: 'main' }),
+    validateBaseEvent({ ...crashFixture, runtime: 'main', reason: 'unexpected-termination' }),
+    true,
+    'validateBaseEvent accepts a main-runtime crash (hard kill)'
+  );
+  assert.equal(
+    validateEvent({ ...crashFixture, runtime: 'main', reason: 'unexpected-termination' }),
+    true,
+    'validateEvent accepts a main-runtime crash (hard kill)'
+  );
+  assert.equal(
+    validateEvent(crashFixture),
+    true,
+    'a renderer-runtime crash still validates'
+  );
+  assert.equal(
+    validateEvent({ ...crashFixture, reason: 7 }),
     false,
-    'crash must be renderer'
+    'a crash with a non-string reason is still rejected'
   );
 });
