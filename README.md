@@ -229,6 +229,9 @@ The response is **bounded and filterable**:
   non-positive `limit` falls back to the default.
 - **`?type=`** — filter to one base type (`error` | `crash` | `performance-stall`). Exact match; a value that
   matches nothing returns an empty `events` array.
+- **`?platform=`** — filter to one OS label (`darwin` | `win32` | `linux`). Exact match; an event whose source
+  omitted the field is excluded (a maintainer asking "show me win32" does not want un-attributed events).
+- **`?appVersion=`** — filter to one release label (e.g. `0.1.19`). Exact match.
 - **`?since=`** — keep only events whose epoch-ms `timestamp` is `>= since` (an absolute cutoff, inclusive).
   Useful for "what landed since I last looked."
 

@@ -783,8 +783,8 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // diagnostic payloads /summary deliberately discards: an ErrorEvent's message +
     // frames, a CrashEvent's reason, a StallEvent's lagMs. BOUNDED to a newest-N
     // window (default 100, hard cap 200) so a near-full store (up to the 10000
-    // retention cap) can never yield a multi-MB response, with optional ?type= and
-    // ?since= filters. No request body is read; nothing is persisted.
+    // retention cap) can never yield a multi-MB response, with optional ?type=,
+    // ?since=, ?platform= and ?appVersion= filters. No request body is read; nothing is persisted.
     //
     // Reads ONLY already-persisted, already-schema-validated, already-client-
     // redacted events via the existing readEvents() seam — no new collection, no
@@ -804,6 +804,8 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
         // bounded `events` array is the newest-N matching the filters.
         const selected = selectEvents(events, {
           type: searchParams.get('type') ?? undefined,
+          platform: searchParams.get('platform') ?? undefined,
+          appVersion: searchParams.get('appVersion') ?? undefined,
           limit: searchParams.has('limit') ? Number(searchParams.get('limit')) : undefined,
           since: searchParams.has('since') ? Number(searchParams.get('since')) : undefined,
         });
