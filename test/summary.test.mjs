@@ -45,6 +45,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.deepEqual(s.topErrorNames, []);
   assert.deepEqual(s.schemaVersions, {});
   assert.deepEqual(s.appVersions, {});
+  assert.deepEqual(s.platforms, {});
   assert.equal(s.firstSeen, null);
   assert.equal(s.lastSeen, null);
 });
@@ -178,6 +179,51 @@ test('appVersions skips absent / null / non-string / empty values (skip-robust, 
 test('appVersions is empty when no events carry a release label', () => {
   const s = summarize([{ ...validError }, { ...validCrash }]);
   assert.deepEqual(s.appVersions, {});
+});
+
+// ── PLATFORM HISTOGRAM (WARDEN-684) ───────────────────────────────────────────
+// Mirrors the appVersions histogram: bucket event counts by the non-identifying
+// `platform` OS label (darwin/win32/linux). Only a PRESENT non-empty string is
+// bucketed — absent / null / non-string / empty is skipped (a v3 source that
+// cannot read process.platform emits no field, and a malformed value must never
+// crash or make a junk bucket).
+
+test('platforms is a histogram keyed by the platform OS label', () => {
+  const events = [
+    { ...validError, platform: 'darwin' },
+    { ...validCrash, platform: 'darwin' },
+    { ...validStall, platform: 'win32' },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.platforms, { darwin: 2, win32: 1 });
+});
+
+test('platforms accumulates counts for events sharing an OS', () => {
+  const events = [
+    { ...validError, platform: 'linux' },
+    { ...validError, platform: 'linux' },
+    { ...validError, platform: 'linux' },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.platforms, { linux: 3 });
+});
+
+test('platforms skips absent / null / non-string / empty values (skip-robust, never a bucket)', () => {
+  const events = [
+    { ...validError }, // no platform field
+    { ...validError, platform: null },
+    { ...validError, platform: 2 },
+    { ...validError, platform: '' },
+    { ...validError, platform: { x: 1 } },
+    { ...validError, platform: 'darwin' }, // the only bucketable one
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.platforms, { darwin: 1 });
+});
+
+test('platforms is empty when no events carry an OS label', () => {
+  const s = summarize([{ ...validError }, { ...validCrash }]);
+  assert.deepEqual(s.platforms, {});
 });
 
 // ── TIME WINDOW ───────────────────────────────────────────────────────────────

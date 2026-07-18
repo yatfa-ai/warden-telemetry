@@ -24,7 +24,7 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 2,
+  SCHEMA_VERSION: 3,
   BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall'],
   RUNTIME: { MAIN: 'main', RENDERER: 'renderer' },
 };
@@ -86,6 +86,30 @@ test('vendored validateEvent accepts extended-tier fixtures (chat/session names)
     validateEvent({ ...errorFixture, chatName: 'Refactor auth', sessionName: 'claude-7b3a2f1' }),
     true,
     'extended-tier names are well-typed'
+  );
+});
+
+test('vendored validateEvent accepts platform-bearing fixtures (WARDEN-684 OS label)', () => {
+  // platform is a v3 base-tier OS label (darwin/win32/linux) the client stamps on
+  // every event via process.platform; the vendored validator MUST accept it — and
+  // accept its ABSENCE (a v3 event without platform still validates). Pinning this
+  // here guards the cross-repo contract: if the client adds platform and
+  // re-vendors schema.ts, the receiver's validator is proven to accept it.
+  assert.equal(
+    validateEvent({ ...errorFixture, platform: 'darwin' }),
+    true,
+    'platform-bearing error fixture validates'
+  );
+  assert.equal(
+    validateEvent({ ...crashFixture, platform: 'win32' }),
+    true,
+    'platform-bearing crash fixture validates'
+  );
+  assert.equal(validateEvent(errorFixture), true, 'absent platform still validates (optional)');
+  assert.equal(
+    validateEvent({ ...errorFixture, platform: 42 }),
+    false,
+    'non-string platform rejected'
   );
 });
 
