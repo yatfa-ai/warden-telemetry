@@ -43,6 +43,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.equal(s.total, 0);
   assert.deepEqual(s.byType, ZEROED_BY_TYPE);
   assert.deepEqual(s.topErrorNames, []);
+  assert.deepEqual(s.topSignatures, []);
   assert.deepEqual(s.schemaVersions, {});
   assert.deepEqual(s.appVersions, {});
   assert.deepEqual(s.platforms, {});
@@ -118,6 +119,135 @@ test('topErrorNames caps at 10 distinct names', () => {
 test('non-error events contribute nothing to topErrorNames', () => {
   const s = summarize([validCrash, validStall]);
   assert.deepEqual(s.topErrorNames, []);
+});
+
+// ── TOP SIGNATURES — distinct-failure ranking (WARDEN-707) ────────────────────
+// `topSignatures` ranks DISTINCT failures via a per-type `signature` so a
+// maintainer can tell ONE regression × N from N distinct bugs — the axis
+// `topErrorNames` (Error#name only) cannot show. Mirrors the topErrorNames
+// section above: same sort (count desc, then key asc), same cap (10).
+
+test('topSignatures collapses N errors sharing name + frames[0] into ONE entry', () => {
+  // The actionable case: ONE failure copied N×. Same name AND same top frame →
+  // a single bucket with count N (not N entries, and not flattened to just the name).
+  const frame = { function: 'renderChat', file: 'App.tsx', line: 142 };
+  const events = [
+    { ...validError, name: 'TypeError', frames: [frame] },
+    { ...validError, name: 'TypeError', frames: [frame] },
+    { ...validError, name: 'TypeError', frames: [frame] },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.topSignatures, [
+    { signature: 'TypeError @ App.tsx:142 (renderChat)', type: 'error', count: 3 },
+  ]);
+});
+
+test('topSignatures keeps DISTINCT signatures separate (same name, different frame)', () => {
+  // Same error name but a different top frame is a DIFFERENT failure — two
+  // entries, not one merged `TypeError` bucket (which is all topErrorNames sees).
+  const events = [
+    { ...validError, name: 'TypeError', frames: [{ file: 'App.tsx', line: 142 }] },
+    { ...validError, name: 'TypeError', frames: [{ file: 'Other.tsx', line: 9 }] },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.topSignatures, [
+    { signature: 'TypeError @ App.tsx:142', type: 'error', count: 1 },
+    { signature: 'TypeError @ Other.tsx:9', type: 'error', count: 1 },
+  ]);
+});
+
+test('topSignatures degrades to name-only when frames are empty / lack the location fields', () => {
+  // An error with NO frames, or whose frames[0] lacks function/file/line, falls
+  // back to the bare `name` — exactly today's topErrorNames bucket. Graceful
+  // superset: nothing regresses.
+  const s = summarize([
+    { ...validError, name: 'TypeError', frames: [] }, // empty frames
+    { ...validError, name: 'TypeError', frames: [{ column: 9 }] }, // frame has no fn/file/line
+    { ...validError, name: 'TypeError' }, // no frames field at all
+  ]);
+  assert.deepEqual(s.topSignatures, [{ signature: 'TypeError', type: 'error', count: 3 }]);
+});
+
+test('topSignatures buckets crash by reason+exitCode and stall by source, ranked across types', () => {
+  // validCrash carries reason:'oom' + exitCode:133 → `crash:oom:exit=133`; a crash
+  // with NO exitCode omits the `:exit=N` segment. Stalls bucket by `source`. Each
+  // entry carries its `type` for a mixed-type ranking.
+  const events = [
+    validCrash, // crash:oom:exit=133
+    { ...validCrash }, // crash:oom:exit=133 → count 2
+    { type: 'crash', reason: 'killed' }, // no exitCode → `crash:killed`
+    { ...validStall, source: 'event-loop' },
+    { ...validStall, source: 'unresponsive' },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.topSignatures, [
+    { signature: 'crash:oom:exit=133', type: 'crash', count: 2 },
+    // the three count=1 entries tie-break by signature asc: 'c' < 's', so the
+    // crash precedes the stalls, and 'stall:event-loop' < 'stall:unresponsive'.
+    { signature: 'crash:killed', type: 'crash', count: 1 },
+    { signature: 'stall:event-loop', type: 'performance-stall', count: 1 },
+    { signature: 'stall:unresponsive', type: 'performance-stall', count: 1 },
+  ]);
+});
+
+test('topSignatures ranks a mixed error/crash/stall batch together in one list', () => {
+  // Cross-type ranking: a high-count error outranks low-count crashes/stalls, so
+  // the maintainer sees the single biggest failure first regardless of its type.
+  const frame = { function: 'renderChat', file: 'App.tsx', line: 142 };
+  const events = [
+    { ...validError, name: 'TypeError', frames: [frame] },
+    { ...validError, name: 'TypeError', frames: [frame] },
+    validCrash, // crash:oom:exit=133 (validCrash carries exitCode)
+    { ...validStall }, // stall:event-loop
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.topSignatures, [
+    { signature: 'TypeError @ App.tsx:142 (renderChat)', type: 'error', count: 2 },
+    { signature: 'crash:oom:exit=133', type: 'crash', count: 1 },
+    { signature: 'stall:event-loop', type: 'performance-stall', count: 1 },
+  ]);
+});
+
+test('topSignatures caps at 10 distinct signatures', () => {
+  // 15 distinct failure signatures collapse to the top 10 by count (here every
+  // count is 1, so the cap is the only limiter — mirrors topErrorNames' cap test).
+  const events = [];
+  for (let i = 0; i < 15; i++) {
+    events.push({ ...validError, name: 'TypeError', frames: [{ file: `F${i}.ts`, line: i }] });
+  }
+  const s = summarize(events);
+  assert.equal(s.topSignatures.length, 10);
+  assert.equal(s.topSignatures.every((e) => e.count === 1), true);
+});
+
+test('topSignatures tie-break is signature asc (stable, deterministic order)', () => {
+  // All count 1 → the rank is purely the signature ascending. Distinct names so
+  // the names themselves order the list (Zeta < … is false; Alpha < Mu < Zeta).
+  const events = [
+    { ...validError, name: 'Zeta', frames: [] },
+    { ...validError, name: 'Alpha', frames: [] },
+    { ...validError, name: 'Mu', frames: [] },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(
+    s.topSignatures.map((e) => e.signature),
+    ['Alpha', 'Mu', 'Zeta']
+  );
+});
+
+test('topSignatures ignores events that yield no signature (skip-robust, never fatal)', () => {
+  // A nameless error, a reasonless crash, a sourceless stall, and a non-object
+  // all yield null from signatureOf → no bucket, and the good records still rank.
+  const s = summarize([
+    { type: 'error', frames: [] }, // no name
+    { type: 'crash' }, // no reason
+    { type: 'performance-stall' }, // no source
+    null,
+    { ...validError, name: 'TypeError', frames: [{ file: 'App.tsx', line: 1 }] },
+  ]);
+  assert.deepEqual(s.topSignatures, [
+    { signature: 'TypeError @ App.tsx:1', type: 'error', count: 1 },
+  ]);
 });
 
 // ── SCHEMA-VERSION HISTOGRAM ──────────────────────────────────────────────────
@@ -250,6 +380,9 @@ test('the summary never echoes raw events or extended-tier identifiers (aggregat
   const events = [
     {
       ...validError,
+      // A real top frame so the failure signature carries the non-identifying
+      // location fields (file/function/line) — asserted present below.
+      frames: [{ function: 'renderChat', file: 'App.tsx', line: 142 }],
       message: 'super secret stack detail',
       chatName: 'Refactor auth',
       sessionName: 'claude-7b3a2f1',
@@ -257,11 +390,21 @@ test('the summary never echoes raw events or extended-tier identifiers (aggregat
   ];
   const s = summarize(events);
   const json = JSON.stringify(s);
+  // The redacted free-text `message` and the extended-tier identifiers MUST NOT
+  // reach the summary — the signature is built ONLY from non-identifying fields.
   assert.equal(json.includes('Refactor auth'), false, 'no chatName in summary');
   assert.equal(json.includes('claude-7b3a2f1'), false, 'no sessionName in summary');
   assert.equal(json.includes('super secret stack detail'), false, 'no message in summary');
-  // the non-identifying error name IS the only string carried through
+  // the non-identifying error name IS carried through…
   assert.equal(json.includes('TypeError'), true);
+  // …and so are the non-identifying frame fields, INSIDE a signature bucket —
+  // this is the trust model for topSignatures (WARDEN-707): only structured
+  // non-identifying fields, never message/identifiers.
+  assert.equal(json.includes('App.tsx:142'), true, 'non-identifying frame file:line is in a signature');
+  assert.equal(json.includes('renderChat'), true, 'non-identifying frame function is in a signature');
+  assert.deepEqual(s.topSignatures, [
+    { signature: 'TypeError @ App.tsx:142 (renderChat)', type: 'error', count: 1 },
+  ]);
 });
 
 // ── SKIP-ROBUST ───────────────────────────────────────────────────────────────

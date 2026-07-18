@@ -236,6 +236,14 @@ test('GET /summary returns the aggregate over a pre-populated store → 200 + JS
   assert.equal(body.total, 2);
   assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0 });
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
+  // The new failure-signature aggregate (WARDEN-707) flows through the
+  // `...summarize(events)` spread at the /summary handler. errorEvent has empty
+  // frames → name-only signature; crashEvent has no exitCode → `crash:oom`.
+  // Both count 1 → tie-broken by signature asc ('T' < 'c').
+  assert.deepEqual(body.topSignatures, [
+    { signature: 'TypeError', type: 'error', count: 1 },
+    { signature: 'crash:oom', type: 'crash', count: 1 },
+  ]);
   assert.deepEqual(body.schemaVersions, { '1': 2 });
   assert.equal(body.firstSeen, 5);
   assert.equal(body.lastSeen, 9);
@@ -838,6 +846,12 @@ test('retention: /summary stays self-consistent over a pruned store — aggregat
   assert.equal(body.total, 2);
   assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0 });
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }], 'RangeError was pruned');
+  // topSignatures reflects ONLY the retained set: RangeError was pruned, so the
+  // sole error signature is the name-only `TypeError`; crash@400 → `crash:oom`.
+  assert.deepEqual(body.topSignatures, [
+    { signature: 'TypeError', type: 'error', count: 1 },
+    { signature: 'crash:oom', type: 'crash', count: 1 },
+  ]);
   assert.deepEqual(body.schemaVersions, { '1': 2 });
   assert.equal(body.firstSeen, 300, 'firstSeen bounds the RETAINED window (100 was pruned)');
   assert.equal(body.lastSeen, 400);
