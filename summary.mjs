@@ -3,7 +3,7 @@
 // They take the events read back via the store and return the AGGREGATE object a
 // self-hosting maintainer can act on (counts / histograms only):
 //   - `summarize(events)`        → flat aggregates (total / byType / topErrorNames
-//                                  / schemaVersions / firstSeen / lastSeen).
+//                                  / schemaVersions / appVersions / firstSeen / lastSeen).
 //   - `summarizeTimeline(events)` → a bounded temporal distribution (event counts
 //                                  per time bucket over a rolling recent window,
 //                                  WARDEN-603) so a maintainer can distinguish a
@@ -15,9 +15,16 @@
 // reached disk. They introduce NO new data, re-collect nothing, and route to no
 // third party (a local read on the self-hosted receiver). Return aggregates only:
 // counts, per-type totals, non-identifying error `name`s, a schema-version
-// histogram, and a counts-only time distribution. NEVER echo raw events or
-// extended-tier names (chatName / sessionName) — those are the only identifiers
-// ever present, and a summary has no need of them.
+// histogram, an app-release `appVersion` histogram, and a counts-only time
+// distribution. NEVER echo raw events or extended-tier names (chatName /
+// sessionName) — those are the only identifiers ever present, and a summary has
+// no need of them.
+//
+// `appVersions` (WARDEN-665) buckets event counts by the client's non-identifying
+// `appVersion` release label — a value identical for every user on a release (not
+// an identifier, not content) — so a maintainer can attribute volume to a release.
+// It is a COUNTS-only histogram keyed by the release label string; like the other
+// aggregates it echoes no raw event and touches no identifier.
 
 import { BASE_EVENT_TYPES } from './schema.ts';
 
@@ -52,6 +59,7 @@ export const DEFAULT_TIMELINE_MAX_BUCKETS = 48;
  *   byType: Record<string, number>,
  *   topErrorNames: { name: string, count: number }[],
  *   schemaVersions: Record<string, number>,
+ *   appVersions: Record<string, number>,
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
@@ -66,6 +74,7 @@ export function summarize(events) {
 
   const errorNameCounts = {};
   const schemaVersions = {};
+  const appVersions = {};
   let total = 0;
   let firstSeen = null;
   let lastSeen = null;
@@ -76,7 +85,7 @@ export function summarize(events) {
     if (!event || typeof event !== 'object') continue;
     total += 1;
 
-    const { type, name, schemaVersion, timestamp } = event;
+    const { type, name, schemaVersion, timestamp, appVersion } = event;
 
     if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(byType, type)) {
       byType[type] += 1;
@@ -88,6 +97,13 @@ export function summarize(events) {
     if (schemaVersion !== undefined && schemaVersion !== null) {
       const key = String(schemaVersion);
       schemaVersions[key] = (schemaVersions[key] ?? 0) + 1;
+    }
+    // appVersion release label (WARDEN-665). Skip-robust like schemaVersions: only
+    // bucket a PRESENT, non-empty string — absent / null / non-string / empty is
+    // ignored (a v2 source that cannot read the version emits no field), so a
+    // malformed value never crashes or produces a junk bucket.
+    if (typeof appVersion === 'string' && appVersion.length > 0) {
+      appVersions[appVersion] = (appVersions[appVersion] ?? 0) + 1;
     }
     if (typeof timestamp === 'number' && Number.isFinite(timestamp)) {
       if (firstSeen === null || timestamp < firstSeen) firstSeen = timestamp;
@@ -107,6 +123,7 @@ export function summarize(events) {
     byType,
     topErrorNames,
     schemaVersions,
+    appVersions,
     firstSeen,
     lastSeen,
   };

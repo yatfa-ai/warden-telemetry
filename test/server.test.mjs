@@ -43,7 +43,7 @@ function fakeRes() {
 }
 
 const validError = {
-  schemaVersion: 1,
+  schemaVersion: SCHEMA_VERSION,
   type: 'error',
   runtime: 'main',
   timestamp: 1,
@@ -51,8 +51,8 @@ const validError = {
   message: 'm',
   frames: [],
 };
-const validBody = JSON.stringify({ schemaVersion: 1, events: [validError] });
-const headersV1 = { 'x-telemetry-schema': '1' };
+const validBody = JSON.stringify({ schemaVersion: SCHEMA_VERSION, events: [validError] });
+const schemaHeaders = { 'x-telemetry-schema': String(SCHEMA_VERSION) };
 
 // Build a handler wired to a capturing store; returns { handler, captured }.
 function wiring() {
@@ -65,7 +65,7 @@ function wiring() {
 test('POST /ingest with a valid batch → 202, JSON body, events reach the store', async () => {
   const { handler, captured } = wiring();
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 202);
   assert.equal(res.headers['content-type'], 'application/json');
   assert.deepEqual(JSON.parse(res.body), { accepted: 1 });
@@ -77,7 +77,7 @@ test('POST /ingest with unknown schema version → 4xx, body never reaches the s
   const { handler, captured } = wiring();
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { 'x-telemetry-schema': '2' }, body: 'GARBAGE NOT JSON' }),
+    fakeReq({ headers: { 'x-telemetry-schema': String(SCHEMA_VERSION + 1) }, body: 'GARBAGE NOT JSON' }),
     res
   );
   assert.ok(res.statusCode >= 400 && res.statusCode <= 499);
@@ -88,10 +88,10 @@ test('POST /ingest with an out-of-schema event → 422, nothing persisted', asyn
   const { handler, captured } = wiring();
   const res = fakeRes();
   const badBody = JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: SCHEMA_VERSION,
     events: [{ ...validError, runtime: 'worker' }],
   });
-  await handler(fakeReq({ headers: headersV1, body: badBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: badBody }), res);
   assert.equal(res.statusCode, 422);
   assert.equal(captured.length, 0);
 });
@@ -99,7 +99,7 @@ test('POST /ingest with an out-of-schema event → 422, nothing persisted', asyn
 test('POST /ingest with malformed JSON → 400', async () => {
   const { handler, captured } = wiring();
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: 'not json' }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: 'not json' }), res);
   assert.equal(res.statusCode, 400);
   assert.equal(captured.length, 0);
 });
@@ -182,7 +182,7 @@ test('a malformed request-target still 400s when auth is set (the throw is after
 test('POST /ingest?foo=bar still routes to ingest (query string ignored)', async () => {
   const { handler, captured } = wiring();
   const res = fakeRes();
-  await handler(fakeReq({ url: '/ingest?foo=bar', headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ url: '/ingest?foo=bar', headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 202);
   assert.equal(captured.length, 1);
 });
@@ -286,7 +286,7 @@ test('GET /summary reflects events appended since the handler was built (live re
   assert.equal(JSON.parse(res.body).total, 0);
 
   // ingest one event, then summary sees it
-  await handler(fakeReq({ headers: headersV1, body: validBody }), fakeRes());
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), fakeRes());
   res = fakeRes();
   await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
   assert.equal(JSON.parse(res.body).total, 1);
@@ -304,7 +304,7 @@ test('both POST /ingest and GET /summary are routed by the SAME createRequestHan
   const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
 
   const ingestRes = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), ingestRes);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), ingestRes);
   assert.equal(ingestRes.statusCode, 202, 'POST /ingest still routes through the handler');
 
   const summaryRes = fakeRes();
@@ -425,7 +425,7 @@ test('every route is served by the SAME createRequestHandler (no route drift acr
   const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
 
   const ingestRes = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), ingestRes);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), ingestRes);
   assert.equal(ingestRes.statusCode, 202, 'POST /ingest still routes through the handler');
 
   const summaryRes = fakeRes();
@@ -773,7 +773,7 @@ test('retention: ingest below the count bound triggers NO rewrite (the request p
   const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, retention });
 
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 202);
   assert.equal(rewriteCalls, 0, 'no rewrite seam call on a sub-bound ingest');
   assert.equal(clock.pending(), 0, 'no prune armed on a sub-bound ingest');
@@ -795,7 +795,7 @@ test('retention: sustained ingest past the count bound arms a debounced prune th
   // bound is crossed, but it has NOT fired yet (the response path does not flush it).
   for (let i = 0; i < 4; i++) {
     const res = fakeRes();
-    await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+    await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
     assert.equal(res.statusCode, 202);
   }
   assert.equal(clock.pending(), 1, 'a debounced prune is armed once the bound is crossed');
@@ -842,7 +842,7 @@ test('retention: an absent retention dep leaves the handler unchanged (today beh
   const store = createNdjsonStore({ sink: async (l) => void captured.push(l) });
   const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } }); // no retention
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 202);
   assert.equal(captured.length, 1);
 });
@@ -975,7 +975,7 @@ async function summaryRejections(handler, headers) {
 test('a 415 rejection (unknown schema) is surfaced in GET /summary — schema drift made visible', async () => {
   const { handler } = wiringWithTally();
   const res = fakeRes();
-  await handler(fakeReq({ headers: { 'x-telemetry-schema': '2' }, body: 'GARBAGE NOT JSON' }), res);
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': String(SCHEMA_VERSION + 1) }, body: 'GARBAGE NOT JSON' }), res);
   assert.equal(res.statusCode, 415);
 
   const rej = await summaryRejections(handler);
@@ -988,9 +988,9 @@ test('a 415 rejection (unknown schema) is surfaced in GET /summary — schema dr
 
 test('a 422 rejection (out-of-schema event) is surfaced in GET /summary', async () => {
   const { handler } = wiringWithTally();
-  const badBody = JSON.stringify({ schemaVersion: 1, events: [{ ...validError, runtime: 'worker' }] });
+  const badBody = JSON.stringify({ schemaVersion: SCHEMA_VERSION, events: [{ ...validError, runtime: 'worker' }] });
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: badBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: badBody }), res);
   assert.equal(res.statusCode, 422);
 
   const rej = await summaryRejections(handler);
@@ -1001,7 +1001,7 @@ test('a 422 rejection (out-of-schema event) is surfaced in GET /summary', async 
 test('a 400 rejection (malformed JSON body) is surfaced in GET /summary', async () => {
   const { handler } = wiringWithTally();
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: 'not json' }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: 'not json' }), res);
   assert.equal(res.statusCode, 400);
 
   const rej = await summaryRejections(handler);
@@ -1027,7 +1027,7 @@ test('a 401 rejection (auth gate) is surfaced in GET /summary — the tally cove
   // the read itself does not add a 401 to the count.
   const { handler } = wiringWithTally(TALLY_SECRET);
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res); // no bearer → 401 at the gate
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res); // no bearer → 401 at the gate
   assert.equal(res.statusCode, 401);
 
   const rej = await summaryRejections(handler, { authorization: `Bearer ${TALLY_SECRET}` });
@@ -1039,7 +1039,7 @@ test('a 401 rejection (auth gate) is surfaced in GET /summary — the tally cove
 test('a successful ingest (202) does NOT increment rejections (accepted traffic is never counted as rejected)', async () => {
   const { handler } = wiringWithTally();
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 202);
 
   const rej = await summaryRejections(handler);
@@ -1054,8 +1054,8 @@ test('an idle receiver (no traffic) returns zeroed rejections in GET /summary (p
 
 test('rejections accumulate across requests and stay bounded — mixed statuses surface a byStatus histogram', async () => {
   const { handler } = wiringWithTally();
-  await handler(fakeReq({ headers: { 'x-telemetry-schema': '2' }, body: 'x' }), fakeRes()); // 415
-  await handler(fakeReq({ headers: headersV1, body: 'not json' }), fakeRes()); // 400
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': String(SCHEMA_VERSION + 1) }, body: 'x' }), fakeRes()); // 415
+  await handler(fakeReq({ headers: schemaHeaders, body: 'not json' }), fakeRes()); // 400
   await handler(fakeReq({ url: '/no-such-route' }), fakeRes()); // 404
 
   const rej = await summaryRejections(handler);
@@ -1208,7 +1208,7 @@ test('a persist failure (store.appendEvents throws) → clean retryable 503, no 
   const res = fakeRes();
   // This await RESOLVES — today's bug made it reject. (If it rejected, node:test
   // surfaces the rejection as a failure before the assertions below run.)
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.ended, true, 'the response is ended — no hung socket');
   assert.equal(res.statusCode, 503, 'a persist failure is a clean retryable 503 (5xx, not a 4xx drop)');
   assert.equal(res.headers['content-type'], 'application/json');
@@ -1221,12 +1221,12 @@ test('a persist failure 503 never echoes the raw event payload (trust model pres
   // sink and the throw fires) yet carries a raw message + an extended-tier name;
   // neither must reach the response (parity with the rejection-tally trust tests).
   const secretBody = JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: SCHEMA_VERSION,
     events: [{ ...validError, name: 'SecretErrorName', message: 'super secret stack detail', chatName: 'Refactor auth' }],
   });
   const { handler } = wiringWithPersistErrors();
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: secretBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: secretBody }), res);
   assert.equal(res.statusCode, 503, 'the valid event reached the sink and tripped the persist failure');
   const json = res.body;
   assert.equal(json.includes('super secret stack detail'), false, 'no raw message in the 503');
@@ -1237,7 +1237,7 @@ test('a persist failure 503 never echoes the raw event payload (trust model pres
 test('a persist failure is surfaced in GET /summary — "validated but un-storable" made visible', async () => {
   const { handler } = wiringWithPersistErrors({ now: () => 12345 });
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 503);
 
   const pe = await summaryPersistErrors(handler);
@@ -1257,7 +1257,7 @@ test('persistErrors stay BOUNDED across many failures with varied reasons — on
     makeError: () => new Error(`outage #${i++}`),
   });
   for (let n = 0; n < 50; n++) {
-    await handler(fakeReq({ headers: headersV1, body: validBody }), fakeRes());
+    await handler(fakeReq({ headers: schemaHeaders, body: validBody }), fakeRes());
   }
   const pe = await summaryPersistErrors(handler);
   assert.equal(pe.total, 50);
@@ -1281,7 +1281,7 @@ test('a persist failure records into persistErrors, NOT into the rejections tall
     persistErrors,
   });
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 503);
 
   const summaryRes = fakeRes();
@@ -1304,7 +1304,7 @@ test('a successful ingest (202) does NOT increment persistErrors (a healthy writ
   const persistErrors = createPersistErrorTally({ now: () => 0 });
   const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, persistErrors });
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: validBody }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
   assert.equal(res.statusCode, 202);
 
   const pe = await summaryPersistErrors(handler);
@@ -1512,7 +1512,7 @@ test('oversized body (no Content-Length) over the cap → 413 via the cap-aware 
   // same way a 415 does — so oversized traffic is distinguishable from no traffic.
   const { handler, rejections } = wiringWithCap({ maxBodyBytes: 10 });
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: 'x'.repeat(100) }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: 'x'.repeat(100) }), res);
   assert.equal(res.statusCode, 413);
   assert.deepEqual(JSON.parse(res.body), { error: 'request body too large' });
   const snap = rejections.snapshot();
@@ -1528,7 +1528,7 @@ test('Content-Length over the cap → 413 PRE-READ, the body is NEVER buffered (
   const { handler } = wiringWithCap({ maxBodyBytes: 1024 });
   const res = fakeRes();
   const req = bodySpyReq({
-    headers: { ...headersV1, 'content-length': String(10 * 1024 * 1024) }, // 10 MiB declared
+    headers: { ...schemaHeaders, 'content-length': String(10 * 1024 * 1024) }, // 10 MiB declared
     body: 'x'.repeat(100), // small actual body — never read anyway
   });
   await handler(req, res);
@@ -1544,7 +1544,7 @@ test('Content-Length AT/UNDER the cap → 202 unchanged (a normal batch still in
   const { handler, captured, rejections } = wiringWithCap({ maxBodyBytes: DEFAULT_MAX_BODY_BYTES });
   const res = fakeRes();
   await handler(
-    fakeReq({ headers: { ...headersV1, 'content-length': String(validBody.length) }, body: validBody }),
+    fakeReq({ headers: { ...schemaHeaders, 'content-length': String(validBody.length) }, body: validBody }),
     res
   );
   assert.equal(res.statusCode, 202);
@@ -1559,7 +1559,7 @@ test('maxBodyBytes=0 (the escape hatch) → an oversized body does NOT 413 (toda
   // who explicitly unbounds the cap gets the original behavior back.
   const { handler, rejections } = wiringWithCap({ maxBodyBytes: 0 });
   const res = fakeRes();
-  await handler(fakeReq({ headers: headersV1, body: 'x'.repeat(100) }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: 'x'.repeat(100) }), res);
   assert.equal(res.statusCode, 400, 'cap=0 → the body was fully read then 400’d by ingest (garbage JSON), NOT 413');
   assert.equal(rejections.snapshot().byStatus['413'], undefined, 'the cap is off — no 413 is ever recorded');
 });
@@ -1572,7 +1572,7 @@ test('wrong x-telemetry-schema → 415 WITHOUT buffering the body (pre-read hand
   // there); this is an EARLY copy that collapses the drift case's memory cost to zero.
   const { handler, rejections } = wiringWithCap({ maxBodyBytes: 1024 });
   const res = fakeRes();
-  const req = bodySpyReq({ headers: { 'x-telemetry-schema': '2' }, body: 'GARBAGE NOT JSON' });
+  const req = bodySpyReq({ headers: { 'x-telemetry-schema': String(SCHEMA_VERSION + 1) }, body: 'GARBAGE NOT JSON' });
   await handler(req, res);
   assert.equal(res.statusCode, 415);
   assert.equal(req.bodyListenerCount(), 0, 'the body was never buffered — the 415 fired pre-read');
@@ -1589,7 +1589,7 @@ test('the 413 body is the receiver FIXED diagnostic, never the oversized payload
   const { handler } = wiringWithCap({ maxBodyBytes: 10 });
   const res = fakeRes();
   const payload = 'SECRET-' + 'x'.repeat(100); // oversized and carries a marker
-  await handler(fakeReq({ headers: headersV1, body: payload }), res);
+  await handler(fakeReq({ headers: schemaHeaders, body: payload }), res);
   assert.equal(res.statusCode, 413);
   assert.equal(res.body.includes('SECRET'), false, 'the oversized payload is not echoed');
   assert.deepEqual(JSON.parse(res.body), { error: 'request body too large' });
