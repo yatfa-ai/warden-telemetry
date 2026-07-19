@@ -61,8 +61,9 @@
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { SCHEMA_VERSION, validateEvent } from './schema.ts';
-import { createNdjsonStore, fileSink, fileSource, fileRewrite } from './store.mjs';
+import { createNdjsonStore, fileSink, fileSource, fileRewrite, fileSeenKeysSource, fileSeenKeysSink } from './store.mjs';
 import { ingest } from './ingest.mjs';
 import { summarize, summarizeTimeline, DEFAULT_TIMELINE_MAX_BUCKETS, DEFAULT_TIMELINE_WINDOW_MS } from './summary.mjs';
 import { selectEvents, filterEvents, resolveLimit, resolveOffset } from './events.mjs';
@@ -128,15 +129,25 @@ export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB POST body cap — bo
 // key expires `ttlMs` after it was recorded, observed lazily on access — no
 // timers, so no setTimer/clearTimer dep) and a COUNT cap (FIFO eviction when
 // exceeded), so neither a long-lived receiver nor a flood of distinct keys grows
-// it without limit. In-memory + receiver-local: need not survive a restart (the
-// tallies' posture) — the known residual edge is a restart mid-retry-window.
-// ADDITIVE ONLY: dedup AVOIDS a duplicate write, never expands collection, relaxes
+// it without limit. Receiver-local: the set is persisted beside telemetry.ndjson
+// via an OPTIONAL injected durability seam (load/persist, WARDEN-803) so it
+// SURVIVES a receiver restart — a retried batch whose 2xx was lost before the
+// restart still dedups, closing the restart-mid-retry-window residual edge (the
+// observability tallies remain restart-local by design, WARDEN-768). ADDITIVE
+// ONLY: dedup AVOIDS a duplicate event write, never expands collection, relaxes
 // no check (handshake / validate / auth / retention / body cap all still run),
-// routes to no third party, persists nothing.
+// and routes nothing to a third party; the persisted set holds only opaque client
+// key strings + expiry ms — never an event payload, tier identifier, or credential.
 // The TTL comfortably spans any client retry window (≤3 jittered attempts ≈
 // seconds) plus receiver-side slack; the count cap mirrors the retention default.
 export const DEFAULT_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 min — ~300x the client retry window
 export const DEFAULT_DEDUP_MAX_KEYS = 10000; // FIFO cap — mirrors STORE_MAX_EVENTS default
+// The persist write is DEBOUNCED so a burst of accepted batches coalesces into one
+// flush — the hot accept path pays no synchronous disk write per batch (mirrors the
+// retention compaction debounce). Small (1s): the persisted set is fresh to within
+// a second, so a restart any time after a burst still reloads those keys. Injectable
+// for unit tests via setTimer/clearTimer (like createRetentionTrigger).
+export const SEEN_KEYS_PERSIST_DEBOUNCE_MS = 1000;
 
 // Parse a non-negative number env override for retention. Unset/empty → fallback;
 // an explicit "0" disables that policy (the opt-out); a malformed/negative value
@@ -835,18 +846,30 @@ export function createDedupTally({ now = Date.now } = {}) {
 
 // ── SEEN-KEY DEDUP SET (WARDEN-666) ───────────────────────────────────────────
 // The receiver-local twin of the client's per-batch idempotency-key header. A
-// bounded, in-memory set of keys the receiver has ALREADY accepted a batch for,
-// consulted in ingest()'s pure pipeline (it receives this set as an OPTIONAL
-// injected dep alongside store/validateEvent). On a HIT (the key was recorded on
-// a PRIOR successful persist and has not expired) ingest() returns 202
+// bounded set of keys the receiver has ALREADY accepted a batch for, consulted in
+// ingest()'s pure pipeline (it receives this set as an OPTIONAL injected dep
+// alongside store/validateEvent). On a HIT (the key was recorded on a PRIOR
+// successful persist and has not expired) ingest() returns 202
 // {accepted:0, deduped:true} WITHOUT calling store.appendEvents — so a retried
 // batch whose 2xx was lost does not double-count. Mirrors the injected-seam
 // discipline of createRejectionTally / createPersistErrorTally: an OPTIONAL dep
 // (no set wired = today's behavior — no dedup, exactly like an absent tally) with
 // an injected `now` so the TTL is unit-testable with a fake clock.
+//
+// DURABILITY (WARDEN-803): the set optionally SURVIVES a receiver restart via two
+// injected seams — `load()` (read the persisted {key, expiresAt} set on boot) and
+// `persist(entries)` (write it back, debounced + off-path). A retried batch whose
+// 2xx was lost BEFORE a restart would otherwise hit a wiped in-memory set and
+// double-persist; reloading the set on boot closes that restart-mid-retry-window
+// edge. UNWIRED (no load/persist) = today's behavior exactly: an in-memory,
+// restart-local set (the optional-dep discipline shared with the store's injected
+// sink/source/rewrite and the tallies). The persisted record is the opaque client
+// key string + its expiry epoch-ms ONLY — never an event payload, tier identifier,
+// or credential — identical trust posture to the on-disk NDJSON event store.
 
 /**
- * Build the seen-key dedup set (WARDEN-666).
+ * Build the seen-key dedup set (WARDEN-666), with an OPTIONAL durability seam
+ * (WARDEN-803) so the set survives a receiver restart.
  *
  * Bounded by BOTH a TTL (each key expires `ttlMs` after it was recorded; expiry
  * is observed LAZILY on access, so no timers are needed) and a COUNT cap (when a
@@ -854,17 +877,85 @@ export function createDedupTally({ now = Date.now } = {}) {
  * FIFO via Map insertion order). Neither a long-lived receiver nor a sustained
  * flood of distinct keys can grow it without limit.
  *
- * @param {{ ttlMs?: number, maxKeys?: number, now?: () => number }} [opts]
+ * `load` / `persist` (WARDEN-803) are OPTIONAL: unwired = an in-memory,
+ * restart-local set (today's behavior). When wired, `boot()` seeds the Map from
+ * `load()` (dropping already-expired entries so a stale file can't resurrect dead
+ * keys) and `record()` arms a DEBOUNCED, off-path, re-entrancy-guarded
+ * `persist()` — the EXACT pattern `createRetentionTrigger` uses for retention
+ * compaction. The hot accept path pays NO synchronous disk write per batch; a
+ * burst of records coalesces into one debounced flush, and a `persist` rejection
+ * is swallowed (telemetry is best-effort — the receiver never crashes on a dedup-
+ * file write failure). The persisted record round-trips BOTH the key AND its
+ * `expiresAt` (dropping expiry would collapse to a no-op — everything would
+ * re-expire immediately and the post-restart HIT would never fire).
+ *
+ * @param {{ ttlMs?: number, maxKeys?: number, now?: () => number, load?: () => (Promise<{key: string, expiresAt: number}[]> | {key: string, expiresAt: number}[]), persist?: (entries: {key: string, expiresAt: number}[]) => (void | Promise<void>), persistDebounceMs?: number, setTimer?: (fn: () => void, ms: number) => unknown, clearTimer?: (id: unknown) => void }} [opts]
  * @returns {{
  *   has(key: string): boolean,
  *   record(key: string): void,
- *   snapshot(): { configured: { maxKeys: number, ttlMs: number }, size: number }
+ *   snapshot(): { configured: { maxKeys: number, ttlMs: number }, size: number },
+ *   boot(): Promise<void>,
+ *   cancel(): void
  * }}
  */
-export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT_DEDUP_MAX_KEYS, now = Date.now } = {}) {
+export function createSeenKeys({
+  ttlMs = DEFAULT_DEDUP_TTL_MS,
+  maxKeys = DEFAULT_DEDUP_MAX_KEYS,
+  now = Date.now,
+  load = null,
+  persist = null,
+  persistDebounceMs = SEEN_KEYS_PERSIST_DEBOUNCE_MS,
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  clearTimer = (id) => clearTimeout(id),
+} = {}) {
   // key -> expiresAt (a Map preserves insertion order, giving O(1)-amortized FIFO
   // eviction via keys().next()).
   const seen = new Map();
+  // Debounce / re-entrancy state for the off-path persist write — mirrors
+  // createRetentionTrigger's timerId / running / arm / flush discipline exactly.
+  let timerId = null;
+  let running = false;
+  let dirty = false; // a record() landed since the last persist began
+
+  // The live {key, expiresAt} set the Map currently holds, with already-expired
+  // entries dropped (they are dead — persisting them would only bloat the file, and
+  // load drops them anyway). Bounded by `maxKeys` (the FIFO cap applied in record()).
+  function liveEntries() {
+    const t = now();
+    const out = [];
+    for (const [key, expiresAt] of seen) {
+      if (expiresAt > t) out.push({ key, expiresAt });
+    }
+    return out;
+  }
+
+  function flush() {
+    timerId = null;
+    // Re-entrancy guard: if a persist is still mid-flight, let it finish. A record()
+    // that lands during it sets `dirty`, and the in-flight flush's .finally re-arms.
+    if (running || !persist) return;
+    running = true;
+    dirty = false; // snapshotting the current set to persist
+    const entries = liveEntries();
+    Promise.resolve(persist(entries))
+      .catch(() => {
+        // A persist failure must NEVER crash the receiver (telemetry is best-effort,
+        // mirroring createRetentionTrigger's swallow-don't-crash posture). The
+        // in-memory set stays correct for this process; the next record() re-arms.
+      })
+      .finally(() => {
+        running = false;
+        // Records that landed during the write re-arm so the latest set reaches disk.
+        if (dirty) arm();
+      });
+  }
+
+  function arm() {
+    if (!persist) return;
+    if (timerId != null || running) return; // already armed / a flush is mid-flight
+    timerId = setTimer(flush, persistDebounceMs);
+  }
+
   return {
     /** True if a non-empty `key` was recorded and has not yet expired (a dedup
      *  HIT). Read-only with a lazy purge: an expired entry looked up here is
@@ -883,13 +974,19 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
     /** Record a key as seen (refreshing its expiry if already present). Call this
      *  ONLY after a successful persist — so a batch that was rejected (4xx) or
      *  failed to store is never cached and a retry is processed normally rather
-     *  than wrongly dedup'd. FIFO cap evicts the OLDEST entry while over the bound. */
+     *  than wrongly dedup'd. FIFO cap evicts the OLDEST entry while over the bound.
+     *  When a `persist` seam is wired, arms a debounced off-path flush (a burst
+     *  coalesces into one write; the hot path pays no synchronous disk write). */
     record(key) {
       if (typeof key !== 'string' || key.length === 0) return;
       seen.set(key, now() + ttlMs);
       while (seen.size > maxKeys) {
         const oldest = seen.keys().next().value;
         seen.delete(oldest);
+      }
+      if (persist) {
+        dirty = true;
+        arm();
       }
     },
     /** Point-in-time capacity snapshot (observability; expired entries are purged
@@ -902,6 +999,45 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
      *  losing keys to FIFO eviction / TTL expiry). */
     snapshot() {
       return { configured: { maxKeys, ttlMs }, size: seen.size };
+    },
+    /** Seed the Map from the `load()` seam (WARDEN-803). Called ONCE at boot,
+     *  BEFORE the server accepts traffic, so a retry landing in the first
+     *  milliseconds after boot still dedups. Already-expired entries are DROPPED on
+     *  load (a stale file can't resurrect a dead key); malformed entries are
+     *  skipped. Best-effort and NEVER rejects — a missing/corrupt file starts the
+     *  set empty (the receiver always comes up). No-op when no `load` is wired. */
+    async boot() {
+      if (typeof load !== 'function') return;
+      let entries;
+      try {
+        entries = await load();
+      } catch {
+        // A missing/corrupt persisted file must never crash boot — start empty.
+        return;
+      }
+      if (!Array.isArray(entries)) return;
+      const t = now();
+      for (const e of entries) {
+        if (!e || typeof e.key !== 'string' || e.key.length === 0) continue;
+        const { expiresAt } = e;
+        if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) continue;
+        if (expiresAt <= t) continue; // DROP already-expired on load
+        seen.set(e.key, expiresAt);
+      }
+      // Apply the FIFO cap in case a stale file exceeds it.
+      while (seen.size > maxKeys) {
+        const oldest = seen.keys().next().value;
+        seen.delete(oldest);
+      }
+      dirty = false; // freshly loaded — the Map mirrors the file
+    },
+    /** Clear any pending debounced persist (e.g. on server shutdown). Mirrors
+     *  createRetentionTrigger.cancel(). */
+    cancel() {
+      if (timerId != null) {
+        clearTimer(timerId);
+        timerId = null;
+      }
     },
   };
 }
@@ -995,8 +1131,8 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * body is buffered (defense-in-depth alongside ingest()'s own check) so a wrong-
  * version request is 415'd without paying its body's memory cost.
  *
- * `seenKeys` (optional dedup set, WARDEN-666): a bounded, in-memory, receiver-local
- * set of idempotency keys the receiver has ALREADY accepted a batch for. It is
+ * `seenKeys` (optional dedup set, WARDEN-666): a bounded, receiver-local set of
+ * idempotency keys the receiver has ALREADY accepted a batch for. It is
  * passed THROUGH to `ingest()` as an optional dep (absent = today's behavior — no
  * dedup, exactly like an absent tally). Inside ingest(), a request whose
  * `idempotency-key` header is already in the set returns 202 {accepted:0,
@@ -1004,15 +1140,22 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * was lost (the client reuses one key across retries of the same bytes) does not
  * double-count and silently inflate /summary + /events. ADDITIVE ONLY: dedup avoids
  * a duplicate write, never expands collection, relaxes no check (handshake /
- * validate / auth / retention / body cap all still run), persists nothing. Built by
- * `createSeenKeys()`. GET /summary ALSO reads `seenKeys.snapshot()` (WARDEN-790) so
- * a maintainer sees the set's live FILL LEVEL (`size`) against its configured
- * `maxKeys` cap + per-key `ttlMs` — the capacity-health complement to the `deduped`
- * hit-count tally: `deduped` says the dedup fired, `seenKeys` says the set backing
- * it can still catch the next retry (or is losing keys to FIFO eviction / TTL
- * expiry). No `seenKeys` dep = no dedup AND the zeroed `EMPTY_SEEN_KEYS` shape on
- * /summary (backward-compatible with an old client that sends no idempotency-key
- * header, and with a caller that doesn't wire the set).
+ * validate / auth / retention / body cap all still run), persists nothing, and
+ * routes nothing to a third party. Built by `createSeenKeys()`. GET /summary ALSO
+ * reads `seenKeys.snapshot()` (WARDEN-790) so a maintainer sees the set's live
+ * FILL LEVEL (`size`) against its configured `maxKeys` cap + per-key `ttlMs` —
+ * the capacity-health complement to the `deduped` hit-count tally: `deduped` says
+ * the dedup fired, `seenKeys` says the set backing it can still catch the next
+ * retry (or is losing keys to FIFO eviction / TTL expiry). No `seenKeys` dep = no
+ * dedup AND the zeroed `EMPTY_SEEN_KEYS` shape on /summary (backward-compatible
+ * with an old client that sends no idempotency-key header, and with a caller that
+ * doesn't wire the set). When the set is built with an injected durability seam
+ * (load/persist, WARDEN-803) it is reloaded from disk on boot and re-persisted
+ * (debounced, off-path) on change, so a retried batch whose 2xx was lost before a
+ * receiver restart still dedups post-restart; the persisted set holds opaque key
+ * strings + expiry ms only (never an event payload or tier identifier). This
+ * handler passes `seenKeys` through opaquely — boot/cancel are driven by
+ * `createReceiver`'s lifecycle, not the per-request path.
  *
  * `deduped` (optional tally, WARDEN-752): a bounded tally of the transport-retries
  * the receiver ABSORBED via idempotent ingest. When `await ingest(...)` resolves
@@ -1050,7 +1193,8 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
   // (the receiver's clock at boot) and frozen for the process — NOT re-read per
   // request. Emitted as a top-level epoch-ms on GET /summary so a maintainer
   // reading the restart-wiped tallies (rejections / persistErrors / retention /
-  // seenKeys) can tell a healthy quiet receiver (startedAt = hours ago, so the
+  // deduped — NOT seenKeys, which is persisted beside telemetry.ndjson by
+  // WARDEN-803) can tell a healthy quiet receiver (startedAt = hours ago, so the
   // zeroed tallies genuinely mean "no rejections in that whole window") apart
   // from a crash-looping one that zeroed every tally seconds ago (startedAt =
   // seconds ago). Those two states read byte-identical on /summary without this
@@ -1498,12 +1642,13 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
  * The ingest body cap (WARDEN-627) mirrors it again: read from
  * INGEST_MAX_BODY_BYTES when not passed, defaulting to a bounded 1 MiB.
  *
- * @param {{ port?: number, storePath?: string, store?: object, schema?: object, authToken?: string, maxEvents?: number, maxAgeHours?: number, maxBodyBytes?: number }} [opts]
+ * @param {{ port?: number, storePath?: string, seenKeysPath?: string, store?: object, schema?: object, authToken?: string, maxEvents?: number, maxAgeHours?: number, maxBodyBytes?: number }} [opts]
  * @returns {import('node:http').Server}
  */
 export function createReceiver({
   port = process.env.PORT ? Number(process.env.PORT) : DEFAULT_PORT,
   storePath = process.env.STORE ?? DEFAULT_STORE_PATH,
+  seenKeysPath = join(dirname(storePath), 'seen-keys.ndjson'),
   store = createNdjsonStore({
     sink: fileSink(storePath),
     source: fileSource(storePath),
@@ -1520,7 +1665,14 @@ export function createReceiver({
   const retention = createRetentionTrigger(store, { maxEvents, maxAgeMs, retention: retentionHealth });
   const rejections = createRejectionTally();
   const persistErrors = createPersistErrorTally();
-  const seenKeys = createSeenKeys();
+  // The seen-key dedup set, wired with its durability seams (WARDEN-803): the set
+  // is reloaded from `seenKeysPath` on boot and re-persisted (debounced, off-path)
+  // on change, so idempotent-ingest dedup survives a receiver restart. The file
+  // lives beside telemetry.ndjson (same dir, same trust posture) by default.
+  const seenKeys = createSeenKeys({
+    load: fileSeenKeysSource(seenKeysPath),
+    persist: fileSeenKeysSink(seenKeysPath),
+  });
   const deduped = createDedupTally();
   const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors, seenKeys, deduped, maxBodyBytes, retentionHealth });
   const server = createServer(handler);
@@ -1537,9 +1689,19 @@ export function createReceiver({
   server.on('close', () => {
     retention.cancel();
     if (sweepInterval) clearInterval(sweepInterval);
+    seenKeys.cancel(); // drop any pending debounced seen-key persist
   });
 
-  if (port != null) server.listen(port);
+  // Boot the seen-key set from disk BEFORE accepting traffic, so a retry landing
+  // in the first milliseconds after boot still dedups (WARDEN-803). boot() is
+  // best-effort and never rejects (a missing/corrupt file starts the set empty),
+  // so `listen` fires either way — the receiver always comes up, just with a
+  // possibly-empty dedup set if the persisted file was unreadable. createReceiver
+  // returns the server synchronously; the deferred `listen` fires once boot
+  // resolves (before which no connection can be accepted).
+  seenKeys.boot().finally(() => {
+    if (port != null) server.listen(port);
+  });
   return server;
 }
 
