@@ -2530,7 +2530,7 @@ test('a dedup records into deduped, NOT into rejections or persistErrors (three 
   assert.equal(body.deduped.total, 1, 'the deduped retry was recorded in its own tally');
   assert.deepEqual(
     body.rejections,
-    { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null },
+    { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null },
     'rejections untouched — a dedup is not an HTTP rejection'
   );
   assert.deepEqual(
