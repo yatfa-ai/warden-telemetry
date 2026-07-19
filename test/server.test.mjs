@@ -861,6 +861,11 @@ test('GET /summary?platform=win32 leaves rejections / persistErrors UNSCOPED (re
   assert.ok(body.rejections.byStatus['404'] >= 1, 'the 404 is still surfaced');
   // persistErrors is present with its stable shape (zeroed here — no persist failure).
   assert.equal(body.persistErrors.total, 0);
+  assert.deepEqual(
+    body.persistErrors.timeline,
+    { buckets: [], bucketMs: 1_800_000 },
+    'zeroed timeline on a quiet receiver — shape-stable, no false alarm (parity with the read-path timeline)'
+  );
 });
 
 test('GET /summary ignores an unrecognized query param (no spurious scoping — backward compatible)', async () => {
@@ -1876,6 +1881,7 @@ test('persistErrors tally: a fresh tally snapshots to the zeroed shape (parity w
     total: 0,
     lastReason: null,
     lastSeen: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
 });
 
@@ -1903,8 +1909,16 @@ test('persistErrors tally: snapshot() is a stable point-in-time copy — a later
   const snap = tally.snapshot();
   clock = 6000;
   tally.record({ reason: 'EISDIR: illegal operation on a directory, write' });
-  // the earlier snapshot is unchanged by the later record
-  assert.deepEqual(snap, { total: 1, lastReason: 'disk full', lastSeen: 5000 });
+  // the earlier snapshot is unchanged by the later record — its scalar aggregate
+  // AND its timeline are both frozen. (The one record at clock=5000 is the newest
+  // event in a 24h window ending at 5000, so it lands in the newest bucket, whose
+  // right edge is exactly 5000 — bucketEnd === lastSeen.)
+  assert.deepEqual(snap, {
+    total: 1,
+    lastReason: 'disk full',
+    lastSeen: 5000,
+    timeline: { buckets: [{ bucketStart: -1_795_000, bucketEnd: 5_000, count: 1 }], bucketMs: 1_800_000 },
+  });
   // a fresh snapshot reflects the new state
   assert.equal(tally.snapshot().total, 2);
   assert.equal(tally.snapshot().lastReason, 'EISDIR: illegal operation on a directory, write');
@@ -1920,7 +1934,7 @@ test('persistErrors tally: BOUNDED — many records with varied reasons never gr
   const snap = tally.snapshot();
   assert.equal(snap.total, 1000);
   assert.equal(snap.lastReason, 'outage reason #999', 'only the single most-recent sample reason is retained');
-  assert.deepEqual(Object.keys(snap).sort(), ['lastReason', 'lastSeen', 'total'], 'shape stays bounded — no per-failure growth');
+  assert.deepEqual(Object.keys(snap).sort(), ['lastReason', 'lastSeen', 'timeline', 'total'], 'shape stays bounded — no per-failure growth');
 });
 
 test('persistErrors tally: record() with a non-string/missing reason stores null (no unbounded/garbage reason)', () => {
@@ -1981,6 +1995,15 @@ test('a persist failure is surfaced in GET /summary — "validated but un-storab
   assert.ok(pe.total >= 1, 'the persist failure was recorded');
   assert.equal(pe.lastReason, 'disk full', 'sample reason is the store diagnostic, not a payload');
   assert.equal(pe.lastSeen, 12345, 'lastSeen is the injected now() of the failure');
+  // The additive timeline (WARDEN-777) surfaces the failure's TIMING: it fired one
+  // bucket, and the failure sat at the top edge of the rolling window's newest
+  // bucket, so bucketEnd === lastSeen (the injected now). This is the spike-vs-
+  // baseline signal total+lastSeen alone could not convey.
+  assert.ok(pe.timeline, 'timeline field present (additive — carried on every response)');
+  assert.equal(pe.timeline.buckets.length, 1, 'the one persist failure fired one bucket');
+  assert.equal(pe.timeline.buckets[0].count, 1);
+  assert.equal(pe.timeline.bucketMs, 1_800_000);
+  assert.equal(pe.timeline.buckets[0].bucketEnd, 12345, 'the failure is at the top edge of the newest bucket (bucketEnd === lastSeen)');
 });
 
 test('persistErrors stay BOUNDED across many failures with varied reasons — one count + single most-recent sample', async () => {
@@ -2000,7 +2023,7 @@ test('persistErrors stay BOUNDED across many failures with varied reasons — on
   assert.equal(pe.total, 50);
   assert.equal(pe.lastReason, 'outage #49', 'only the single most-recent sample reason is retained');
   assert.equal(pe.lastSeen, 50_000, 'lastSeen is the injected now() of the most-recent failure');
-  assert.deepEqual(Object.keys(pe).sort(), ['lastReason', 'lastSeen', 'total'], 'shape stays bounded — no per-failure growth');
+  assert.deepEqual(Object.keys(pe).sort(), ['lastReason', 'lastSeen', 'timeline', 'total'], 'shape stays bounded — no per-failure growth');
 });
 
 test('a persist failure records into persistErrors, NOT into the rejections tally (separate signals)', async () => {
@@ -2045,13 +2068,13 @@ test('a successful ingest (202) does NOT increment persistErrors (a healthy writ
   assert.equal(res.statusCode, 202);
 
   const pe = await summaryPersistErrors(handler);
-  assert.deepEqual(pe, { total: 0, lastReason: null, lastSeen: null });
+  assert.deepEqual(pe, { total: 0, lastReason: null, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } });
 });
 
 test('an idle receiver (no traffic) returns zeroed persistErrors in GET /summary (parity with today — no false alarm)', async () => {
   const { handler } = wiringWithPersistErrors();
   const pe = await summaryPersistErrors(handler);
-  assert.deepEqual(pe, { total: 0, lastReason: null, lastSeen: null });
+  assert.deepEqual(pe, { total: 0, lastReason: null, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } });
 });
 
 test('GET /summary WITHOUT a wired persistErrors tally still returns a zeroed persistErrors field (backward-compatible additive shape)', async () => {
@@ -2067,7 +2090,94 @@ test('GET /summary WITHOUT a wired persistErrors tally still returns a zeroed pe
     total: 0,
     lastReason: null,
     lastSeen: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
+});
+
+// ── PERSIST-ERROR TIMELINE (WARDEN-777) ──────────────────────────────────────
+// The bounded `timeline` on the persistErrors tally — mirrors the read-path
+// `timeline` (summarizeTimeline, WARDEN-603) so a maintainer can tell an ONGOING
+// store outage (failures still landing in the newest bucket) from a RESOLVED one
+// (failures clustered in older buckets, newest bucket empty). Driven directly with
+// an injected fake clock (mirroring the tally unit tests above): bucket-placement
+// parity with summarizeTimeline, the rolling-window roll-off bound, and redaction
+// parity with the read-path timeline.
+
+test('persistErrors tally timeline: a known seeded time spread — a recent outage spike vs an earlier baseline (bucket placement parity with the read-path summarizeTimeline)', () => {
+  // Mirrors the read-path /summary "known seeded time spread" test above: record
+  // failures at known fake-clock times so the snapshot emits buckets at EXACTLY those
+  // times. window [0, 86_400_000], bucketMs 1_800_000; bucket 1 = [1.8M, 3.6M);
+  // bucket 47 = [84.6M, 86.4M); a record at EXACTLY now (86.4M) folds into the newest
+  // bucket (parity with summarizeTimeline's top-boundary fold). The expected buckets
+  // are byte-identical to the read-path /summary timeline test.
+  let clock = 0;
+  const tally = createPersistErrorTally({ now: () => clock });
+  // baseline: one failure in bucket 1
+  clock = 1_800_000; tally.record({ reason: 'baseline ENOSPC' });
+  // spike: three failures in bucket 47 (one at exactly now → folded via the top edge)
+  clock = 84_600_000; tally.record({ reason: 'spike EACCES' });
+  clock = 84_600_001; tally.record({ reason: 'spike EACCES' });
+  clock = 86_400_000; tally.record({ reason: 'spike EACCES' }); // === now → newest via boundary fold
+  clock = 86_400_000; // snapshot time
+  const { timeline } = tally.snapshot();
+  assert.equal(timeline.buckets.length, 2, 'two distinct buckets: baseline + spike');
+  assert.deepEqual(timeline.buckets, [
+    { bucketStart: 1_800_000, bucketEnd: 3_600_000, count: 1 },   // baseline
+    { bucketStart: 84_600_000, bucketEnd: 86_400_000, count: 3 }, // recent spike (newest)
+  ]);
+  assert.equal(timeline.bucketMs, 1_800_000);
+});
+
+test('persistErrors tally timeline: ROLL-OFF BOUND — buckets older than the window drop on snapshot(); bucket count never exceeds maxBuckets', () => {
+  // Record one failure per distinct 30-min slot for 60 slots (> maxBuckets=48), each a
+  // bucketMs apart, so the 48-slot-wide rolling 24h window cannot hold them all.
+  // Advancing the fake clock pushes the earliest failures out of the window: the
+  // snapshot must drop the rolled-off buckets, never emit more than maxBuckets, and —
+  // unlike `total` — only the TIMELINE window rolls; total stays cumulative.
+  let clock = 1_800_000;
+  const tally = createPersistErrorTally({ now: () => clock });
+  for (let i = 0; i < 60; i++) {
+    tally.record({ reason: `outage slot ${i}` });
+    clock += 1_800_000; // advance to the next distinct 30-min slot
+  }
+  // clock is now 1_800_000 + 60 * 1_800_000 = 109_800_000 (snapshot time)
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 60, 'total is cumulative — it does NOT roll off (only the timeline window does)');
+  assert.ok(snap.timeline.buckets.length <= 48, `bucket count bounded at maxBuckets (got ${snap.timeline.buckets.length})`);
+  assert.equal(snap.timeline.bucketMs, 1_800_000);
+  // Every surviving bucket sits inside the current 24h window — the oldest failures
+  // (the first ~12 slots) rolled off. windowStart = clock - windowMs = 23_400_000.
+  const windowStart = clock - 86_400_000;
+  for (const b of snap.timeline.buckets) {
+    assert.ok(b.bucketStart >= windowStart, `bucket ${b.bucketStart} is inside the rolling window (>= ${windowStart})`);
+  }
+  // Emitted oldest → newest.
+  for (let i = 1; i < snap.timeline.buckets.length; i++) {
+    assert.ok(
+      snap.timeline.buckets[i - 1].bucketStart < snap.timeline.buckets[i].bucketStart,
+      'buckets sorted oldest → newest'
+    );
+  }
+});
+
+test('persistErrors tally timeline: redaction parity — a bucket carries COUNT + window only, never a reason / OS errno (parity with the read-path timeline)', () => {
+  // Mirrors the read-path /summary "never echoes raw events or extended-tier names"
+  // timeline test above: the timeline adds TIMING, not content. A persist failure's
+  // `reason` is already an OS errno / sink diagnostic (the store JSON.stringified
+  // each event BEFORE the sink ran, so a sink throw carries system info, never event
+  // bytes), and the bucket carries only a count + time window — so no reason text
+  // reaches the timeline beyond what `lastReason` already exposes.
+  let clock = 1_800_000;
+  const tally = createPersistErrorTally({ now: () => clock });
+  tally.record({ reason: 'ENOSPC: super secret disk diagnostic #7B' });
+  const { timeline } = tally.snapshot();
+  assert.equal(timeline.buckets.length, 1, 'the failure fired a bucket');
+  const json = JSON.stringify(timeline);
+  assert.equal(json.includes('ENOSPC'), false, 'no OS errno text in the timeline');
+  assert.equal(json.includes('super secret disk diagnostic'), false, 'no reason text in the timeline');
+  assert.equal(json.includes('7B'), false, 'no reason fragment in the timeline');
+  // The bucket shape is count + window only — there is no field that could carry a reason.
+  assert.deepEqual(Object.keys(timeline.buckets[0]).sort(), ['bucketEnd', 'bucketStart', 'count']);
 });
 
 // ── RETENTION-HEALTH TALLY (WARDEN-743) ──────────────────────────────────────
@@ -2603,7 +2713,7 @@ test('a dedup records into deduped, NOT into rejections or persistErrors (three 
   );
   assert.deepEqual(
     body.persistErrors,
-    { total: 0, lastReason: null, lastSeen: null },
+    { total: 0, lastReason: null, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } },
     'persistErrors untouched — a dedup is not a persist failure'
   );
 });
