@@ -1863,7 +1863,7 @@ test('(WARDEN-666) a retried batch (same idempotency-key) is deduped: ONE store 
   });
   const seenKeys = createSeenKeys();
   const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, seenKeys });
-  const headers = { ...headersV1, 'idempotency-key': 'batch-xyz' };
+  const headers = { ...schemaHeaders, 'idempotency-key': 'batch-xyz' };
 
   // First POST: accepted + persisted normally.
   const r1 = fakeRes();
@@ -1896,7 +1896,7 @@ test('(WARDEN-666) a handler with NO seenKeys dep does NOT dedup (backward-compa
   // wiring() wires NO seenKeys, so the key header is ignored — both posts persist.
   // An unwired receiver (or an old client that sends no key header) is unchanged.
   const { handler, captured } = wiring();
-  const headers = { ...headersV1, 'idempotency-key': 'dup' };
+  const headers = { ...schemaHeaders, 'idempotency-key': 'dup' };
   await handler(fakeReq({ headers, body: validBody }), fakeRes());
   await handler(fakeReq({ headers, body: validBody }), fakeRes());
   assert.equal(captured.length, 2, 'no seenKeys wired → no dedup → both stored (today behavior)');
@@ -1906,9 +1906,9 @@ test('(WARDEN-666) distinct idempotency-keys are distinct batches (both persist 
   const seenKeys = createSeenKeys();
   const handler = createRequestHandler({ store: createNdjsonStore({ sink: async () => {} }), schema: { SCHEMA_VERSION, validateEvent }, seenKeys });
   const r1 = fakeRes();
-  await handler(fakeReq({ headers: { ...headersV1, 'idempotency-key': 'A' }, body: validBody }), r1);
+  await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'A' }, body: validBody }), r1);
   const r2 = fakeRes();
-  await handler(fakeReq({ headers: { ...headersV1, 'idempotency-key': 'B' }, body: validBody }), r2);
+  await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'B' }, body: validBody }), r2);
   assert.deepEqual(JSON.parse(r1.body), { accepted: 1 });
   assert.deepEqual(JSON.parse(r2.body), { accepted: 1 }, 'a distinct key is a distinct batch — never deduped');
 });
