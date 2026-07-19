@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createDedupTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createDedupTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, DEFAULT_DEDUP_MAX_KEYS, DEFAULT_DEDUP_TTL_MS, readBody } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 import { EVENTS_LIMIT_DEFAULT, EVENTS_LIMIT_MAX } from '../events.mjs';
@@ -2554,6 +2554,15 @@ async function summaryDeduped(handler) {
   return JSON.parse(res.body).deduped;
 }
 
+// Drive GET /summary on the handler and return just the `seenKeys` capacity
+// aggregate (WARDEN-790 — the dedup-set fill level, complement to `deduped`).
+async function summarySeenKeys(handler) {
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200, 'summary read must succeed to inspect the set');
+  return JSON.parse(res.body).seenKeys;
+}
+
 test('deduped tally: a fresh tally snapshots to the zeroed shape (parity with a healthy receiver)', () => {
   const tally = createDedupTally({ now: () => 0 });
   assert.deepEqual(tally.snapshot(), {
@@ -2769,6 +2778,91 @@ test('a handler with NO seenKeys dep does NOT dedup, so deduped stays at zero (b
 
   const ded = await summaryDeduped(handler);
   assert.deepEqual(ded, { total: 0, lastSeen: null }, 'no seenKeys → no dedup → tally stays zeroed');
+});
+
+// ── SEEN-KEYS CAPACITY surfaced in GET /summary (WARDEN-790) ──────────────────
+// The capacity-health complement to the `deduped` tally above: `deduped` reports the
+// dedup HIT COUNT, `seenKeys` reports the live FILL LEVEL of the in-memory set that
+// backs the dedup decision (sourced from the existing seenKeys.snapshot()). Driven
+// through the same wiringWithDedup harness (which wires seenKeys + deduped together,
+// mirroring createReceiver) so the field reflects the SAME set ingest() consults.
+
+test('seenKeys.size increments on /summary after a successful persist (the set that backs dedup is legible)', async () => {
+  // A fresh accept RECORDS its key into the set; /summary.seenKeys.size must reflect
+  // that one live key. This is the core capacity signal — a maintainer sees the set
+  // filling as traffic flows, against the configured cap.
+  const { handler } = wiringWithDedup({ now: () => 0 });
+  let sk = await summarySeenKeys(handler);
+  assert.equal(sk.size, 0, 'an idle receiver shows an empty set');
+
+  await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'A' }, body: validBody }), fakeRes());
+  sk = await summarySeenKeys(handler);
+  assert.equal(sk.size, 1, 'one accepted batch → one live key in the set');
+});
+
+test('seenKeys carries its configured bounds (maxKeys + ttlMs) so size is read against the cap', async () => {
+  // The default-constructed set (mirrors createReceiver's createSeenKeys() call with no
+  // overrides) carries DEFAULT_DEDUP_MAX_KEYS + DEFAULT_DEDUP_TTL_MS — the cap + TTL a
+  // maintainer needs to interpret `size`. Mirrors how retention.snapshots carries
+  // {maxEvents, maxAgeMs} beside retainedCount.
+  const { handler } = wiringWithDedup({ now: () => 0 });
+  const sk = await summarySeenKeys(handler);
+  assert.deepEqual(sk.configured, {
+    maxKeys: DEFAULT_DEDUP_MAX_KEYS,
+    ttlMs: DEFAULT_DEDUP_TTL_MS,
+  }, 'the field surfaces the FIFO cap + per-key TTL the set was built with');
+  // and the full shape is exactly { configured, size } — nothing else leaks
+  assert.deepEqual(Object.keys(sk).sort(), ['configured', 'size'], 'shape is { configured, size } only');
+});
+
+test('seenKeys.size grows with DISTINCT accepted keys (a near-unique-key flood is legible at the read surface)', async () => {
+  // The signal-loss scenario the field exists to surface: a fleet / a client-side
+  // idempotency-key bug emitting distinct keys per batch fills the set toward the cap.
+  // Three distinct-key batches all accept normally (none dedup) → the set holds three
+  // live keys. A maintainer reading size=3 against maxKeys can tell the set is filling
+  // even though deduped.total is still 0 (no retries happened).
+  const { handler } = wiringWithDedup({ now: () => 0 });
+  await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'A' }, body: validBody }), fakeRes());
+  await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'B' }, body: validBody }), fakeRes());
+  await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'C' }, body: validBody }), fakeRes());
+
+  const sk = await summarySeenKeys(handler);
+  assert.equal(sk.size, 3, 'three distinct accepted keys → three live keys in the set');
+});
+
+test('a retried batch (same idempotency-key) does NOT grow seenKeys.size — the key is already present (dedup is visible by NOT growing)', async () => {
+  // The complement to the deduped-increments test: the SAME key retried is a HIT, so the
+  // set records it ONCE (record() refreshes expiry on an existing key) and size stays at
+  // 1 — while deduped.total climbs to 1. The two fields together read "1 retry absorbed
+  // against a set of size 1" — exactly the hit-count + capacity pairing.
+  const { handler } = wiringWithDedup({ now: () => 0 });
+  const headers = { ...schemaHeaders, 'idempotency-key': 'solo' };
+  await handler(fakeReq({ headers, body: validBody }), fakeRes()); // accept → records 'solo'
+  await handler(fakeReq({ headers, body: validBody }), fakeRes()); // retry → dedup, does NOT add a new key
+
+  const sk = await summarySeenKeys(handler);
+  const ded = await summaryDeduped(handler);
+  assert.equal(sk.size, 1, 'a retry of an already-seen key does not grow the set');
+  assert.equal(ded.total, 1, 'the same retry WAS counted as a dedup hit');
+});
+
+test('GET /summary WITHOUT a wired seenKeys dep still returns a zeroed seenKeys field (backward-compatible additive shape)', async () => {
+  // Parity with the deduped-absent test above: a caller that does not pass a seenKeys
+  // set still gets the field, zeroed to the EMPTY_SEEN_KEYS shape — exactly like an
+  // absent deduped/persistErrors/rejections dep. The {maxKeys:0, ttlMs:0} "unset"
+  // configured shape mirrors EMPTY_RETENTION's {maxEvents:0, maxAgeMs:0} convention.
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  // no seenKeys wired
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const sk = await summarySeenKeys(handler);
+  assert.deepEqual(sk, {
+    configured: { maxKeys: 0, ttlMs: 0 },
+    size: 0,
+  }, 'an absent seenKeys dep yields the zeroed EMPTY_SEEN_KEYS shape');
 });
 
 // ── INGEST BODY CAP (WARDEN-627) ─────────────────────────────────────────────
@@ -3110,6 +3204,21 @@ test('createSeenKeys: has() is false before record and true after', () => {
   assert.equal(keys.snapshot().size, 1);
 });
 
+test('createSeenKeys: snapshot() carries the configured maxKeys + ttlMs bounds beside size (WARDEN-790)', () => {
+  // The snapshot the /summary capacity-health field is sourced from. It must carry the
+  // FIFO cap + per-key TTL the set was built with so `size` is interpretable against
+  // the bound — mirroring how createRetentionTally().snapshot() carries {maxEvents,
+  // maxAgeMs} beside retainedCount. Defaults reflect DEFAULT_DEDUP_MAX_KEYS / _TTL_MS;
+  // overrides flow through verbatim.
+  const defaults = createSeenKeys({ now: () => 0 }).snapshot();
+  assert.deepEqual(defaults.configured, { maxKeys: DEFAULT_DEDUP_MAX_KEYS, ttlMs: DEFAULT_DEDUP_TTL_MS });
+  assert.deepEqual(Object.keys(defaults).sort(), ['configured', 'size'], 'shape is { configured, size } only');
+
+  const custom = createSeenKeys({ ttlMs: 5000, maxKeys: 100, now: () => 0 });
+  custom.record('k');
+  assert.deepEqual(custom.snapshot(), { configured: { maxKeys: 100, ttlMs: 5000 }, size: 1 }, 'overrides flow through beside size');
+});
+
 test('createSeenKeys: a key expires after ttlMs (fake clock) and can be re-recorded fresh', () => {
   // The injected `now` makes the TTL unit-testable with no real timer (mirrors the
   // tally factories' fake-clock discipline).
@@ -3135,6 +3244,26 @@ test('createSeenKeys: a FIFO cap evicts the oldest distinct key (bounded — a f
   assert.equal(keys.has('a'), false, 'the oldest key was evicted');
   assert.equal(keys.has('b'), true);
   assert.equal(keys.has('c'), true);
+});
+
+test('createSeenKeys: driving past maxKeys evicts and snapshot.size stays pinned at the cap (capacity pressure is legible — WARDEN-790)', () => {
+  // The signal-loss scenario the capacity field exists to surface: a sustained flood of
+  // distinct keys (a fleet, or a client-side idempotency-key bug) PINS the set at the
+  // cap. snapshot.size reflects exactly maxKeys (never above), so a maintainer reading
+  // size === maxKeys on /summary sees the set is FULL — and knows a retried batch whose
+  // key was evicted before its retry arrives would now be treated as fresh. This is the
+  // capacity-health complement to the deduped hit count: it tells you the set that backs
+  // dedup is LOSING keys, not just that dedup fired.
+  const keys = createSeenKeys({ ttlMs: 1e9, maxKeys: 3, now: () => 0 });
+  for (const k of ['a', 'b', 'c', 'd', 'e', 'f', 'g']) keys.record(k); // 7 distinct, cap 3
+  const snap = keys.snapshot();
+  assert.equal(snap.size, 3, 'size stays pinned at the cap regardless of how many distinct keys flowed through');
+  assert.equal(snap.configured.maxKeys, 3, 'the configured cap is surfaced beside the pinned size');
+  // only the NEWEST 3 survive (FIFO evicted a–d)
+  assert.equal(keys.has('e'), true);
+  assert.equal(keys.has('f'), true);
+  assert.equal(keys.has('g'), true);
+  assert.equal(keys.has('a'), false, 'the oldest keys were evicted under the cap');
 });
 
 test('createSeenKeys: a non-string/empty key is a no-op (an absent header never dedups)', () => {
