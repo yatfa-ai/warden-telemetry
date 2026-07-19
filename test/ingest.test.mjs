@@ -276,10 +276,10 @@ test('EVERY rejection is a non-retryable 4xx — the client drops, never retries
 test('with seenKeys: the SAME idempotency-key posted twice persists ONE copy; the second is a dedup 202 that never reaches the store', async () => {
   const store = memoryStore();
   const keys = seenKeysSet();
-  const headers = { ...headersV1, 'idempotency-key': 'dup-key-1' };
+  const headers = { ...schemaHeaders, 'idempotency-key': 'dup-key-1' };
 
-  const first = await ingest({ headers, body: bodyOf([validError, validCrash]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
-  const second = await ingest({ headers, body: bodyOf([validError, validCrash]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
+  const first = await ingest({ headers, body: bodyOf([validError, validCrash]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys, now: fakeNow });
+  const second = await ingest({ headers, body: bodyOf([validError, validCrash]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys, now: fakeNow });
 
   // First: accepted + persisted normally.
   assert.equal(first.ok, true);
@@ -292,8 +292,8 @@ test('with seenKeys: the SAME idempotency-key posted twice persists ONE copy; th
   assert.equal(second.body.deduped, true, 'the retry is marked deduped');
   // The store holds ONE copy — exactly the events of the first (accepted) batch.
   assert.equal(store.appended.length, 2, 'appendEvents ran once — the retry did not double-count');
-  assert.deepEqual(store.appended[0], validError);
-  assert.deepEqual(store.appended[1], validCrash);
+  assert.deepEqual(store.appended[0], { ...validError, receivedAt: RECEIVED_AT });
+  assert.deepEqual(store.appended[1], { ...validCrash, receivedAt: RECEIVED_AT });
   // The key was recorded exactly once (on the first accept), proving the retry did
   // not re-record (which would be harmless but confirms the HIT path skips record).
   assert.deepEqual(keys.recorded, ['dup-key-1']);
@@ -303,8 +303,8 @@ test('with seenKeys: DIFFERENT idempotency-keys both persist (two distinct batch
   const store = memoryStore();
   const keys = seenKeysSet();
 
-  const a = await ingest({ headers: { ...headersV1, 'idempotency-key': 'key-A' }, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
-  const b = await ingest({ headers: { ...headersV1, 'idempotency-key': 'key-B' }, body: bodyOf([validCrash]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
+  const a = await ingest({ headers: { ...schemaHeaders, 'idempotency-key': 'key-A' }, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
+  const b = await ingest({ headers: { ...schemaHeaders, 'idempotency-key': 'key-B' }, body: bodyOf([validCrash]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
 
   assert.equal(a.body.accepted, 1);
   assert.equal(b.body.accepted, 1);
@@ -317,8 +317,8 @@ test('a missing idempotency-key header is NEVER deduped (old client — unchange
   const store = memoryStore();
   const keys = seenKeysSet();
   // Two posts with NO idempotency-key header: both persist, neither deduped.
-  const first = await ingest({ headers: headersV1, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
-  const second = await ingest({ headers: headersV1, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
+  const first = await ingest({ headers: schemaHeaders, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
+  const second = await ingest({ headers: schemaHeaders, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
   assert.equal(first.body.accepted, 1);
   assert.equal(second.body.accepted, 1);
   assert.equal(second.body.deduped, undefined);
@@ -328,7 +328,7 @@ test('a missing idempotency-key header is NEVER deduped (old client — unchange
 
 test('seenKeys omitted entirely → repeated key is NOT deduped (backward-compatible with an unwired receiver)', async () => {
   const store = memoryStore();
-  const headers = { ...headersV1, 'idempotency-key': 'dup-key-2' };
+  const headers = { ...schemaHeaders, 'idempotency-key': 'dup-key-2' };
   // No seenKeys in deps at all — exactly today's behavior: the key header is ignored.
   const first = await ingest({ headers, body: bodyOf([validError]) }, deps(store));
   const second = await ingest({ headers, body: bodyOf([validError]) }, deps(store));
@@ -341,7 +341,7 @@ test('seenKeys omitted entirely → repeated key is NOT deduped (backward-compat
 test('a REJECTED batch does not record its key — only an accepted batch is cached (record-on-success)', async () => {
   const store = memoryStore();
   const keys = seenKeysSet();
-  const headers = { ...headersV1, 'idempotency-key': 'rejected-key' };
+  const headers = { ...schemaHeaders, 'idempotency-key': 'rejected-key' };
   // An out-of-schema event → 422. The key must NOT be recorded (the batch was not
   // accepted), so a second post with the same key is RE-PROCESSED (re-rejected),
   // never silently deduped. This proves dedup only ever short-circuits batches the
@@ -358,12 +358,12 @@ test('dedup never relaxes validation: an out-of-schema event with an already-see
   const store = memoryStore();
   const keys = seenKeysSet();
   // Prime the set with a key via a VALID batch (so the key is "seen")...
-  await ingest({ headers: { ...headersV1, 'idempotency-key': 'prime' }, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
+  await ingest({ headers: { ...schemaHeaders, 'idempotency-key': 'prime' }, body: bodyOf([validError]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
   assert.equal(keys.has('prime'), true);
   // ...then POST a body that is INVALID under the SAME key. Validation must run and
   // 422 it — the dedup HIT (which would skip persist) sits AFTER validate, so a bad
   // body is never accepted just because its key was seen.
-  const res = await ingest({ headers: { ...headersV1, 'idempotency-key': 'prime' }, body: bodyOf([{ ...validError, runtime: 'worker' }]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
+  const res = await ingest({ headers: { ...schemaHeaders, 'idempotency-key': 'prime' }, body: bodyOf([{ ...validError, runtime: 'worker' }]) }, { SCHEMA_VERSION, validateEvent, store, seenKeys: keys });
   assert.equal(res.status, 422, 'validate runs before dedup — an invalid body is rejected regardless of the key');
   assert.equal(store.appended.length, 1, 'only the valid prime batch is stored');
 });
@@ -375,10 +375,6 @@ test('dedup never relaxes validation: an out-of-schema event with an already-see
 // client's (robust to skewed client clocks). The stamp is receiver-owned metadata
 // added after the client's redacted payload lands — it changes nothing about what
 // the client sends or what consent covers.
-//
-// NOTE: these use `schemaHeaders` (not `headersV1`) so they RUN — the WARDEN-666
-// dedup block above references an undefined `headersV1` (a pre-existing main bug,
-// flagged separately, deliberately left unfixed per project norm).
 
 test('stamps every accepted event with a finite receivedAt epoch-ms (one `now()` read shared across the batch)', async () => {
   const store = memoryStore();
