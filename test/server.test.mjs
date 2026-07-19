@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 
@@ -864,7 +864,14 @@ function storeWithRetentionSpy({ pruneImpl } = {}) {
     calls,
     prune: async (opts) => {
       calls.push(opts);
-      if (pruneImpl) await pruneImpl(opts);
+      // Honor a supplied pruneImpl's RETURN so a test can simulate a prune that
+      // DROPPED events (e.g. {before:5, after:3, pruned:2, rewrote:true}) for the
+      // retention-health tally assertions (WARDEN-743). Defaults to the no-op
+      // shape used by the arming/debounce suite.
+      if (pruneImpl) {
+        const result = await pruneImpl(opts);
+        return result ?? { before: 0, after: 0, pruned: 0, rewrote: false };
+      }
       return { before: 0, after: 0, pruned: 0, rewrote: false };
     },
   };
@@ -1582,6 +1589,334 @@ test('GET /summary WITHOUT a wired persistErrors tally still returns a zeroed pe
     lastReason: null,
     lastSeen: null,
   });
+});
+
+// ── RETENTION-HEALTH TALLY (WARDEN-743) ──────────────────────────────────────
+// The third "silent signal-loss" path on the receiver, made legible: an event
+// ingested + persisted can still leave the pipeline by being PRUNED (count cap /
+// age window), and before WARDEN-743 that eviction was invisible on GET /summary.
+// `store.prune()` already returned {before, after, pruned, rewrote} but
+// createRetentionTrigger DISCARDED it; now a SUCCESSFUL prune records into the
+// retention-health tally and /summary surfaces it. Below: the tally is driven
+// directly (record/snapshot), then through the trigger's .then (the discipline
+// that a FAILED prune records nothing), then end-to-end through /summary. Still
+// ZERO real fs, ZERO real network — the in-memory file mirror + fake clock drive it.
+
+// Drive GET /summary on the handler and return just the `retention` aggregate.
+async function summaryRetention(handler) {
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200, 'summary read must succeed to inspect the tally');
+  return JSON.parse(res.body).retention;
+}
+
+test('retention tally: a fresh tally snapshots to the zeroed shape, carrying the configured bounds (parity with an idle receiver)', () => {
+  const tally = createRetentionTally({ now: () => 0, maxEvents: 7, maxAgeMs: 3600_000 });
+  assert.deepEqual(tally.snapshot(), {
+    configured: { maxEvents: 7, maxAgeMs: 3600_000 },
+    retainedCount: 0,
+    totalPruned: 0,
+    last: null,
+  });
+});
+
+test('retention tally: record() on a prune that DROPPED events accumulates totalPruned + tracks the most-recent sample', () => {
+  let clock = 1000;
+  const tally = createRetentionTally({ now: () => clock, maxEvents: 3 });
+  tally.record({ before: 5, after: 3, pruned: 2, rewrote: true, retainedCount: 3 });
+  clock = 2000;
+  tally.record({ before: 4, after: 3, pruned: 1, rewrote: true, retainedCount: 3 });
+
+  const snap = tally.snapshot();
+  assert.equal(snap.totalPruned, 3, 'running total accumulates across prunes (2 + 1)');
+  assert.equal(snap.retainedCount, 3, 'retainedCount is the post-prune store size');
+  assert.deepEqual(snap.last, {
+    before: 4,
+    after: 3,
+    pruned: 1,
+    rewrote: true,
+    ts: 2000,
+  }, 'last is the single most-recent prune sample stamped with the injected now()');
+});
+
+test('retention tally: a no-op prune (pruned:0) does NOT inflate totalPruned but DOES refresh last (so a maintainer sees when retention last ran)', () => {
+  // Chosen semantics: totalPruned counts only what was actually DROPPED; `last`
+  // is the most-recent prune SAMPLE regardless of whether it dropped anything, so
+  // an idle-but-healthy retention (a no-op sweep on a quiet store) is still
+  // observable as "retention ran, dropped nothing" rather than reading as never-run.
+  let clock = 5000;
+  const tally = createRetentionTally({ now: () => clock, maxEvents: 3 });
+  tally.record({ before: 5, after: 3, pruned: 2, rewrote: true, retainedCount: 3 });
+  clock = 6000;
+  tally.record({ before: 3, after: 3, pruned: 0, rewrote: false, retainedCount: 3 });
+
+  const snap = tally.snapshot();
+  assert.equal(snap.totalPruned, 2, 'the no-op prune added 0 — totalPruned is unchanged');
+  assert.equal(snap.retainedCount, 3);
+  assert.deepEqual(snap.last, {
+    before: 3,
+    after: 3,
+    pruned: 0,
+    rewrote: false,
+    ts: 6000,
+  }, 'last refreshed to the no-op sample (retention ran, dropped nothing)');
+});
+
+test('retention tally: snapshot() is a stable point-in-time copy — a later record does not mutate it', () => {
+  let clock = 7000;
+  const tally = createRetentionTally({ now: () => clock, maxEvents: 2 });
+  tally.record({ before: 4, after: 2, pruned: 2, rewrote: true, retainedCount: 2 });
+  const snap = tally.snapshot();
+  clock = 8000;
+  tally.record({ before: 3, after: 2, pruned: 1, rewrote: true, retainedCount: 2 });
+  // the earlier snapshot is unchanged by the later record
+  assert.deepEqual(snap, {
+    configured: { maxEvents: 2, maxAgeMs: 0 },
+    retainedCount: 2,
+    totalPruned: 2,
+    last: { before: 4, after: 2, pruned: 2, rewrote: true, ts: 7000 },
+  });
+  // a fresh snapshot reflects the new state
+  assert.equal(tally.snapshot().totalPruned, 3);
+  assert.equal(tally.snapshot().last.ts, 8000);
+});
+
+test('retention tally: BOUNDED — many records never grow unbounded (one most-recent sample + a running total, not one entry per prune)', () => {
+  const tally = createRetentionTally({ now: () => 0, maxEvents: 10 });
+  for (let i = 0; i < 1000; i++) {
+    tally.record({ before: 11, after: 10, pruned: 1, rewrote: true, retainedCount: 10 });
+  }
+  const snap = tally.snapshot();
+  assert.equal(snap.totalPruned, 1000, 'running total accumulates');
+  assert.equal(snap.retainedCount, 10);
+  assert.deepEqual(snap.last, {
+    before: 11,
+    after: 10,
+    pruned: 1,
+    rewrote: true,
+    ts: 0,
+  }, 'only the single most-recent sample is retained — not 1000 entries');
+});
+
+test('retention tally: record() on a bare/empty call is a defensive no-op that does not throw or record a spurious sample', () => {
+  const tally = createRetentionTally({ now: () => 0, maxEvents: 3 });
+  assert.doesNotThrow(() => tally.record());
+  assert.doesNotThrow(() => tally.record({}));
+  const snap = tally.snapshot();
+  assert.equal(snap.totalPruned, 0, 'a bare record added nothing');
+  assert.equal(snap.retainedCount, 0);
+  assert.equal(snap.last, null, 'no prune was recorded');
+});
+
+// ── RETENTION TALLY wired through createRetentionTrigger (.then discipline) ───
+// The trigger records prune()'s already-computed result ONLY on success. A FAILED
+// prune removed nothing and must not record a spurious sample — the .then vs
+// .catch/.finally distinction. Driven with the fake clock + the spy store.
+
+test('retention tally: createRetentionTrigger records a SUCCESSFUL prune into the tally (.then discipline)', async () => {
+  const store = storeWithRetentionSpy({
+    pruneImpl: async () => ({ before: 5, after: 3, pruned: 2, rewrote: true }),
+  });
+  const clock = fakeClock();
+  clock.setNow(42_000);
+  const retention = createRetentionTally({ now: clock.now, maxEvents: 3, maxAgeMs: 1000 });
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 3,
+    maxAgeMs: 1000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    retention,
+  });
+  trigger.afterAppend(3); // cross the count bound → arm
+  clock.flushAll(); // fire the debounced prune
+  await new Promise((r) => setTimeout(r, 0)); // let the .then settle
+
+  const snap = retention.snapshot();
+  assert.equal(store.calls.length, 1, 'the prune ran once');
+  assert.equal(snap.totalPruned, 2, 'the dropped count was recorded');
+  assert.equal(snap.retainedCount, 3, 'retainedCount is the post-prune store size (after)');
+  assert.deepEqual(snap.last, {
+    before: 5,
+    after: 3,
+    pruned: 2,
+    rewrote: true,
+    ts: 42_000,
+  }, 'last carries the prune sample stamped with the injected now()');
+});
+
+test('retention tally: createRetentionTrigger records NOTHING on a FAILED prune (a failed prune removed nothing)', async () => {
+  const store = { prune: async () => { throw new Error('disk full'); } };
+  const clock = fakeClock();
+  const retention = createRetentionTally({ now: clock.now, maxEvents: 1 });
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 1,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    retention,
+  });
+  trigger.afterAppend(1); // arm
+  assert.doesNotThrow(() => clock.flushAll(), 'flushing a failed prune must not throw');
+  await new Promise((r) => setTimeout(r, 0)); // let the rejected prune's .catch settle
+
+  // The .then discipline: a rejected prune skips .then, so NOTHING is recorded —
+  // the tally stays zeroed (no spurious "dropped 0" sample, no totalPruned bump).
+  const snap = retention.snapshot();
+  assert.equal(snap.totalPruned, 0);
+  assert.equal(snap.retainedCount, 0);
+  assert.equal(snap.last, null, 'a failed prune recorded no sample');
+});
+
+test('retention tally: createRetentionTrigger with NO retention tally wired is today’s behavior (optional dep — nothing throws)', async () => {
+  // Omitting `retention` from the trigger opts must not change the trigger's
+  // behavior: a prune still runs, the (absent) tally is never consulted, and
+  // nothing throws — the optional-dep parity shared with the sibling tallies.
+  const store = storeWithRetentionSpy({
+    pruneImpl: async () => ({ before: 4, after: 2, pruned: 2, rewrote: true }),
+  });
+  const clock = fakeClock();
+  const trigger = createRetentionTrigger(store, {
+    maxEvents: 1,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    // no `retention` tally wired
+  });
+  trigger.afterAppend(1);
+  assert.doesNotThrow(() => clock.flushAll());
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(store.calls.length, 1, 'the prune still ran with no tally wired');
+});
+
+// ── RETENTION AGGREGATE surfaced in GET /summary (WARDEN-743) ─────────────────
+// A wired tally is read by GET /summary; an absent tally yields the zeroed
+// EMPTY_RETENTION shape (backward-compatible additive field). The tally is
+// UNSCOPED by the /summary event filters (receiver operational health, like
+// rejections / persistErrors).
+
+test('GET /summary carries a `retention` field; a wired-but-idle tally reads zeroed EXCEPT configured carries the active bounds', async () => {
+  const store = readableStore([errorEvent]);
+  const retentionHealth = createRetentionTally({ maxEvents: 9, maxAgeMs: 7200_000 });
+  const handler = createRequestHandler({ store, retentionHealth });
+  const ret = await summaryRetention(handler);
+  assert.deepEqual(ret, {
+    configured: { maxEvents: 9, maxAgeMs: 7200_000 },
+    retainedCount: 0,
+    totalPruned: 0,
+    last: null,
+  }, 'no prune ran → zeroed sample, but the configured bounds are still visible');
+});
+
+test('GET /summary WITHOUT a wired retentionHealth tally returns the zeroed EMPTY_RETENTION shape (backward-compatible additive field)', async () => {
+  // A caller that does not pass a retentionHealth tally still gets the field,
+  // zeroed — the handler is unchanged for callers that don't wire the tally,
+  // exactly like an absent persistErrors dep. configured is the unset shape.
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store }); // no retentionHealth
+  const ret = await summaryRetention(handler);
+  assert.deepEqual(ret, {
+    configured: { maxEvents: 0, maxAgeMs: 0 },
+    retainedCount: 0,
+    totalPruned: 0,
+    last: null,
+  });
+});
+
+test('GET /summary retention reflects a real end-to-end prune (ingest past the cap → debounced prune → totalPruned + last sample)', async () => {
+  // The full slice: a handler + trigger + tally wired to a live in-memory store.
+  // Ingesting past maxEvents arms a debounced prune; flushing it compacts the
+  // store AND records into the tally, which the next GET /summary surfaces.
+  const f = inMemoryFile();
+  const store = createNdjsonStore(f);
+  const clock = fakeClock();
+  clock.setNow(123_000);
+  const retentionHealth = createRetentionTally({ now: clock.now, maxEvents: 3 });
+  const retention = createRetentionTrigger(store, {
+    maxEvents: 3,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    retention: retentionHealth,
+  });
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    retention,
+    retentionHealth,
+  });
+
+  // Ingest 4 one-event batches; maxEvents=3 → a debounced prune is armed once the
+  // bound is crossed, but it has NOT fired yet (the response path does not flush).
+  for (let i = 0; i < 4; i++) {
+    const res = fakeRes();
+    await handler(fakeReq({ headers: schemaHeaders, body: validBody }), res);
+    assert.equal(res.statusCode, 202);
+  }
+  assert.equal(clock.pending(), 1, 'a debounced prune is armed once the bound is crossed');
+  assert.equal(f.read().length, 4, 'pre-prune: all 4 events still persisted');
+
+  clock.flushAll(); // fire the off-path, debounced prune
+  await new Promise((r) => setTimeout(r, 0)); // let the async compaction + .then settle
+
+  assert.equal(f.read().length, 3, 'post-prune: store bounded to the count cap');
+
+  // The maintainer's view: retention pruned 1, left 3, and the overview now
+  // spans only the retained window — a previously-silent eviction, surfaced.
+  const ret = await summaryRetention(handler);
+  assert.equal(ret.configured.maxEvents, 3, 'the configured cap is visible');
+  assert.equal(ret.configured.maxAgeMs, 0);
+  assert.equal(ret.totalPruned, 1, 'the one pruned event is counted');
+  assert.equal(ret.retainedCount, 3, 'retainedCount is the post-prune store size');
+  assert.deepEqual(ret.last, {
+    before: 4,
+    after: 3,
+    pruned: 1,
+    rewrote: true,
+    ts: 123_000,
+  }, 'last is the most-recent prune sample stamped with the injected now()');
+});
+
+test('GET /summary?platform=win32 leaves retention UNSCOPED (receiver operational health survives the event filter)', async () => {
+  // retention tallies receiver OPERATIONAL health (what retention pruned) — a
+  // platform filter scopes the EVENTS, not the retention tally, exactly like
+  // rejections / persistErrors. Drive a real prune by ingesting past the cap,
+  // then scope /summary to a platform and assert the retention tally survives.
+  const f = inMemoryFile();
+  const store = createNdjsonStore(f);
+  const clock = fakeClock();
+  clock.setNow(999_000);
+  const retentionHealth = createRetentionTally({ now: clock.now, maxEvents: 2 });
+  const retention = createRetentionTrigger(store, {
+    maxEvents: 2,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    retention: retentionHealth,
+  });
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    retention,
+    retentionHealth,
+  });
+
+  // Ingest 3 one-event batches → crosses maxEvents:2 → arms a debounced prune.
+  for (let i = 0; i < 3; i++) {
+    await handler(fakeReq({ headers: schemaHeaders, body: validBody }), fakeRes());
+  }
+  clock.flushAll();
+  await new Promise((r) => setTimeout(r, 0));
+
+  // Scope to win32 — the retention tally must read through the event filter.
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.ok(body.matched <= body.total, 'the platform filter scoped the events');
+  assert.equal(body.retention.totalPruned, 1, 'retention survives the platform filter (unscoped)');
+  assert.equal(body.retention.retainedCount, 2);
+  assert.equal(body.retention.last.pruned, 1);
 });
 
 // ── INGEST BODY CAP (WARDEN-627) ─────────────────────────────────────────────
