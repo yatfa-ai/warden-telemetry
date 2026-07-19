@@ -1426,6 +1426,7 @@ test('rejections tally: a fresh tally snapshots to the zeroed shape (parity with
   assert.deepEqual(tally.snapshot(), {
     total: 0,
     byStatus: {},
+    byDeclaredVersion: {},
     lastStatus: null,
     lastReason: null,
     lastSeen: null,
@@ -1464,6 +1465,7 @@ test('rejections tally: snapshot() is a stable point-in-time copy — a later re
   assert.deepEqual(snap, {
     total: 1,
     byStatus: { '401': 1 },
+    byDeclaredVersion: {},
     lastStatus: 401,
     lastReason: 'unauthorized',
     lastSeen: 5000,
@@ -1491,6 +1493,7 @@ test('rejections tally: record() with no status is a defensive no-op (never thro
   assert.deepEqual(tally.snapshot(), {
     total: 0,
     byStatus: {},
+    byDeclaredVersion: {},
     lastStatus: null,
     lastReason: null,
     lastSeen: null,
@@ -1505,6 +1508,71 @@ test('rejections tally: record() with a non-string reason stores null (no unboun
   assert.equal(snap.lastStatus, 400);
   assert.equal(snap.lastReason, null, 'a non-string reason is not retained');
 });
+
+// ── byDeclaredVersion: the 415 drift breakdown (WARDEN-761) ───────────────────
+// A bounded histogram of the DECLARED schema version on 415-rejected batches —
+// the drift population (which client versions are still sending during a bump).
+// Enum-bounded like `byStatus`, populated ONLY by 415s (only they pass a
+// declaredVersion), mirroring summary.mjs's `schemaVersions` presence rule.
+
+test('byDeclaredVersion: 415s with DIFFERENT declared versions bucket distinctly (one drifting client vs many)', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  tally.record({ status: 415, reason: '...got "3"', declaredVersion: '3' });
+  tally.record({ status: 415, reason: '...got "3"', declaredVersion: '3' });
+  tally.record({ status: 415, reason: '...got "5"', declaredVersion: '5' });
+  const snap = tally.snapshot();
+  assert.deepEqual(snap.byDeclaredVersion, { '3': 2, '5': 1 }, 'each declared version buckets distinctly');
+  assert.equal(snap.byStatus['415'], 3, 'byStatus still accumulates in parallel');
+});
+
+test('byDeclaredVersion: NON-415 rejections do NOT populate it (401/404/400/422 pass no declaredVersion)', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  tally.record({ status: 401, reason: 'unauthorized' });
+  tally.record({ status: 404, reason: 'not found' });
+  tally.record({ status: 400, reason: 'malformed body' });
+  tally.record({ status: 422, reason: 'out-of-schema event' });
+  const snap = tally.snapshot();
+  assert.deepEqual(snap.byDeclaredVersion, {}, 'no declared version is bucketed for non-415 rejections');
+  assert.equal(snap.total, 4);
+});
+
+test('byDeclaredVersion: a missing-header 415 (declaredVersion absent) records the 415 but no bucket', () => {
+  // A missing x-telemetry-schema header still 415's (declared !== SCHEMA_VERSION),
+  // but declaredVersion is undefined → no bucket (mirror summary.mjs: absent → skip).
+  const tally = createRejectionTally({ now: () => 0 });
+  tally.record({ status: 415, reason: '...got null', declaredVersion: undefined });
+  const snap = tally.snapshot();
+  assert.equal(snap.byStatus['415'], 1, 'the 415 is still counted in byStatus');
+  assert.deepEqual(snap.byDeclaredVersion, {}, 'an absent declared version yields no bucket');
+});
+
+test('byDeclaredVersion: a non-numeric/scanner declaredVersion is bucketed verbatim (real signal never dropped)', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  tally.record({ status: 415, reason: '...got "abc"', declaredVersion: 'abc' });
+  tally.record({ status: 415, reason: '...got ""', declaredVersion: '' });
+  const snap = tally.snapshot();
+  assert.deepEqual(snap.byDeclaredVersion, { abc: 1, '': 1 }, 'scanner values bucket verbatim, not validated away');
+});
+
+test('byDeclaredVersion: BOUNDED — a sustained drift storm collapses to enum keys, never one entry per rejection', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  for (let i = 0; i < 1000; i++) {
+    // Only two declared versions in the wild — a thousand 415s collapse to two keys.
+    tally.record({ status: 415, reason: `drift #${i}`, declaredVersion: i % 2 === 0 ? '3' : '5' });
+  }
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 1000);
+  assert.deepEqual(snap.byDeclaredVersion, { '3': 500, '5': 500 }, 'two enum keys — not 1000 entries');
+});
+
+test('byDeclaredVersion: snapshot() copies the histogram — a later record does not mutate a prior snapshot', () => {
+  const tally = createRejectionTally({ now: () => 0 });
+  tally.record({ status: 415, reason: '...got "3"', declaredVersion: '3' });
+  const snap = tally.snapshot();
+  tally.record({ status: 415, reason: '...got "5"', declaredVersion: '5' });
+  assert.deepEqual(snap.byDeclaredVersion, { '3': 1 }, 'the earlier snapshot is unchanged by the later record');
+});
+
 
 // ── REJECTIONS AGGREGATE surfaced in GET /summary (WARDEN-591) ─────────────────
 // A tally wired into the handler records at EVERY rejection site; GET /summary
@@ -1549,6 +1617,41 @@ test('a 415 rejection (unknown schema) is surfaced in GET /summary — schema dr
   assert.equal(rej.lastStatus, 415);
   assert.notEqual(rej.lastSeen, null);
   assert.match(rej.lastReason, /unsupported telemetry schema version/, 'sample reason is the receiver diagnostic, not a payload');
+  assert.equal(rej.byDeclaredVersion[String(SCHEMA_VERSION + 1)], 1, 'the declared version buckets on the drift axis');
+});
+
+test('415s from MIXED declared versions surface a bounded byDeclaredVersion histogram (one drifting client vs many)', async () => {
+  // The flagship signal: during a coordinated bump, two client versions still
+  // drift. GET /summary must tell them apart so the maintainer knows whether the
+  // bump is safe to complete.
+  const { handler } = wiringWithTally();
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '3' }, body: 'x' }), fakeRes()); // 415, declares v3
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '3' }, body: 'x' }), fakeRes()); // 415, declares v3
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '5' }, body: 'x' }), fakeRes()); // 415, declares v5
+
+  const rej = await summaryRejections(handler);
+  assert.deepEqual(rej.byDeclaredVersion, { '3': 2, '5': 1 }, 'each declared version is bucketed distinctly');
+  assert.equal(rej.byStatus['415'], 3, 'the 415s are also counted in byStatus');
+});
+
+test('a 415 with a MISSING header surfaces byStatus but NOT byDeclaredVersion (absent → no bucket, end-to-end)', async () => {
+  const { handler } = wiringWithTally();
+  await handler(fakeReq({ headers: {}, body: 'x' }), fakeRes()); // no header → 415, declaredVersion undefined
+  const rej = await summaryRejections(handler);
+  assert.ok(rej.byStatus['415'] >= 1, 'the 415 is still recorded in byStatus');
+  assert.deepEqual(rej.byDeclaredVersion, {}, 'a missing header buckets no declared version');
+});
+
+test('a NON-415 rejection does NOT populate byDeclaredVersion on the handler path', async () => {
+  // A 422 passes the handshake (header matches) and fails event validation — it
+  // carries no declaredVersion, so byDeclaredVersion stays empty even though the
+  // 422 lands in byStatus.
+  const { handler } = wiringWithTally();
+  const badBody = JSON.stringify({ schemaVersion: SCHEMA_VERSION, events: [{ ...validError, runtime: 'worker' }] });
+  await handler(fakeReq({ headers: schemaHeaders, body: badBody }), fakeRes());
+  const rej = await summaryRejections(handler);
+  assert.ok(rej.byStatus['422'] >= 1);
+  assert.deepEqual(rej.byDeclaredVersion, {}, 'only 415s populate byDeclaredVersion');
 });
 
 test('a 422 rejection (out-of-schema event) is surfaced in GET /summary', async () => {
@@ -1608,13 +1711,13 @@ test('a successful ingest (202) does NOT increment rejections (accepted traffic 
   assert.equal(res.statusCode, 202);
 
   const rej = await summaryRejections(handler);
-  assert.deepEqual(rej, { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null });
+  assert.deepEqual(rej, { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null });
 });
 
 test('an idle receiver (no traffic) returns zeroed rejections in GET /summary (parity with today — no false alarm)', async () => {
   const { handler } = wiringWithTally();
   const rej = await summaryRejections(handler);
-  assert.deepEqual(rej, { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null });
+  assert.deepEqual(rej, { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null });
 });
 
 test('rejections accumulate across requests and stay bounded — mixed statuses surface a byStatus histogram', async () => {
@@ -1641,6 +1744,7 @@ test('GET /summary WITHOUT a wired tally still returns a zeroed rejections field
   assert.deepEqual(JSON.parse(res.body).rejections, {
     total: 0,
     byStatus: {},
+    byDeclaredVersion: {},
     lastStatus: null,
     lastReason: null,
     lastSeen: null,
@@ -1855,7 +1959,7 @@ test('a persist failure records into persistErrors, NOT into the rejections tall
   assert.equal(body.persistErrors.total, 1, 'the persist failure was recorded in its own tally');
   assert.deepEqual(
     body.rejections,
-    { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null },
+    { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null },
     'rejections untouched — a persist failure is not an HTTP rejection'
   );
 });
@@ -2426,7 +2530,7 @@ test('a dedup records into deduped, NOT into rejections or persistErrors (three 
   assert.equal(body.deduped.total, 1, 'the deduped retry was recorded in its own tally');
   assert.deepEqual(
     body.rejections,
-    { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null },
+    { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null },
     'rejections untouched — a dedup is not an HTTP rejection'
   );
   assert.deepEqual(

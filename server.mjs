@@ -419,8 +419,12 @@ export function createRetentionTrigger(
 // (a misconfiguration detector need not survive a restart).
 //
 // Bounded means: counts by status + a SINGLE most-recent sample (status/reason/
-// ts). It does NOT keep one record per rejection or an unbounded set of reason
-// strings, so a sustained drift storm can't grow it without limit.
+// ts), plus a `byDeclaredVersion` histogram of the DECLARED schema version on
+// 415-rejected batches (the drift population, WARDEN-761). It does NOT keep one
+// record per rejection or an unbounded set of reason strings, so a sustained
+// drift storm can't grow it without limit. `byDeclaredVersion` is enum-bounded
+// (schema versions are a small set like HTTP statuses in `byStatus`), NOT
+// free-text reason histogramming — the unbounded axis WARDEN-591 scoped out.
 
 // The zeroed shape returned when no tally is wired OR no rejection has been
 // recorded yet — identical to a fresh tally's snapshot(), so an idle receiver
@@ -429,6 +433,7 @@ export function createRetentionTrigger(
 const EMPTY_REJECTIONS = Object.freeze({
   total: 0,
   byStatus: {},
+  byDeclaredVersion: {}, // 415 drift axis (WARDEN-761) — enum-bounded, zeroed when idle
   lastStatus: null,
   lastReason: null,
   lastSeen: null,
@@ -442,25 +447,39 @@ const EMPTY_REJECTIONS = Object.freeze({
  *
  * @param {{ now?: () => number }} [opts]
  * @returns {{
- *   record(rec: { status: number, reason?: string }): void,
- *   snapshot(): { total: number, byStatus: Record<string, number>, lastStatus: number | null, lastReason: string | null, lastSeen: number | null }
+ *   record(rec: { status: number, reason?: string, declaredVersion?: string }): void,
+ *   snapshot(): { total: number, byStatus: Record<string, number>, byDeclaredVersion: Record<string, number>, lastStatus: number | null, lastReason: string | null, lastSeen: number | null }
  * }}
  */
 export function createRejectionTally({ now = Date.now } = {}) {
   let total = 0;
   const byStatus = {};
+  const byDeclaredVersion = {};
   let lastStatus = null;
   let lastReason = null;
   let lastSeen = null;
 
   return {
     /** Record one rejection. Bounded: accumulates a per-status COUNT and tracks
-     *  only the single most-recent {status, reason, ts} — never one entry per call. */
-    record({ status, reason } = {}) {
+     *  only the single most-recent {status, reason, ts} — never one entry per call.
+     *  When `declaredVersion` is present (only 415s carry one), buckets
+     *  `String(declaredVersion)` into `byDeclaredVersion` — the drift population. */
+    record({ status, reason, declaredVersion } = {}) {
       if (status == null) return;
       const key = String(status);
       total += 1;
       byStatus[key] = (byStatus[key] ?? 0) + 1;
+      // byDeclaredVersion (WARDEN-761): bucket the DECLARED schema version of a
+      // 415-rejected batch — the drift population (a wrong/old client version
+      // still sending during a coordinated bump). Enum-bounded like `byStatus`,
+      // NOT reason-string histogramming. Mirror summary.mjs's `schemaVersions`
+      // pattern: bucket any PRESENT value (incl. scanner non-numerics like "abc"
+      // / ""); absent/missing (undefined/null) → no bucket. Only the 415 seams
+      // pass a declaredVersion, so this naturally reflects drift alone.
+      if (declaredVersion !== undefined && declaredVersion !== null) {
+        const dvKey = String(declaredVersion);
+        byDeclaredVersion[dvKey] = (byDeclaredVersion[dvKey] ?? 0) + 1;
+      }
       lastStatus = status;
       lastReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
       lastSeen = now();
@@ -468,7 +487,7 @@ export function createRejectionTally({ now = Date.now } = {}) {
     /** A stable point-in-time copy of the aggregate (a later record does not mutate
      *  a previously-returned snapshot). */
     snapshot() {
-      return { total, byStatus: { ...byStatus }, lastStatus, lastReason, lastSeen };
+      return { total, byStatus: { ...byStatus }, byDeclaredVersion: { ...byDeclaredVersion }, lastStatus, lastReason, lastSeen };
     },
   };
 }
@@ -925,8 +944,10 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
   // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
   // behavior — no recording, exactly like an absent retention dep). Every rejection
   // site below reads `recordRejection(...)`; the tally dep is the single switch.
-  const recordRejection = (status, reason) => {
-    if (rejections) rejections.record({ status, reason });
+  // `declaredVersion` is passed ONLY at the 415 seams (the drift population,
+  // WARDEN-761); other statuses omit it and the tally buckets nothing.
+  const recordRejection = (status, reason, declaredVersion) => {
+    if (rejections) rejections.record({ status, reason, declaredVersion });
   };
   // Centralized persist-error recorder: a guarded no-op when no tally is wired
   // (today's behavior — no recording, exactly like an absent rejections dep). The
@@ -1197,7 +1218,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     const declaredSchema = readHeader(req.headers, 'x-telemetry-schema');
     if (declaredSchema !== String(schema.SCHEMA_VERSION)) {
       const reason = `unsupported telemetry schema version: expected "${schema.SCHEMA_VERSION}", got ${JSON.stringify(declaredSchema)}`;
-      recordRejection(415, reason);
+      recordRejection(415, reason, declaredSchema);
       return sendJson(res, 415, { error: reason });
     }
 
@@ -1289,9 +1310,14 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // own diagnostic string (e.g. "unsupported telemetry schema version..."), never
     // a raw client payload. Accepted traffic (result.ok) records nothing here. A
     // persist failure (caught above) records into the SEPARATE persistErrors tally,
-    // NOT here — a store throw never reaches this `!result.ok` branch.
+    // NOT here — a store throw never reaches this `!result.ok` branch. For a 415,
+    // the declared version is threaded from ingest's structured `body.declaredVersion`
+    // (WARDEN-761) so the drift population buckets by declared version here too —
+    // the contract path used by direct ingest callers + tests (the production 415
+    // is recorded earlier at the defense-in-depth pre-read; both record for
+    // consistency, and they are mutually exclusive — the pre-read returns first).
     if (!result.ok) {
-      recordRejection(result.status, result.body && result.body.error);
+      recordRejection(result.status, result.body && result.body.error, result.body && result.body.declaredVersion);
     }
 
     // RETENTION (WARDEN-579) — fire-and-forget: AFTER a successful persist, tell

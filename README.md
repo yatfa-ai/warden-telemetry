@@ -108,6 +108,7 @@ curl http://localhost:7421/summary
 #   "rejections": {
 #     "total": 13,                          # count of hard-rejected requests
 #     "byStatus": { "415": 11, "401": 2 },  # histogram keyed by HTTP status
+#     "byDeclaredVersion": { "3": 30, "5": 4 },  # 415 drift: declared schema version (enum-bounded, not free-text)
 #     "lastStatus": 415,
 #     "lastReason": "unsupported telemetry schema version...",  # receiver diagnostic, not a payload
 #     "lastSeen": 1720000099000
@@ -148,6 +149,18 @@ identical to the empty-store shape, so a quiet receiver never looks like a rejec
 the receiver's own short diagnostic string — never raw event payloads or extended-tier identifiers. The
 tally is receiver-local and **does not survive a restart** (a misconfiguration detector need not), and it is
 purely additive: it records rejections that already happen, relaxes no check, and routes nothing anywhere.
+
+`rejections.byDeclaredVersion` is the drift breakdown of those `415`s: a histogram of the DECLARED schema
+version (`x-telemetry-schema` header) on 415-rejected batches, e.g. `{ "3": 30, "5": 4 }`. During a
+coordinated schema bump — a change across both repos, when multiple client versions coexist sending to one
+receiver — it tells you **which declared versions are still drifting**, so you know when the bump is safe
+to complete (one stubborn client version vs many). It is **enum-bounded** (schema versions are a small set,
+like the HTTP statuses in `byStatus`), NOT free-text reason histogramming, so a sustained drift storm can't
+grow it without limit. Only `415`s carry a declared version — `401`/`404`/`400`/`413`/`422` populate no
+bucket — so the histogram reflects **only** the drift population. A missing header records nothing; a
+scanner's non-numeric value (`"abc"`, `""`) is bucketed verbatim (real signal is never silently dropped).
+The declared version is the single digit the client already sends in the header — non-identifying, same
+posture as `byStatus`.
 When `AUTH_TOKEN` is set, add the bearer header (e.g. `-H "Authorization: Bearer <token>"`) to this and
 every other request — see below.
 
