@@ -859,6 +859,21 @@ test('GET /summary?platform=win32 leaves rejections / persistErrors UNSCOPED (re
   // The 404 rejection survives the win32 filter (receiver health is unscoped).
   assert.ok(body.rejections.total >= 1, 'rejections survive the platform filter');
   assert.ok(body.rejections.byStatus['404'] >= 1, 'the 404 is still surfaced');
+  // The additive rejections.timeline (WARDEN-798) carries the SAME shape and
+  // granularity as persistErrors.timeline — byte-for-byte parity between the two
+  // tallies' temporal axes (both mirror the read-path timeline's window/bucketMs).
+  assert.ok(body.rejections.timeline, 'rejections.timeline present (additive — carried on every response)');
+  assert.deepEqual(
+    Object.keys(body.rejections.timeline).sort(),
+    ['bucketMs', 'buckets'],
+    'rejections.timeline shape: buckets + bucketMs only'
+  );
+  assert.equal(
+    body.rejections.timeline.bucketMs,
+    body.persistErrors.timeline.bucketMs,
+    'same granularity as persistErrors.timeline (both default to the read-path DEFAULT_TIMELINE_* constants)'
+  );
+  assert.ok(body.rejections.timeline.buckets.length >= 1, 'the 404 rejection fired a timeline bucket');
   // persistErrors is present with its stable shape (zeroed here — no persist failure).
   assert.equal(body.persistErrors.total, 0);
   assert.deepEqual(
@@ -1503,6 +1518,7 @@ test('rejections tally: a fresh tally snapshots to the zeroed shape (parity with
     lastStatus: null,
     lastReason: null,
     lastSeen: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
 });
 
@@ -1534,7 +1550,10 @@ test('rejections tally: snapshot() is a stable point-in-time copy — a later re
   const snap = tally.snapshot();
   clock = 6000;
   tally.record({ status: 404, reason: 'not found' });
-  // the earlier snapshot is unchanged by the later record
+  // the earlier snapshot is unchanged by the later record — its scalar aggregate
+  // AND its timeline are both frozen. (The one record at clock=5000 is the newest
+  // event in a 24h window ending at 5000, so it lands in the newest bucket, whose
+  // right edge is exactly 5000 — bucketEnd === lastSeen.)
   assert.deepEqual(snap, {
     total: 1,
     byStatus: { '401': 1 },
@@ -1542,6 +1561,7 @@ test('rejections tally: snapshot() is a stable point-in-time copy — a later re
     lastStatus: 401,
     lastReason: 'unauthorized',
     lastSeen: 5000,
+    timeline: { buckets: [{ bucketStart: -1_795_000, bucketEnd: 5_000, count: 1 }], bucketMs: 1_800_000 },
   });
   // a fresh snapshot reflects the new state
   assert.equal(tally.snapshot().total, 2);
@@ -1557,6 +1577,7 @@ test('rejections tally: BOUNDED — many records with varied reasons never grow 
   assert.equal(snap.total, 1000);
   assert.deepEqual(snap.byStatus, { '415': 1000 }, 'one count key — not 1000 entries');
   assert.equal(snap.lastReason, 'drift reason #999', 'only the single most-recent sample reason is retained');
+  assert.deepEqual(Object.keys(snap).sort(), ['byDeclaredVersion', 'byStatus', 'lastReason', 'lastSeen', 'lastStatus', 'timeline', 'total'], 'shape stays bounded — no per-rejection growth');
 });
 
 test('rejections tally: record() with no status is a defensive no-op (never throws)', () => {
@@ -1570,6 +1591,7 @@ test('rejections tally: record() with no status is a defensive no-op (never thro
     lastStatus: null,
     lastReason: null,
     lastSeen: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
 });
 
@@ -1691,6 +1713,16 @@ test('a 415 rejection (unknown schema) is surfaced in GET /summary — schema dr
   assert.notEqual(rej.lastSeen, null);
   assert.match(rej.lastReason, /unsupported telemetry schema version/, 'sample reason is the receiver diagnostic, not a payload');
   assert.equal(rej.byDeclaredVersion[String(SCHEMA_VERSION + 1)], 1, 'the declared version buckets on the drift axis');
+  // The additive timeline (WARDEN-798) surfaces the drift's TIMING: the 415 just
+  // fired, so it lands in the newest bucket — the ONGOING-drift signal that
+  // total + lastSeen alone cannot convey (a spike that recovered would leave the
+  // newest bucket empty). The two Date.now() reads (record + snapshot) are
+  // microseconds apart, so they cannot straddle a 30-min bucket boundary.
+  assert.ok(rej.timeline, 'timeline field present (additive — carried on every response)');
+  assert.ok(rej.timeline.buckets.length >= 1, 'the recent 415 fired a timeline bucket');
+  const newest = rej.timeline.buckets[rej.timeline.buckets.length - 1];
+  assert.ok(newest.count >= 1, 'the recent 415 lands in the newest bucket — ONGOING drift (newest bucket non-empty)');
+  assert.equal(rej.timeline.bucketMs, 1_800_000, 'same granularity as the read-path timeline');
 });
 
 test('415s from MIXED declared versions surface a bounded byDeclaredVersion histogram (one drifting client vs many)', async () => {
@@ -1784,13 +1816,13 @@ test('a successful ingest (202) does NOT increment rejections (accepted traffic 
   assert.equal(res.statusCode, 202);
 
   const rej = await summaryRejections(handler);
-  assert.deepEqual(rej, { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null });
+  assert.deepEqual(rej, { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } });
 });
 
 test('an idle receiver (no traffic) returns zeroed rejections in GET /summary (parity with today — no false alarm)', async () => {
   const { handler } = wiringWithTally();
   const rej = await summaryRejections(handler);
-  assert.deepEqual(rej, { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null });
+  assert.deepEqual(rej, { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } });
 });
 
 test('rejections accumulate across requests and stay bounded — mixed statuses surface a byStatus histogram', async () => {
@@ -1821,7 +1853,173 @@ test('GET /summary WITHOUT a wired tally still returns a zeroed rejections field
     lastStatus: null,
     lastReason: null,
     lastSeen: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
+});
+
+// ── REJECTION TIMELINE (WARDEN-798) ──────────────────────────────────────────
+// The bounded `timeline` on the rejections tally — mirrors the read-path
+// `timeline` (summarizeTimeline, WARDEN-603) and the persistErrors timeline
+// (WARDEN-777) so a maintainer can tell an ONGOING schema-drift storm (415s
+// still landing in the newest bucket) from a RESOLVED one (415s clustered in
+// older buckets, newest bucket empty) — the spike-vs-baseline question `total` +
+// `lastSeen` provably cannot answer for the roadmap's flagship risk (schema
+// drift → a 415 flood). Driven directly with an injected fake clock (mirroring
+// the tally unit tests above): bucket-placement parity with summarizeTimeline,
+// the rolling-window roll-off bound, redaction parity, the degenerate-config
+// guard, and the ongoing-vs-resolved flagship.
+
+test('rejections tally timeline: an empty tally carries the zeroed shape — buckets: [], bucketMs = default (no false alarm)', () => {
+  // Case 1: a fresh createRejectionTally({ now }) snapshot returns the zeroed
+  // timeline — shape-stable whether or not the tally is wired, mirroring
+  // EMPTY_PERSIST_ERRORS. bucketMs is the default granularity (NOT 0).
+  const tally = createRejectionTally({ now: () => 0 });
+  assert.deepEqual(tally.snapshot().timeline, { buckets: [], bucketMs: 1_800_000 });
+});
+
+test('rejections tally timeline: a known seeded time spread — a recent drift spike vs an earlier baseline (bucket placement parity with the read-path summarizeTimeline + the persistErrors tally)', () => {
+  // Mirrors the read-path /summary "known seeded time spread" test AND the
+  // persistErrors tally timeline test (WARDEN-777): record 415s at known fake-clock
+  // times so the snapshot emits buckets at EXACTLY those times. window
+  // [0, 86_400_000], bucketMs 1_800_000; bucket 1 = [1.8M, 3.6M); bucket 47 =
+  // [84.6M, 86.4M); a record at EXACTLY now (86.4M) folds into the newest bucket
+  // (parity with summarizeTimeline's top-boundary fold). Covers same-bucket
+  // accumulation (count: 3) and chronological sort (oldest → newest).
+  let clock = 0;
+  const tally = createRejectionTally({ now: () => clock });
+  // baseline: one 415 in bucket 1
+  clock = 1_800_000; tally.record({ status: 415, reason: 'baseline drift', declaredVersion: '3' });
+  // spike: three 415s in bucket 47 (one at exactly now → folded via the top edge)
+  clock = 84_600_000; tally.record({ status: 415, reason: 'spike drift', declaredVersion: '5' });
+  clock = 84_600_001; tally.record({ status: 415, reason: 'spike drift', declaredVersion: '5' });
+  clock = 86_400_000; tally.record({ status: 415, reason: 'spike drift', declaredVersion: '5' }); // === now → newest via boundary fold
+  clock = 86_400_000; // snapshot time
+  const { timeline, byDeclaredVersion, total, byStatus } = tally.snapshot();
+  assert.equal(timeline.buckets.length, 2, 'two distinct buckets: baseline + spike');
+  assert.deepEqual(timeline.buckets, [
+    { bucketStart: 1_800_000, bucketEnd: 3_600_000, count: 1 },   // baseline (oldest)
+    { bucketStart: 84_600_000, bucketEnd: 86_400_000, count: 3 }, // recent spike (newest) — three 415s accumulated into one bucket
+  ]);
+  assert.equal(timeline.bucketMs, 1_800_000);
+  assert.equal(total, 4, 'total is cumulative across the timeline');
+  assert.deepEqual(byStatus, { '415': 4 }, 'byStatus still accumulates in parallel');
+  // The new timeline field does NOT disturb the existing drift axis (WARDEN-761):
+  // byDeclaredVersion still populates — the timeline is an ADDITIVE temporal axis,
+  // not a replacement for the version histogram.
+  assert.deepEqual(byDeclaredVersion, { '3': 1, '5': 3 }, 'byDeclaredVersion still populates — the timeline is an additive axis, the drift population is unaffected');
+});
+
+test('rejections tally timeline: ROLL-OFF BOUND — buckets older than the window drop on snapshot(); bucket count never exceeds maxBuckets', () => {
+  // Record one 415 per distinct 30-min slot for 60 slots (> maxBuckets=48), each a
+  // bucketMs apart, so the 48-slot-wide rolling 24h window cannot hold them all.
+  // Advancing the fake clock pushes the earliest 415s out of the window: the
+  // snapshot must drop the rolled-off buckets, never emit more than maxBuckets,
+  // and — unlike `total` — only the TIMELINE window rolls; total stays cumulative.
+  let clock = 1_800_000;
+  const tally = createRejectionTally({ now: () => clock });
+  for (let i = 0; i < 60; i++) {
+    tally.record({ status: 415, reason: `drift slot ${i}`, declaredVersion: '3' });
+    clock += 1_800_000; // advance to the next distinct 30-min slot
+  }
+  // clock is now 1_800_000 + 60 * 1_800_000 = 109_800_000 (snapshot time)
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 60, 'total is cumulative — it does NOT roll off (only the timeline window does)');
+  assert.ok(snap.timeline.buckets.length <= 48, `bucket count bounded at maxBuckets (got ${snap.timeline.buckets.length})`);
+  assert.equal(snap.timeline.bucketMs, 1_800_000);
+  // Every surviving bucket sits inside the current 24h window — the earliest 415s
+  // (the first ~12 slots) rolled off. windowStart = clock - windowMs = 23_400_000.
+  const windowStart = clock - 86_400_000;
+  for (const b of snap.timeline.buckets) {
+    assert.ok(b.bucketStart >= windowStart, `bucket ${b.bucketStart} is inside the rolling window (>= ${windowStart})`);
+  }
+  // Emitted oldest → newest (chronological sort).
+  for (let i = 1; i < snap.timeline.buckets.length; i++) {
+    assert.ok(
+      snap.timeline.buckets[i - 1].bucketStart < snap.timeline.buckets[i].bucketStart,
+      'buckets sorted oldest → newest'
+    );
+  }
+});
+
+test('rejections tally timeline: redaction parity — a bucket carries COUNT + window only, never a reason / status / declared-version string', () => {
+  // Mirrors the read-path /summary "never echoes raw events or extended-tier
+  // names" timeline test AND the persistErrors tally redaction test (WARDEN-777):
+  // the timeline adds TIMING, not content. A rejection's `reason` is the
+  // receiver's diagnostic and the bucket carries only a count + time window — so
+  // no reason text, status, or declared version reaches the timeline.
+  let clock = 1_800_000;
+  const tally = createRejectionTally({ now: () => clock });
+  tally.record({ status: 415, reason: 'unsupported telemetry schema version: super secret drift diagnostic #7B', declaredVersion: '3' });
+  const { timeline } = tally.snapshot();
+  assert.equal(timeline.buckets.length, 1, 'the rejection fired a bucket');
+  const json = JSON.stringify(timeline);
+  assert.equal(json.includes('super secret drift diagnostic'), false, 'no reason text in the timeline');
+  assert.equal(json.includes('7B'), false, 'no reason fragment in the timeline');
+  // The bucket shape is count + window only — there is no field that could carry
+  // a reason, status, or declared version.
+  assert.deepEqual(Object.keys(timeline.buckets[0]).sort(), ['bucketEnd', 'bucketStart', 'count']);
+});
+
+test('rejections tally timeline: DEGENERATE config (windowMs: 0 / maxBuckets: 0) → { buckets: [], bucketMs: 0 } while the scalar tally keeps working', () => {
+  // Mirrors summarizeTimeline's + the persistErrors tally's degenerate-config
+  // guard: a bad windowMs/maxBuckets override collapses the timeline to
+  // { buckets: [], bucketMs: 0 } — never a huge/NaN array — while the scalar
+  // tally (total/byStatus/byDeclaredVersion/lastStatus/lastReason/lastSeen) keeps
+  // working regardless.
+  let clock = 5_000;
+  const tally = createRejectionTally({ now: () => clock, maxBuckets: 0, windowMs: 0 });
+  tally.record({ status: 415, reason: 'drift', declaredVersion: '3' });
+  const snap = tally.snapshot();
+  // scalar tally unaffected
+  assert.equal(snap.total, 1);
+  assert.deepEqual(snap.byStatus, { '415': 1 });
+  assert.deepEqual(snap.byDeclaredVersion, { '3': 1 }, 'the drift axis still works under a degenerate timeline config');
+  assert.equal(snap.lastStatus, 415);
+  assert.equal(snap.lastReason, 'drift');
+  assert.equal(snap.lastSeen, 5_000);
+  // timeline collapsed — never a huge/NaN array
+  assert.deepEqual(snap.timeline, { buckets: [], bucketMs: 0 });
+});
+
+test('rejections tally timeline: ONGOING drift vs RESOLVED drift — the newest bucket tells them apart (total + lastSeen alone cannot)', () => {
+  // The flagship success criterion (WARDEN-798): two receivers with the SAME
+  // total can be distinguished by whether 415 traffic is STILL landing (newest
+  // bucket non-empty = ONGOING) or has gone quiet (no bucket near now, only older
+  // buckets populated = RESOLVED). `total` + a single `lastSeen` provably cannot
+  // answer this — a sustained drift flood and a spike that clients recovered from
+  // read identical without the per-bucket distribution.
+  const snapshotTime = 100_000_000;
+
+  // ONGOING: a 415 landed moments before the snapshot — newest bucket non-empty.
+  let clock = snapshotTime;
+  const ongoing = createRejectionTally({ now: () => clock });
+  clock = snapshotTime - 60_000; // 1 min ago — inside the newest bucket
+  ongoing.record({ status: 415, reason: 'live drift', declaredVersion: '5' });
+  clock = snapshotTime;
+  const ongSnap = ongoing.snapshot();
+  const ongBuckets = ongSnap.timeline.buckets;
+  assert.ok(ongBuckets.length >= 1, 'ONGOING: at least one bucket is populated');
+  const ongNewest = ongBuckets[ongBuckets.length - 1];
+  assert.equal(ongNewest.bucketEnd, snapshotTime, 'ONGOING: the newest bucket reaches now — traffic is still landing');
+  assert.ok(ongNewest.count >= 1, 'ONGOING: the newest bucket is non-empty');
+
+  // RESOLVED: the only 415 landed near the START of the window, then clients were
+  // updated; snapshot much later — the 415 sits in an OLD bucket, no bucket near now.
+  const resolved = createRejectionTally({ now: () => clock });
+  clock = snapshotTime - 80_000_000; // ~22h ago — near the window's oldest edge
+  resolved.record({ status: 415, reason: 'old drift', declaredVersion: '3' });
+  clock = snapshotTime; // clients updated an hour ago; 415s stopped
+  const resSnap = resolved.snapshot();
+  const resBuckets = resSnap.timeline.buckets;
+  assert.ok(resBuckets.length >= 1, 'RESOLVED: the old 415 still has its bucket');
+  const resNewest = resBuckets[resBuckets.length - 1];
+  assert.ok(
+    resNewest.bucketEnd < snapshotTime,
+    'RESOLVED: the newest POPULATED bucket ends well before now — no bucket reaches the snapshot time (traffic went quiet)'
+  );
+
+  // Same total, opposite verdict — the temporal distribution is the deciding signal.
+  assert.equal(ongSnap.total, resSnap.total, 'both saw one 415 — identical total, but the timeline tells them apart');
 });
 
 // ── PERSIST-ERROR TALLY (WARDEN-607) ─────────────────────────────────────────
@@ -2050,7 +2248,7 @@ test('a persist failure records into persistErrors, NOT into the rejections tall
   assert.equal(body.persistErrors.total, 1, 'the persist failure was recorded in its own tally');
   assert.deepEqual(
     body.rejections,
-    { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null },
+    { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } },
     'rejections untouched — a persist failure is not an HTTP rejection'
   );
 });
@@ -2717,7 +2915,7 @@ test('a dedup records into deduped, NOT into rejections or persistErrors (three 
   assert.equal(body.deduped.total, 1, 'the deduped retry was recorded in its own tally');
   assert.deepEqual(
     body.rejections,
-    { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null },
+    { total: 0, byStatus: {}, byDeclaredVersion: {}, lastStatus: null, lastReason: null, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } },
     'rejections untouched — a dedup is not an HTTP rejection'
   );
   assert.deepEqual(
