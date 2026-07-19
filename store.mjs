@@ -137,6 +137,87 @@ export function fileRewrite(path) {
   };
 }
 
+// ── SEEN-KEY DEDUP FILE SEAMS (WARDEN-803) ────────────────────────────────────
+// The durability seams for the seen-key dedup set (server.mjs createSeenKeys):
+// the set is persisted beside telemetry.ndjson as a small, bounded NDJSON file of
+// {key, expiresAt} pairs so idempotent-ingest dedup survives a receiver restart.
+// These mirror the fileSource/fileRewrite discipline exactly — a MISSING file is
+// the normal state for a fresh receiver (returns []), and the sink atomically
+// rewrites the whole snapshot (write a sibling temp, rename over the original) so
+// a crash mid-write leaves either the old-complete file or the new-complete one,
+// never a partial. The persisted record is the opaque client idempotency-key
+// string + its expiry epoch-ms ONLY — never an event payload or tier identifier
+// (identical trust posture to the NDJSON event store above). Used ONLY by the
+// production server wiring; tests inject capturing fns so the suite touches ZERO
+// real filesystem.
+
+/**
+ * A real-filesystem SOURCE for the seen-key set: reads `path` as NDJSON and
+ * returns the parsed `{ key, expiresAt }` entries. A MISSING file returns `[]` —
+ * a fresh receiver with no accepted batches yet has no `seen-keys.ndjson`, and
+ * that is not an error (mirrors `fileSource`'s ENOENT→`[]`). A malformed/partial
+ * line is SKIPPED (via `parseNdjson`); an entry missing a string `key` or a finite
+ * numeric `expiresAt` is dropped, so a corrupt file can never crash boot.
+ *
+ * @param {string} path — NDJSON file path (resolved relative to cwd).
+ * @returns {() => Promise<{ key: string, expiresAt: number }[]>}
+ */
+export function fileSeenKeysSource(path) {
+  const dest = resolve(path);
+  return async () => {
+    let text;
+    try {
+      text = await readFile(dest, 'utf8');
+    } catch (e) {
+      // A missing seen-keys file is the normal state for a fresh receiver — surface
+      // it as an empty set, not a throw (mirrors fileSource's ENOENT→[]).
+      if (e && e.code === 'ENOENT') return [];
+      throw e;
+    }
+    const out = [];
+    for (const e of parseNdjson(text)) {
+      if (
+        e &&
+        typeof e.key === 'string' &&
+        e.key.length > 0 &&
+        typeof e.expiresAt === 'number' &&
+        Number.isFinite(e.expiresAt)
+      ) {
+        out.push({ key: e.key, expiresAt: e.expiresAt });
+      }
+    }
+    return out;
+  };
+}
+
+/**
+ * A real-filesystem SINK for the seen-key set: ATOMICALLY replace the entire file
+ * with the live `{ key, expiresAt }` snapshot (the same atomic temp-then-rename
+ * discipline as `fileRewrite`, so a crash mid-write never leaves a partial file).
+ * Each entry is serialized as `{key, expiresAt}` — the opaque client key string
+ * and its expiry ONLY. An empty snapshot writes an empty file (reads back as `[]`).
+ *
+ * @param {string} path — NDJSON file path (resolved relative to cwd).
+ * @returns {(entries: { key: string, expiresAt: number }[]) => Promise<void>}
+ */
+export function fileSeenKeysSink(path) {
+  const dest = resolve(path);
+  const tmp = `${dest}.tmp`;
+  return async (entries) => {
+    let text = '';
+    if (Array.isArray(entries)) {
+      for (const e of entries) {
+        // Persist ONLY the {key, expiresAt} pair — never an event payload or any
+        // other field. A defensive entry shape is tolerated; the sink never throws
+        // on a missing field (it serializes whatever key/expiresAt it is given).
+        text += `${JSON.stringify({ key: e && e.key, expiresAt: e && e.expiresAt })}\n`;
+      }
+    }
+    await writeFile(tmp, text, 'utf8');
+    await rename(tmp, dest);
+  };
+}
+
 /**
  * The PURE, fs-free retention policy core (so the count-cap / age-window
  * discipline is unit-testable with plain arrays — no seams, no disk). A retention

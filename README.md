@@ -157,8 +157,10 @@ observed time window (`null` on an empty store); `startedAt` is the epoch-ms at 
 (re)booted**. A fresh receiver with no traffic returns `total: 0` with zeroed counters.
 
 `startedAt` is the key that makes the **restart-wiped** tallies below (`rejections`, `persistErrors`,
-`retention`, `seenKeys`) interpretable. All four are in-memory and zeroed on every restart BY DESIGN — a
-misconfiguration detector need not survive a restart. That design has a hole without `startedAt`: a
+`retention`, `deduped`) interpretable. All four are in-memory and zeroed on every restart BY DESIGN — a
+misconfiguration detector need not survive a restart. (`seenKeys` is the exception, not a tally: it is the
+idempotent-ingest dedup SET, persisted beside `telemetry.ndjson` (WARDEN-803) so a retried batch whose 2xx
+was lost before a restart still dedups — see `deduped` below for the dedup correctness story.) That design has a hole without `startedAt`: a
 maintainer reading `rejections.total = 0`, `persistErrors.total = 0` cannot tell a **healthy quiet
 receiver** (up for hours, genuinely saw zero rejections) from a **crash-looping one** that zeroed every
 tally — including the `415` flood that crashed it — seconds ago. The two states read byte-identical on

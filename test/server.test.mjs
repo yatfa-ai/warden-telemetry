@@ -581,7 +581,9 @@ test('GET /summary carries the timeline field for a handler wired WITHOUT an exp
 // createRequestHandler construction (the handler owns the receiver's clock via its
 // `now` dep — the boot timestamp IS that clock at construction). It exists so a
 // maintainer reading the restart-wiped tallies (rejections / persistErrors /
-// retention / seenKeys — all in-memory and restart-wiped BY DESIGN per README) can
+// retention / deduped — all in-memory and restart-wiped BY DESIGN per README; NOTE
+// seenKeys is NOT among them: it is persisted beside telemetry.ndjson by WARDEN-803
+// so idempotent-ingest dedup survives a restart) can
 // tell a healthy quiet receiver (startedAt = hours ago) from a crash-looping one
 // that zeroed every tally seconds ago (startedAt = seconds ago). Those two states
 // read byte-identical on /summary without this field. The frozen-at-boot contract
