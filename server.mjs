@@ -707,6 +707,17 @@ const EMPTY_DEDUPED = Object.freeze({
   lastSeen: null,
 });
 
+// The zeroed shape returned when no dedup set is wired (no seenKeys dep) — the
+// capacity-health complement's parity with EMPTY_DEDUPED. `configured` is
+// {maxKeys:0, ttlMs:0} here (the "unset" shape an absent dep yields, exactly like
+// EMPTY_RETENTION's {maxEvents:0, maxAgeMs:0}); `size: 0`. So a caller that does
+// not wire the set still gets a zeroed `seenKeys` field on /summary —
+// backward-compatible additive shape, exactly like an absent deduped dep.
+const EMPTY_SEEN_KEYS = Object.freeze({
+  configured: { maxKeys: 0, ttlMs: 0 },
+  size: 0,
+});
+
 /**
  * Build the dedup tally (WARDEN-752). Mirrors the injected-seam discipline of
  * `createPersistErrorTally`: an OPTIONAL handler dep (no tally wired = today's
@@ -765,7 +776,7 @@ export function createDedupTally({ now = Date.now } = {}) {
  * @returns {{
  *   has(key: string): boolean,
  *   record(key: string): void,
- *   snapshot(): { size: number }
+ *   snapshot(): { configured: { maxKeys: number, ttlMs: number }, size: number }
  * }}
  */
 export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT_DEDUP_MAX_KEYS, now = Date.now } = {}) {
@@ -799,10 +810,16 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
         seen.delete(oldest);
       }
     },
-    /** Point-in-time size (observability; expired entries are purged only lazily,
-     *  so this is an upper bound on live keys). */
+    /** Point-in-time capacity snapshot (observability; expired entries are purged
+     *  only lazily, so `size` is an UPPER BOUND on live keys). `configured` carries
+     *  the FIFO `maxKeys` cap + per-key `ttlMs` this set was built with, so GET
+     *  /summary can show the live `size` against the bounds that back the dedup
+     *  decision — the capacity-health complement to the `deduped` hit-count tally
+     *  (WARDEN-790): `deduped` tells you "the dedup fired"; `configured` + `size`
+     *  tell you "the set that backs it can still catch the next retry" (or is
+     *  losing keys to FIFO eviction / TTL expiry). */
     snapshot() {
-      return { size: seen.size };
+      return { configured: { maxKeys, ttlMs }, size: seen.size };
     },
   };
 }
@@ -906,8 +923,14 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * double-count and silently inflate /summary + /events. ADDITIVE ONLY: dedup avoids
  * a duplicate write, never expands collection, relaxes no check (handshake /
  * validate / auth / retention / body cap all still run), persists nothing. Built by
- * `createSeenKeys()`; no `seenKeys` dep = no dedup (backward-compatible with an old
- * client that sends no idempotency-key header).
+ * `createSeenKeys()`. GET /summary ALSO reads `seenKeys.snapshot()` (WARDEN-790) so
+ * a maintainer sees the set's live FILL LEVEL (`size`) against its configured
+ * `maxKeys` cap + per-key `ttlMs` — the capacity-health complement to the `deduped`
+ * hit-count tally: `deduped` says the dedup fired, `seenKeys` says the set backing
+ * it can still catch the next retry (or is losing keys to FIFO eviction / TTL
+ * expiry). No `seenKeys` dep = no dedup AND the zeroed `EMPTY_SEEN_KEYS` shape on
+ * /summary (backward-compatible with an old client that sends no idempotency-key
+ * header, and with a caller that doesn't wire the set).
  *
  * `deduped` (optional tally, WARDEN-752): a bounded tally of the transport-retries
  * the receiver ABSORBED via idempotent ingest. When `await ingest(...)` resolves
@@ -935,7 +958,7 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * seenKeys / retention-trigger factories) keeps the stamp unit-testable with a
  * fake clock; absent it defaults to Date.now.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void }, deduped?: { record(): void, snapshot(): object }, maxBodyBytes?: number, now?: () => number, retentionHealth?: { record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void, snapshot(): object } }} deps
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void, snapshot(): { configured: { maxKeys: number, ttlMs: number }, size: number } }, deduped?: { record(): void, snapshot(): object }, maxBodyBytes?: number, now?: () => number, retentionHealth?: { record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void, snapshot(): object } }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
 export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, deduped, maxBodyBytes = 0, now = Date.now, retentionHealth } = {}) {
@@ -1107,6 +1130,23 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           persistErrors: persistErrors ? persistErrors.snapshot() : EMPTY_PERSIST_ERRORS,
           retention: retentionHealth ? retentionHealth.snapshot() : EMPTY_RETENTION,
           deduped: deduped ? deduped.snapshot() : EMPTY_DEDUPED,
+          // `seenKeys` (WARDEN-790): the capacity-health complement to `deduped`
+          // above. `deduped` reports the dedup HIT COUNT (how many retries the set
+          // absorbed); `seenKeys` reports the set's live FILL LEVEL against its
+          // configured FIFO `maxKeys` cap + per-key `ttlMs` — so a maintainer can
+          // tell the set that backs dedup is LOSING keys (a fleet / a client-side
+          // idempotency-key bug emitting near-unique keys pinning it at the cap, or
+          // a TTL too short for the retry window under disk pressure) from one with
+          // room to spare. Without this, dedup degradation under FIFO eviction or
+          // TTL expiry is SILENT: a retried batch whose key was evicted/expired
+          // before its retry arrives is treated as FRESH and persisted again,
+          // inflating /summary + /events while `deduped` still climbs on the keys
+          // that DID hit. Sourced from the existing seenKeys.snapshot() (the same
+          // set ingest() consults); no set wired = the zeroed EMPTY_SEEN_KEYS
+          // shape (today's behavior, exactly like an absent deduped dep). `size` is
+          // an upper bound — expired entries purge lazily on access, so a high read
+          // means "the set WAS that full," never a false alarm of its own.
+          seenKeys: seenKeys ? seenKeys.snapshot() : EMPTY_SEEN_KEYS,
           timeline: summarizeTimeline(filtered, { now }),
         });
       } catch (e) {
