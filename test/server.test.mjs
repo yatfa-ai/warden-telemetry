@@ -574,6 +574,237 @@ test('GET /summary carries the timeline field for a handler wired WITHOUT an exp
   assert.equal(body.timeline.bucketMs, 1_800_000, 'bucketMs always conveyed');
 });
 
+// ── SCOPED /summary — ?type= / ?platform= / ?appVersion= / ?since= (WARDEN-727) ─
+// The scoped-OVERVIEW complement to /events' scoped drill-down: the SAME conjunctive
+// filters select which ALREADY-redacted, ALREADY-validated events get aggregated, so
+// a maintainer who spots a win32 spike or a v0.1.18 volume bubble on
+// /summary.platforms / appVersions can scope /summary to read that slice's
+// topErrorNames / topSignatures / timeline without hand-parsing /events. Driven with
+// fake req/res + an INJECTED readable store; ZERO real fs, ZERO real network.
+//
+// `total` stays the FULL persisted count (mirrors /events' `total: events.length`);
+// `matched` is the scoped subset size (≤ total). `rejections` / `persistErrors` are
+// UNSCOPED (receiver health, not the event subset). The timestamps below are seeded
+// in-window against a fake now = 86_400_000 (window [0, 86_400_000], bucketMs
+// 1_800_000) so the timeline assertions are exact, never wall-clock-dependent.
+
+test('GET /summary?platform=win32 scopes byType / topErrorNames / topSignatures / platforms to win32 only', async () => {
+  // Three events across two platforms + two distinct error names. Scoping to win32
+  // must keep the win32 error + win32 crash and drop the darwin error entirely.
+  const store = readableStore([
+    { ...errorEvent, platform: 'win32', name: 'TypeError', timestamp: 1_800_000 },
+    { ...errorEvent, platform: 'darwin', name: 'RangeError', timestamp: 1_800_000 },
+    { ...crashEvent, platform: 'win32', reason: 'oom', timestamp: 1_800_000 },
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  // total is the FULL set across platforms; matched is the win32 subset.
+  assert.equal(body.total, 3, 'total is the full persisted count, unfiltered');
+  assert.equal(body.matched, 2, 'matched is the win32 subset');
+  assert.ok(body.matched <= body.total, 'matched never exceeds total');
+  // byType reflects ONLY the win32 events: one error + one crash.
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0 });
+  // topErrorNames is win32-only: RangeError (darwin) is gone.
+  assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
+  // topSignatures is win32-only: the darwin RangeError signature is gone.
+  assert.deepEqual(body.topSignatures, [
+    { signature: 'TypeError', type: 'error', count: 1 },
+    { signature: 'crash:oom', type: 'crash', count: 1 },
+  ]);
+  // platforms collapses to the scoped platform only.
+  assert.deepEqual(body.platforms, { win32: 2 }, 'platforms collapses to {win32: matched}');
+});
+
+test('GET /summary?platform=win32 scopes the TIMELINE to win32 arrivals only', async () => {
+  // Seed a win32 spike (3 in the newest bucket) + a darwin baseline (1 in an earlier
+  // bucket). Scoping to win32 must drop the darwin baseline from the distribution.
+  const newestStart = 84_600_000; // bucket 47
+  const store = readableStore([
+    { ...errorEvent, platform: 'darwin', timestamp: 1_800_000 },     // bucket 1 (darwin baseline)
+    { ...errorEvent, platform: 'win32', timestamp: newestStart },    // bucket 47 (win32 spike)
+    { ...errorEvent, platform: 'win32', timestamp: newestStart + 1 },
+    { ...crashEvent, platform: 'win32', timestamp: 86_400_000 },
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const { timeline, matched, total } = JSON.parse(res.body);
+  assert.equal(matched, 3, '3 win32 events matched');
+  assert.equal(total, 4, 'total is the full set');
+  // The darwin baseline bucket is GONE — only the win32 spike bucket remains.
+  assert.deepEqual(timeline.buckets, [
+    { bucketStart: 84_600_000, bucketEnd: 86_400_000, count: 3 },
+  ]);
+  assert.equal(timeline.bucketMs, 1_800_000);
+});
+
+test('GET /summary?platform=win32 scopes firstSeen / lastSeen to the win32 subset', async () => {
+  // firstSeen/lastSeen are part of summarize()'s spread, so they too must reflect
+  // only the scoped subset (the win32 window), not the full retained set.
+  const store = readableStore([
+    { ...errorEvent, platform: 'darwin', timestamp: 5 },    // outside the win32 window
+    { ...errorEvent, platform: 'win32', timestamp: 100 },
+    { ...errorEvent, platform: 'win32', timestamp: 300 },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.matched, 2);
+  assert.equal(body.firstSeen, 100, 'firstSeen is the win32 subset min, not the darwin 5');
+  assert.equal(body.lastSeen, 300, 'lastSeen is the win32 subset max');
+});
+
+test('GET /summary?type=crash scopes the aggregates to a single base type', async () => {
+  const store = readableStore([
+    { ...errorEvent, name: 'TypeError', timestamp: 1_800_000 },
+    { ...crashEvent, reason: 'oom', timestamp: 1_800_000 },
+    { ...crashEvent, reason: 'killed', timestamp: 1_800_000 },
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?type=crash' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 3);
+  assert.equal(body.matched, 2);
+  assert.deepEqual(body.byType, { error: 0, crash: 2, 'performance-stall': 0 });
+  assert.deepEqual(body.topErrorNames, [], 'no error names — errors were filtered out');
+});
+
+test('GET /summary?since= scopes the aggregates to events at/after the cutoff (receivedAt ?? timestamp)', async () => {
+  const store = readableStore([
+    { ...errorEvent, timestamp: 100, receivedAt: 100 },
+    { ...errorEvent, timestamp: 200, receivedAt: 200 },
+    { ...errorEvent, timestamp: 300, receivedAt: 300 },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?since=200' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 3);
+  assert.equal(body.matched, 2, '200 (>=) + 300 survive; 100 dropped');
+  assert.equal(body.firstSeen, 200);
+  assert.equal(body.lastSeen, 300);
+});
+
+test('GET /summary?appVersion=0.1.18&platform=darwin&type=crash intersects all filters (regression attribution)', async () => {
+  // The end-to-end attribution question: "is the v0.1.18 darwin crash real?" Only
+  // one event survives the conjunctive intersection; the rest are excluded for a
+  // distinct reason each.
+  const store = readableStore([
+    { ...crashEvent, platform: 'darwin', appVersion: '0.1.18', reason: 'mac-oom', timestamp: 1_800_000 }, // MATCH
+    { ...crashEvent, platform: 'win32', appVersion: '0.1.18', reason: 'win-oom', timestamp: 1_800_000 },  // wrong platform
+    { ...crashEvent, platform: 'darwin', appVersion: '0.1.19', reason: 'mac-new', timestamp: 1_800_000 }, // wrong version
+    { ...errorEvent, platform: 'darwin', appVersion: '0.1.18', name: 'mac-err', timestamp: 1_800_000 },   // wrong type
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?appVersion=0.1.18&platform=darwin&type=crash' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 4, 'total is the full set');
+  assert.equal(body.matched, 1, 'only the one darwin/0.1.18/crash event survives');
+  assert.deepEqual(body.byType, { error: 0, crash: 1, 'performance-stall': 0 });
+  assert.deepEqual(body.topSignatures, [{ signature: 'crash:mac-oom', type: 'crash', count: 1 }]);
+  assert.deepEqual(body.platforms, { darwin: 1 });
+  assert.deepEqual(body.appVersions, { '0.1.18': 1 });
+});
+
+test('GET /summary with NO filters is backward compatible — matched === total, aggregates over the whole set', async () => {
+  // The legacy unscoped path must be unchanged: matched equals total, and the
+  // aggregates match the pre-WARDEN-727 expectations for this exact fixture.
+  const store = readableStore([errorEvent, crashEvent]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 2);
+  assert.equal(body.matched, 2, 'unfiltered → matched === total');
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0 });
+  assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
+  assert.deepEqual(body.topSignatures, [
+    { signature: 'TypeError', type: 'error', count: 1 },
+    { signature: 'crash:oom', type: 'crash', count: 1 },
+  ]);
+  assert.deepEqual(body.schemaVersions, { '1': 2 });
+  assert.equal(body.firstSeen, 5);
+  assert.equal(body.lastSeen, 9);
+});
+
+test('GET /summary?platform=win32 on a store with NO win32 events → matched 0, total full, zeroed aggregates', async () => {
+  const store = readableStore([
+    { ...errorEvent, platform: 'darwin', timestamp: 1_800_000 },
+    { ...crashEvent, platform: 'darwin', timestamp: 1_800_000 },
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 2, 'total still the full persisted count');
+  assert.equal(body.matched, 0, 'nothing matched the win32 filter');
+  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0 });
+  assert.deepEqual(body.topErrorNames, []);
+  assert.deepEqual(body.platforms, {});
+  assert.deepEqual(body.timeline.buckets, []);
+  assert.equal(body.firstSeen, null);
+  assert.equal(body.lastSeen, null);
+});
+
+test('GET /summary?platform=win32 leaves rejections / persistErrors UNSCOPED (receiver health, not the event subset)', async () => {
+  // rejections/persistErrors tally the REQUEST seam on THIS receiver — a platform
+  // filter must NOT hide them. Wire a tally + seeded mixed-platform store, trigger a
+  // rejection, then scope to a platform that matches NOTHING and assert the rejection
+  // still surfaces (the filter scopes events, not receiver health).
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const rejections = createRejectionTally();
+  const persistErrors = createPersistErrorTally();
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    rejections,
+    persistErrors,
+  });
+
+  // Seed a darwin-only store + trigger one 404 rejection (a routing miss).
+  await handler(fakeReq({ headers: schemaHeaders, body: JSON.stringify({ schemaVersion: SCHEMA_VERSION, events: [{ ...validError, platform: 'darwin' }] }) }), fakeRes());
+  await handler(fakeReq({ method: 'GET', url: '/no-such-route' }), fakeRes());
+
+  // Scope to win32 (matches nothing) — rejections/persistErrors must still read.
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.matched, 0, 'no win32 events');
+  assert.equal(body.total, 1, 'the one darwin event is the full set');
+  // The 404 rejection survives the win32 filter (receiver health is unscoped).
+  assert.ok(body.rejections.total >= 1, 'rejections survive the platform filter');
+  assert.ok(body.rejections.byStatus['404'] >= 1, 'the 404 is still surfaced');
+  // persistErrors is present with its stable shape (zeroed here — no persist failure).
+  assert.equal(body.persistErrors.total, 0);
+});
+
+test('GET /summary ignores an unrecognized query param (no spurious scoping — backward compatible)', async () => {
+  // A param the filter does not consume (?foo=bar) applies NO filter: matched === total.
+  const store = readableStore([errorEvent, crashEvent]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?foo=bar' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 2);
+  assert.equal(body.matched, 2, 'an unknown param does not scope the aggregates');
+});
+
 // ── RETENTION (WARDEN-579) ────────────────────────────────────────────────────
 // The maintenance trigger keeps the persisted store bounded. It runs prune OFF
 // the request path on a debounced (>=1 min), re-entrancy-guarded cadence — never

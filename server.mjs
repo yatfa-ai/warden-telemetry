@@ -59,7 +59,7 @@ import { SCHEMA_VERSION, validateEvent } from './schema.ts';
 import { createNdjsonStore, fileSink, fileSource, fileRewrite } from './store.mjs';
 import { ingest } from './ingest.mjs';
 import { summarize, summarizeTimeline } from './summary.mjs';
-import { selectEvents } from './events.mjs';
+import { selectEvents, filterEvents } from './events.mjs';
 
 export const DEFAULT_PORT = 7421;
 export const DEFAULT_STORE_PATH = new URL('./telemetry.ndjson', import.meta.url).pathname;
@@ -725,6 +725,18 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // (counts / per-type / top error names / schema-version histogram only —
     // never raw events, never extended-tier names). No request body is read.
     //
+    // The aggregates are SCOPEABLE (WARDEN-727) via the SAME conjunctive filters
+    // /events takes — ?type= / ?platform= / ?appVersion= / ?since= — applied
+    // pre-summarize so a maintainer who spots a win32 spike or a v0.1.18 volume
+    // bubble on /summary.platforms / appVersions can scope /summary to that
+    // platform / release to read its topErrorNames / topSignatures / timeline,
+    // then drill into /events for the individual payloads. The filter uses the
+    // SHARED `filterEvents` core selectEvents also calls, so the two surfaces
+    // agree on what each filter means. With NO filters the response is byte-for-
+    // byte the legacy unscoped aggregate (backward compatible). `total` is ALWAYS
+    // the FULL persisted count (how much the window is a window OF); `matched` is
+    // the size of the scoped subset the aggregates were computed over (≤ total).
+    //
     // Gated by the auth block above: like every other route, /summary requires the
     // shared secret when AUTH_TOKEN is set (so extended-tier-derived aggregates are
     // never broadcast to an unauthenticated reader on the LAN). Unset = open. (This
@@ -732,22 +744,50 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     if (req.method === 'GET' && pathname === SUMMARY_PATH) {
       try {
         const events = await store.readEvents();
+        // Scope the aggregates with the SAME conjunctive filter /events uses
+        // (WARDEN-727): ?type= / ?platform= / ?appVersion= / ?since= select which
+        // ALREADY-redacted, ALREADY-validated events get aggregated. filterEvents is
+        // the SHARED core selectEvents also calls, so /summary and /events filter
+        // identically forever. The filter lives HERE (pre-summarize) — NOT as a param
+        // to summarize()/summarizeTimeline(), which stay PURE single-arg functions of
+        // the (now-filtered) event array (the contract documented + tested in the
+        // comment just below). Same `searchParams.get(…) ?? undefined` /
+        // `searchParams.has(…) ? Number(…) : undefined` shape as the /events handler.
+        const filtered = filterEvents(events, {
+          type: searchParams.get('type') ?? undefined,
+          platform: searchParams.get('platform') ?? undefined,
+          appVersion: searchParams.get('appVersion') ?? undefined,
+          since: searchParams.has('since') ? Number(searchParams.get('since')) : undefined,
+        });
         // Compose the bounded `rejections` tally, the bounded `persistErrors`
         // tally, AND the bounded `timeline` distribution here — NOT inside
-        // summarize(). summarize(events) stays a PURE single-arg function of the
-        // event array (documented + tested that way); all three are handler-
-        // composed, exactly the way `retention` is handler-injected rather than
-        // summarize-injected. `rejections` and `persistErrors` are each the tally's
-        // snapshot when wired, or their zeroed EMPTY_* shape otherwise (stable shape
-        // for every caller). `timeline` is ALWAYS computed — a pure read over the
-        // events' `timestamp`s measured back from the injected `now` (default
-        // Date.now) — so the field is present for every caller, wired or not.
-        // Counts only; never raw events or extended-tier names.
+        // summarize(). summarize(filtered) stays a PURE single-arg function of the
+        // (already-filtered) event array (documented + tested that way); all three
+        // are handler-composed, exactly the way `retention` is handler-injected
+        // rather than summarize-injected. `rejections` and `persistErrors` are each
+        // the tally's snapshot when wired, or their zeroed EMPTY_* shape otherwise
+        // (stable shape for every caller). They are intentionally UNSCOPED — they
+        // tally the REQUEST seam (every rejection / persist site on THIS receiver),
+        // NOT the event subset; a platform/release filter must not hide receiver-
+        // health signal. `timeline` is ALWAYS computed — a pure read over the
+        // FILTERED events' effective `receivedAt ?? timestamp`s measured back from
+        // the injected `now` (default Date.now) — so the field is present for every
+        // caller, wired or not, and now reflects the scoped subset. Counts only;
+        // never raw events or extended-tier names.
+        //
+        // `total` overrides summarize()'s own `total` (which would be
+        // `filtered.length`) to stay the FULL persisted count — `events.length`,
+        // mirroring /events' `total: events.length` ("how much the window is a
+        // window OF"). `matched` is the scoped count (`filtered.length`, ≤ total),
+        // so a maintainer sees both the retained set and the slice the aggregates
+        // were computed over. With no filters, matched === total.
         return sendJson(res, 200, {
-          ...summarize(events),
+          ...summarize(filtered),
+          total: events.length,
+          matched: filtered.length,
           rejections: rejections ? rejections.snapshot() : EMPTY_REJECTIONS,
           persistErrors: persistErrors ? persistErrors.snapshot() : EMPTY_PERSIST_ERRORS,
-          timeline: summarizeTimeline(events, { now }),
+          timeline: summarizeTimeline(filtered, { now }),
         });
       } catch (e) {
         return sendJson(res, 500, { error: `could not read summary: ${e?.message ?? e}` });

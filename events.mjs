@@ -8,6 +8,14 @@
 // /summary only counts — in-product, without SSH-ing to the host to hand-parse
 // telemetry.ndjson with jq.
 //
+// The CONJUNCTIVE FILTER CORE (skip-robust + type/platform/appVersion/since) is
+// extracted as `filterEvents()` (WARDEN-727) so the two read surfaces — `selectEvents`
+// (the /events drill-down) AND the /summary handler (the scoped-OVERVIEW complement)
+// — select the SAME events for the SAME query forever. `selectEvents` calls
+// `filterEvents` and then bounds the matches to the newest-N window (the part
+// /summary does NOT want — it aggregates the whole scoped set). `filterEvents` is
+// the canonical owner of the filter semantics; `selectEvents` owns the bound.
+//
 // ── TRUST MODEL (do not erode) ────────────────────────────────────────────────
 // This returns events that ALREADY landed — every one was schema-validated by
 // `ingest` AND redacted client-side / pre-collection before it ever reached disk.
@@ -33,12 +41,21 @@ export const EVENTS_LIMIT_DEFAULT = 100;
 export const EVENTS_LIMIT_MAX = 200;
 
 /**
- * Select a bounded, full-fidelity window of recent persisted events.
+ * The conjunctive filter core shared by the read surfaces (WARDEN-727).
+ *
+ * Selects the subset of `events` matching ALL of the supplied filters — the exact
+ * core `selectEvents` applies before its newest-N bound, factored out so the
+ * `/summary` handler can scope its aggregates with the IDENTICAL semantics (a
+ * maintainer who scopes `/summary?platform=win32` and `/events?platform=win32`
+ * sees the two surfaces agree on what "win32" means, forever). PURE: a function
+ * of the event array + the filter opts — no fs, no network, no deps, no reference
+ * clock. Returns a NEW array (the matching subset in input order); it never
+ * mutates the input.
  *
  * Pure and total: a non-array (or empty) input yields `[]`. Non-object entries
  * (null / primitives / a partial parse) are SKIPPED, not fatal — mirroring
  * `summarize()`'s skip-robustness so a partial read or shape drift can never
- * crash the read and one bad record never taints the window.
+ * crash the read and one bad record never taints the subset.
  *
  * Filters (all optional, all conjunctive — an event is kept iff it survives all
  * that apply):
@@ -58,25 +75,16 @@ export const EVENTS_LIMIT_MAX = 200;
  *     without a finite effective time does not satisfy the window (dropped by the
  *     filter, never a crash).
  *
- * `limit` bounds the window to the NEWEST N events. The store is append-ordered
- * newest-last, so the newest N are the LAST N in arrival order. A missing /
- * non-finite / sub-1 `limit` falls back to the default; a `limit` above
- * the hard cap is clamped to the cap — so the response is always bounded
- * regardless of how full the store is. Sub-1 fractions are grouped with the
- * fallback (not floored to 0) precisely because `slice(-0)` returns the WHOLE
- * array: floor(0.5) is 0, and slicing the last 0 is the entire set, which would
- * defeat the cap.
- *
  * `since` is an ABSOLUTE epoch-ms cutoff, so unlike `applyRetention`'s age window
- * this filter needs no reference clock; the helper stays pure and fs-free — the
- * sibling of `summarize()`, which is a pure single-arg function of the event
- * array. The handler composes it, exactly as it composes `summarize()`.
+ * this filter needs no reference clock; the helper stays pure and fs-free. This is
+ * the sibling of `summarize()`'s "pure single-arg function of the event array"
+ * contract: the filter lives OUTSIDE the aggregator, composed by the handler.
  *
  * @param {object[]} [events]
- * @param {{ limit?: number, type?: string, since?: number, platform?: string, appVersion?: string }} [opts]
+ * @param {{ type?: string, since?: number, platform?: string, appVersion?: string }} [opts]
  * @returns {object[]}
  */
-export function selectEvents(events, { limit, type, since, platform, appVersion } = {}) {
+export function filterEvents(events, { type, since, platform, appVersion } = {}) {
   // Skip-robust up front (mirrors summarize()): drop non-object entries so a
   // partial read or shape drift never crashes the read.
   let list = (Array.isArray(events) ? events : []).filter((e) => e && typeof e === 'object');
@@ -113,6 +121,44 @@ export function selectEvents(events, { limit, type, since, platform, appVersion 
     });
   }
 
+  return list;
+}
+
+/**
+ * Select a bounded, full-fidelity window of recent persisted events.
+ *
+ * Filtering delegates to the shared `filterEvents` core (WARDEN-727) — see its
+ * doc for the conjunctive / omit-excluded / `receivedAt ?? timestamp` semantics,
+ * which are identical to `/summary`'s scoped aggregates. `selectEvents` then owns
+ * the part `/summary` does NOT want: the newest-N bound that keeps a near-full
+ * store from yielding a multi-MB full-fidelity response.
+ *
+ * Pure and total: a non-array (or empty) input yields `[]`. Non-object entries
+ * (null / primitives / a partial parse) are SKIPPED by `filterEvents`, not fatal —
+ * mirroring `summarize()`'s skip-robustness so a partial read or shape drift can
+ * never crash the read and one bad record never taints the window.
+ *
+ * `limit` bounds the window to the NEWEST N events. The store is append-ordered
+ * newest-last, so the newest N are the LAST N in arrival order. A missing /
+ * non-finite / sub-1 `limit` falls back to the default; a `limit` above
+ * the hard cap is clamped to the cap — so the response is always bounded
+ * regardless of how full the store is. Sub-1 fractions are grouped with the
+ * fallback (not floored to 0) precisely because `slice(-0)` returns the WHOLE
+ * array: floor(0.5) is 0, and slicing the last 0 is the entire set, which would
+ * defeat the cap.
+ *
+ * @param {object[]} [events]
+ * @param {{ limit?: number, type?: string, since?: number, platform?: string, appVersion?: string }} [opts]
+ * @returns {object[]}
+ */
+export function selectEvents(events, { limit, type, since, platform, appVersion } = {}) {
+  // The conjunctive filter core (skip-robust + type/platform/appVersion/since) is
+  // the SHARED `filterEvents` helper (WARDEN-727) — the same one the /summary
+  // handler calls — so /events and /summary filter identically forever. selectEvents
+  // then bounds the matches to the newest-N window (the part /summary does NOT
+  // want: it aggregates the whole scoped set, not a bounded tail).
+  const filtered = filterEvents(events, { type, since, platform, appVersion });
+
   // Resolve the bound: a missing / non-finite / sub-1 limit → default;
   // above the hard cap → clamped to the cap. A typo or absurd value can never
   // unbound the response. The guard is `>= 1` (not `> 0`): a sub-1 fraction
@@ -127,5 +173,5 @@ export function selectEvents(events, { limit, type, since, platform, appVersion 
   // Newest N: the store is append-ordered newest-last, so the newest N are the
   // LAST N. slice(-n) returns exactly the newest N, preserving arrival order
   // within the window (oldest-of-the-window first, newest last).
-  return list.slice(-n);
+  return filtered.slice(-n);
 }

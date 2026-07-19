@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { selectEvents, EVENTS_LIMIT_DEFAULT, EVENTS_LIMIT_MAX } from '../events.mjs';
+import { selectEvents, filterEvents, EVENTS_LIMIT_DEFAULT, EVENTS_LIMIT_MAX } from '../events.mjs';
 import { createRequestHandler } from '../server.mjs';
 import { createNdjsonStore } from '../store.mjs';
 
@@ -40,6 +40,247 @@ const validStall = {
   lagMs: 750,
   source: 'event-loop',
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ── PURE HELPER: filterEvents(events, opts) — the shared filter core (WARDEN-727)
+// The conjunctive filter core factored out of selectEvents so the /summary handler
+// can scope its aggregates with the IDENTICAL semantics. Pure: a function of the
+// event array + filter opts — no fs, no network, no clock. These tests pin the
+// core's contract directly AND prove selectEvents delegates to it (so /events and
+// /summary filter identically forever).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── EMPTY / DEFENSIVE ─────────────────────────────────────────────────────────
+
+test('filterEvents: empty input → []', () => {
+  assert.deepEqual(filterEvents([]), []);
+});
+
+test('filterEvents: non-array input is treated as empty (defensive — never throws)', () => {
+  assert.deepEqual(filterEvents(undefined), []);
+  assert.deepEqual(filterEvents(null), []);
+  assert.deepEqual(filterEvents('nope'), []);
+});
+
+test('filterEvents: empty input yields [] regardless of filters', () => {
+  assert.deepEqual(filterEvents([], { type: 'error', platform: 'win32', since: 10 }), []);
+});
+
+// ── NO FILTERS → the whole (skip-robust) set, in input order ──────────────────
+
+test('filterEvents: no filters returns every event in input order (skip-robust)', () => {
+  const out = filterEvents([validError, validCrash, validStall]);
+  assert.equal(out.length, 3);
+  assert.deepEqual(out, [validError, validCrash, validStall]);
+});
+
+test('filterEvents: malformed entries (null / primitives / non-objects) are skipped, not fatal', () => {
+  const out = filterEvents([null, 'not-an-object', 42, undefined, validError, validCrash]);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[0], validError);
+  assert.deepEqual(out[1], validCrash);
+});
+
+test('filterEvents: returns event REFERENCES into the input (no defensive clone — a pure selector)', () => {
+  const out = filterEvents([validError]);
+  assert.equal(out[0], validError);
+});
+
+// ── TYPE / PLATFORM / APPVERSION FILTERS (exact match, omit-excluded) ─────────
+// Mirror selectEvents' filters EXACTLY — the whole point of the extraction is that
+// the two surfaces share one semantics. The canonical fixtures carry no platform/
+// appVersion (a v3 source may legitimately omit them), so they are spread in.
+
+test('filterEvents: ?type= filters to a single base type', () => {
+  const out = filterEvents([validError, validCrash, validStall], { type: 'performance-stall' });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].type, 'performance-stall');
+});
+
+test('filterEvents: a non-matching type yields [] (exact, not "contains")', () => {
+  assert.deepEqual(filterEvents([validError, validCrash], { type: 'performance-stall' }), []);
+});
+
+test('filterEvents: a non-string / empty type applies NO type filter', () => {
+  const all = [validError, validCrash, validStall];
+  assert.equal(filterEvents(all, { type: undefined }).length, 3);
+  assert.equal(filterEvents(all, { type: '' }).length, 3);
+  assert.equal(filterEvents(all, { type: 123 }).length, 3);
+});
+
+test('filterEvents: ?platform= filters to a single OS label', () => {
+  const events = [
+    { ...validError, platform: 'win32' },
+    { ...validCrash, platform: 'darwin' },
+    { ...validStall, platform: 'win32' },
+  ];
+  const out = filterEvents(events, { platform: 'win32' });
+  assert.equal(out.length, 2);
+  assert.ok(out.every((e) => e.platform === 'win32'));
+});
+
+test('filterEvents: ?platform= excludes events whose source OMITTED the field (undefined !== "win32")', () => {
+  // Mirrors selectEvents' omit-excluded semantics: a v3 event with no platform has
+  // platform === undefined, which correctly fails === 'win32'. A maintainer asking
+  // "show me win32" does not want un-attributed events.
+  const events = [
+    { ...validError, platform: 'win32' },
+    validCrash, // no platform field
+  ];
+  const out = filterEvents(events, { platform: 'win32' });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].platform, 'win32');
+});
+
+test('filterEvents: ?appVersion= filters to a single release label', () => {
+  const events = [
+    { ...validError, appVersion: '0.1.19' },
+    { ...validCrash, appVersion: '0.1.20' },
+    { ...validStall, appVersion: '0.1.19' },
+  ];
+  const out = filterEvents(events, { appVersion: '0.1.19' });
+  assert.equal(out.length, 2);
+  assert.ok(out.every((e) => e.appVersion === '0.1.19'));
+});
+
+test('filterEvents: a non-string / empty platform / appVersion applies NO filter', () => {
+  const all = [
+    { ...validError, platform: 'win32', appVersion: '0.1.19' },
+    { ...validCrash, platform: 'darwin', appVersion: '0.1.20' },
+  ];
+  assert.equal(filterEvents(all, { platform: undefined }).length, 2);
+  assert.equal(filterEvents(all, { platform: '' }).length, 2);
+  assert.equal(filterEvents(all, { appVersion: undefined }).length, 2);
+});
+
+// ── SINCE FILTER (absolute epoch-ms cutoff, receivedAt ?? timestamp keying) ───
+
+test('filterEvents: ?since= keeps events with effective time >= since (inclusive lower bound)', () => {
+  const events = [
+    { type: 'error', timestamp: 100 },
+    { type: 'error', timestamp: 200 },
+    { type: 'error', timestamp: 300 },
+  ];
+  const out = filterEvents(events, { since: 200 });
+  assert.deepEqual(
+    out.map((e) => e.timestamp),
+    [200, 300],
+    '200 is included (>=), 100 is dropped'
+  );
+});
+
+test('filterEvents: ?since= later than every event yields []', () => {
+  assert.deepEqual(filterEvents([{ type: 'error', timestamp: 100 }, { type: 'error', timestamp: 200 }], { since: 201 }), []);
+});
+
+test('filterEvents: a non-finite since applies NO time filter', () => {
+  const all = [validError, validCrash, validStall];
+  assert.equal(filterEvents(all, { since: NaN }).length, 3);
+  assert.equal(filterEvents(all, { since: undefined }).length, 3);
+  assert.equal(filterEvents(all, { since: 'nope' }).length, 3);
+});
+
+test('filterEvents: since drops events without a finite effective time', () => {
+  const events = [
+    { type: 'error', timestamp: 300 },
+    { type: 'error', timestamp: undefined },
+    { type: 'error', timestamp: Infinity },
+  ];
+  const out = filterEvents(events, { since: 0 });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].timestamp, 300);
+});
+
+test('filterEvents: ?since= keys off receivedAt — a skewed-old timestamp with a fresh receivedAt is KEPT', () => {
+  // Clock-skew robustness (WARDEN-692): the effective time PREFERS receivedAt, so an
+  // event the receiver saw after the cutoff is kept even if the client timestamp
+  // predates it. This is the exact keying selectEvents uses.
+  const events = [{ type: 'error', timestamp: 100, receivedAt: 300 }];
+  assert.equal(filterEvents(events, { since: 200 }).length, 1);
+  // ...but when receivedAt is below the cutoff too, the event is dropped.
+  assert.equal(filterEvents([{ type: 'error', timestamp: 100, receivedAt: 200 }], { since: 250 }).length, 0);
+});
+
+test('filterEvents: ?since= on events lacking receivedAt reads via the timestamp fallback', () => {
+  const events = [
+    { type: 'error', timestamp: 100 },
+    { type: 'error', timestamp: 300 },
+  ];
+  assert.deepEqual(
+    filterEvents(events, { since: 200 }).map((e) => e.timestamp),
+    [300]
+  );
+});
+
+// ── COMBINED FILTERS (conjunctive) ────────────────────────────────────────────
+
+test('filterEvents: type + platform + appVersion + since are CONJUNCTIVE', () => {
+  const events = [
+    { type: 'crash', platform: 'win32', appVersion: '0.1.18', timestamp: 50, reason: 'a' },
+    { type: 'crash', platform: 'darwin', appVersion: '0.1.18', timestamp: 100, reason: 'b' },
+    { type: 'crash', platform: 'win32', appVersion: '0.1.19', timestamp: 200, reason: 'c' },
+    { type: 'error', platform: 'win32', appVersion: '0.1.18', timestamp: 300, name: 'd' },
+    { type: 'crash', platform: 'win32', appVersion: '0.1.18', timestamp: 400, reason: 'e' },
+  ];
+  // ?type=crash&platform=win32&appVersion=0.1.18&since=100 → only events a(origin 50,
+  // dropped by since) and e survive: crash AND win32 AND 0.1.18 AND ts>=100.
+  const out = filterEvents(events, {
+    type: 'crash',
+    platform: 'win32',
+    appVersion: '0.1.18',
+    since: 100,
+  });
+  assert.deepEqual(
+    out.map((e) => e.reason),
+    ['e']
+  );
+});
+
+// ── EQUIVALENCE: selectEvents delegates its filter core to filterEvents ───────
+// The load-bearing invariant for WARDEN-727: /events and /summary filter
+// identically because selectEvents CALLS filterEvents. These prove the delegation,
+// so a future edit to one cannot silently diverge the two surfaces.
+
+test('filterEvents: selectEvents applies filterEvents then bounds — same filter, same matches', () => {
+  // For a set SMALLER than the default window, selectEvents' newest-N bound is a
+  // no-op (slice(-n) with n >= length returns everything), so selectEvents(events,
+  // {filters}) must equal filterEvents(events, {filters}) element-for-element.
+  const events = [
+    { ...validError, platform: 'win32', appVersion: '0.1.18', timestamp: 100 },
+    { ...validCrash, platform: 'darwin', appVersion: '0.1.19', timestamp: 200 },
+    { ...validStall, platform: 'win32', appVersion: '0.1.18', timestamp: 300 },
+  ];
+  for (const opts of [
+    {},
+    { type: 'error' },
+    { platform: 'win32' },
+    { appVersion: '0.1.18' },
+    { since: 150 },
+    { type: 'crash', platform: 'darwin', appVersion: '0.1.19', since: 0 },
+  ]) {
+    assert.deepEqual(
+      selectEvents(events, opts),
+      filterEvents(events, opts),
+      `selectEvents must equal filterEvents for opts=${JSON.stringify(opts)} (set < window)`
+    );
+  }
+});
+
+test('filterEvents: selectEvents bounds the filterEvents result to the newest N', () => {
+  // With a set LARGER than an explicit limit, selectEvents returns the newest N of
+  // the FILTERED set — i.e. filterEvents(...).slice(-n). Proves the bound is taken
+  // AFTER filtering, not before.
+  const events = Array.from({ length: 20 }, (_, i) => ({ type: 'error', timestamp: i, platform: i % 2 ? 'win32' : 'darwin' }));
+  const opts = { platform: 'win32', limit: 3 };
+  const filtered = filterEvents(events, opts); // 10 win32 events
+  assert.equal(filtered.length, 10);
+  assert.deepEqual(selectEvents(events, opts), filtered.slice(-3), 'newest 3 of the filtered win32 set');
+});
+
+test('filterEvents: a query that matches nothing yields [] from both helpers', () => {
+  assert.deepEqual(filterEvents([validError, validCrash], { platform: 'linux' }), []);
+  assert.deepEqual(selectEvents([validError, validCrash], { platform: 'linux' }), []);
+});
 
 // ── EMPTY / DEFENSIVE ─────────────────────────────────────────────────────────
 
