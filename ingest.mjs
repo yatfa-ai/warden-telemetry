@@ -45,9 +45,15 @@ function readHeader(headers, name) {
   return undefined;
 }
 
-// Build a non-retryable 4xx rejection result.
-function reject(status, error) {
-  return { ok: false, status, body: { error } };
+// Build a non-retryable 4xx rejection result. `extra` carries OPTIONAL extra
+// body fields for one specific reject site: the handshake 415 carries the
+// client's DECLARED schema version STRUCTURALLY (WARDEN-761) — on `body` as
+// `declaredVersion`, NOT embedded only inside the reason string — so the
+// receiver can bucket drift by declared version without regex-parsing a
+// diagnostic. Undefined `extra` yields just `{ error }`, so every other caller
+// (400 / 422) is unchanged.
+function reject(status, error, extra) {
+  return { ok: false, status, body: { error, ...extra } };
 }
 
 /**
@@ -58,7 +64,10 @@ function reject(status, error) {
  * @returns {Promise<{ ok: boolean, status: number, body: object }>}
  *   - success: `{ ok: true, status: 202, body: { accepted: <n> } }`
  *   - dedup:   `{ ok: true, status: 202, body: { accepted: 0, deduped: true } }` (nothing persisted — a retried batch whose 2xx was lost; WARDEN-666)
- *   - rejection: `{ ok: false, status: 4xx, body: { error: string } }` (nothing persisted)
+ *   - rejection: `{ ok: false, status: 4xx, body: { error: string } }` (nothing persisted).
+ *     A 415 (schema-handshake mismatch) additionally carries the client's DECLARED
+ *     version structurally as `body.declaredVersion` (WARDEN-761) — the raw
+ *     `x-telemetry-schema` header value, or `undefined` when the header is missing.
  */
 export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent, store, seenKeys, now = Date.now } = {}) {
   if (typeof SCHEMA_VERSION !== 'number') {
@@ -78,7 +87,12 @@ export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent,
   if (declared !== String(SCHEMA_VERSION)) {
     return reject(
       415,
-      `unsupported telemetry schema version: expected "${SCHEMA_VERSION}", got ${JSON.stringify(declared)}`
+      `unsupported telemetry schema version: expected "${SCHEMA_VERSION}", got ${JSON.stringify(declared)}`,
+      // Carry the DECLARED version structurally (WARDEN-761) so the receiver can
+      // bucket 415 drift by declared version without parsing the reason string.
+      // `declared` is the raw header value (string, or undefined when the header
+      // is missing) — passed through verbatim; the tally decides presence/null.
+      { declaredVersion: declared }
     );
   }
 

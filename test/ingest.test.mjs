@@ -135,6 +135,55 @@ test('rejects a MISSING x-telemetry-schema header the same way (no parse, no per
   assert.equal(store.appended.length, 0);
 });
 
+// ── 415 carries the DECLARED version structurally (WARDEN-761) ────────────────
+// The declared version rides on `body.declaredVersion` — NOT embedded only in the
+// reason string — so the receiver buckets drift without parsing the diagnostic.
+
+test('a 415 carries body.declaredVersion equal to the raw header value (structural, not string-parsed)', async () => {
+  const store = memoryStore();
+  const res = await ingest(
+    { headers: { 'x-telemetry-schema': String(SCHEMA_VERSION + 1) }, body: '}{ not json at all' },
+    deps(store)
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 415);
+  assert.equal(res.body.declaredVersion, String(SCHEMA_VERSION + 1), 'declaredVersion is the raw header value');
+});
+
+test('a 415 for a non-numeric/scanner header value carries it verbatim (no validation drops real drift signal)', async () => {
+  const store = memoryStore();
+  const res = await ingest(
+    { headers: { 'x-telemetry-schema': 'abc' }, body: '}{ not json' },
+    deps(store)
+  );
+  assert.equal(res.status, 415);
+  assert.equal(res.body.declaredVersion, 'abc', 'a scanner value is carried through untouched');
+});
+
+test('a 415 for a MISSING header carries declaredVersion undefined (absent → no bucket downstream)', async () => {
+  const store = memoryStore();
+  const res = await ingest({ headers: {}, body: bodyOf([validError]) }, deps(store));
+  assert.equal(res.status, 415);
+  assert.equal(res.body.declaredVersion, undefined, 'a missing header yields no declaredVersion');
+});
+
+test('a NON-415 rejection does NOT carry declaredVersion (the field is 415-handshake-only)', async () => {
+  // 400 — malformed JSON (passes the handshake because the header matches).
+  const storeA = memoryStore();
+  const r400 = await ingest({ headers: schemaHeaders, body: 'not json' }, deps(storeA));
+  assert.equal(r400.status, 400);
+  assert.equal(r400.body.declaredVersion, undefined, 'a 400 carries no declaredVersion');
+
+  // 422 — an out-of-schema event (passes the handshake + parse, fails validation).
+  const storeB = memoryStore();
+  const r422 = await ingest(
+    { headers: schemaHeaders, body: bodyOf([{ ...validError, runtime: 'worker' }]) },
+    deps(storeB)
+  );
+  assert.equal(r422.status, 422);
+  assert.equal(r422.body.declaredVersion, undefined, 'a 422 carries no declaredVersion');
+});
+
 // ── SUCCESS CRITERION 3: out-of-schema event → hard-reject, nothing persisted ───
 
 test('hard-rejects a batch containing an out-of-schema event (bad runtime) and persists NOTHING', async () => {
