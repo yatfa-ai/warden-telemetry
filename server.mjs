@@ -991,7 +991,18 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // frames, a CrashEvent's reason, a StallEvent's lagMs. BOUNDED to a newest-N
     // window (default 100, hard cap 200) so a near-full store (up to the 10000
     // retention cap) can never yield a multi-MB response, with optional ?type=,
-    // ?since=, ?platform= and ?appVersion= filters. No request body is read; nothing is persisted.
+    // ?since=, ?platform=, ?appVersion= and ?signature= filters. No request body is read; nothing is persisted.
+    //
+    // ?signature= (WARDEN-746) is the failure-axis drill-down complement to
+    // /summary.topSignatures (WARDEN-707): a maintainer who spots a high-count
+    // distinct failure on /summary copies its `signature` here to read THAT
+    // failure's actual payloads instead of eyeballing ?type=error mixed with every
+    // other error in the window. The filter key is the SAME signatureOf() /summary
+    // ranks by (reused, not copied — byte-identical round-trip). It is wired HERE
+    // only, NOT on /summary (scoping the aggregates to a single signature is not
+    // meaningful), so the filter is an /events-only drill-down even though it rides
+    // the shared filterEvents core. An event whose signatureOf() is null never
+    // matches, never crashes; no param = today's behavior exactly (backward compatible).
     //
     // Reads ONLY already-persisted, already-schema-validated, already-client-
     // redacted events via the existing readEvents() seam — no new collection, no
@@ -1013,6 +1024,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           type: searchParams.get('type') ?? undefined,
           platform: searchParams.get('platform') ?? undefined,
           appVersion: searchParams.get('appVersion') ?? undefined,
+          signature: searchParams.get('signature') ?? undefined,
           limit: searchParams.has('limit') ? Number(searchParams.get('limit')) : undefined,
           since: searchParams.has('since') ? Number(searchParams.get('since')) : undefined,
         });

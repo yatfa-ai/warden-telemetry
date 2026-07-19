@@ -10,6 +10,12 @@ import assert from 'node:assert/strict';
 import { selectEvents, filterEvents, EVENTS_LIMIT_DEFAULT, EVENTS_LIMIT_MAX } from '../events.mjs';
 import { createRequestHandler } from '../server.mjs';
 import { createNdjsonStore } from '../store.mjs';
+// signatureOf is the SINGLE source of truth for the failure-signature key (it is
+// what /summary ranks topSignatures by — summary.mjs). Importing it here lets the
+// ?signature= tests compute the expected key from the SAME function the filter
+// uses, pinning the /summary.topSignatures[].signature → /events?signature=
+// round-trip exactly (the byte-identical property WARDEN-746 requires).
+import { signatureOf } from '../summary.mjs';
 
 // ── PURE HELPER: selectEvents(events, opts) ───────────────────────────────────
 
@@ -153,6 +159,89 @@ test('filterEvents: a non-string / empty platform / appVersion applies NO filter
   assert.equal(filterEvents(all, { appVersion: undefined }).length, 2);
 });
 
+// ── SIGNATURE FILTER (WARDEN-746 — the topSignatures drill-down complement) ──
+// The failure-axis filter: keep only events whose DERIVED signature (signatureOf,
+// summary.mjs) exactly matches. The expected key is computed from the SAME
+// signatureOf the filter uses, so these tests pin the round-trip
+// /summary.topSignatures[].signature → /events?signature= byte-for-byte.
+
+test('filterEvents: ?signature= keeps only events whose signatureOf(e) matches (round-trip from /summary)', () => {
+  // The expected signature is DERIVED from signatureOf — the exact function
+  // /summary ranks by — so the test asserts the filter key, never a hand-typed
+  // literal that could drift from the ranker.
+  const err = signatureOf(validError);
+  const crash = signatureOf(validCrash);
+  const stall = signatureOf(validStall);
+  assert.equal(typeof err, 'string');
+  assert.equal(typeof crash, 'string');
+  assert.equal(typeof stall, 'string');
+  // Each distinct failure's signature selects ONLY that failure.
+  assert.deepEqual(filterEvents([validError, validCrash, validStall], { signature: err }), [validError]);
+  assert.deepEqual(filterEvents([validError, validCrash, validStall], { signature: crash }), [validCrash]);
+  assert.deepEqual(filterEvents([validError, validCrash, validStall], { signature: stall }), [validStall]);
+});
+
+test('filterEvents: ?signature= distinguishes same-named errors by their FIRST frame (the whole point vs topErrorNames)', () => {
+  // Two TypeErrors at DIFFERENT call sites are DISTINCT failures → distinct
+  // signatures. topErrorNames would merge them as `TypeError: 2`; the signature
+  // tells them apart. Drilling into one signature returns ONLY that one.
+  const errA = { ...validError, frames: [{ function: 'foo', file: 'app.js', line: 42 }] };
+  const errB = { ...validError, frames: [{ function: 'bar', file: 'lib.js', line: 7 }] };
+  const sigA = signatureOf(errA);
+  const sigB = signatureOf(errB);
+  assert.notEqual(sigA, sigB, 'same name, different frame → different signature');
+  assert.deepEqual(filterEvents([errA, errB], { signature: sigA }), [errA]);
+  assert.deepEqual(filterEvents([errA, errB], { signature: sigB }), [errB]);
+});
+
+test('filterEvents: a non-matching ?signature= yields [] (exact, not "contains")', () => {
+  assert.deepEqual(filterEvents([validError, validCrash], { signature: 'no-such-signature' }), []);
+  // A signature that is a SUBSTRING of a real one still does not match (exact ===).
+  const err = signatureOf(validError);
+  assert.equal(filterEvents([validError], { signature: err.slice(0, 5) }).length, 0);
+});
+
+test('filterEvents: an event whose signatureOf() is null NEVER matches any ?signature= (never crashes)', () => {
+  // A nameless error yields null (signatureOf), a reasonless crash yields null,
+  // and an unknown type yields null — none of these ever match a signature
+  // filter, and none of them throw. This is the skip-robustness that mirrors
+  // every other filter (and signatureOf's own totality).
+  const nameless = { type: 'error', timestamp: 1 }; // no name → null
+  const reasonless = { type: 'crash', timestamp: 2 }; // no reason → null
+  const unknown = { type: 'something-else', timestamp: 3 }; // unknown type → null
+  for (const sig of [signatureOf(validError), 'crash:oom:exit=133', 'stall:event-loop', 'totally-made-up']) {
+    const out = filterEvents([nameless, reasonless, unknown, validError], { signature: sig });
+    // Only validError can ever survive, and only when sig === its signature.
+    assert.ok(out.every((e) => signatureOf(e) === sig), `null-signature events never match sig=${sig}`);
+  }
+  // And explicitly: a nameless error never matches even an empty-string signature
+  // is NOT tried (guard skips), and never matches a real one.
+  assert.equal(filterEvents([nameless], { signature: signatureOf(validError) }).length, 0);
+});
+
+test('filterEvents: ?signature= is CONJUNCTIVE with ?type= (a maintainer copies BOTH from a topSignatures entry)', () => {
+  // The maintainer drill-down path: copy `signature` AND `type` off a
+  // /summary.topSignatures[] entry. Both filters must hold.
+  const events = [
+    validError, // error, signatureOf(validError)
+    { ...validError, frames: [{ function: 'other', file: 'z.js', line: 1 }] }, // error, DIFFERENT sig
+    validCrash, // crash
+  ];
+  const errSig = signatureOf(validError);
+  const out = filterEvents(events, { type: 'error', signature: errSig });
+  assert.equal(out.length, 1);
+  assert.equal(out[0], events[0]);
+  assert.equal(signatureOf(out[0]), errSig);
+});
+
+test('filterEvents: a non-string / empty signature applies NO filter (backward-compat: no param = today)', () => {
+  const all = [validError, validCrash, validStall];
+  assert.equal(filterEvents(all, { signature: undefined }).length, 3);
+  assert.equal(filterEvents(all, { signature: '' }).length, 3);
+  assert.equal(filterEvents(all, { signature: null }).length, 3);
+  assert.equal(filterEvents(all, { signature: 123 }).length, 3);
+});
+
 // ── SINCE FILTER (absolute epoch-ms cutoff, receivedAt ?? timestamp keying) ───
 
 test('filterEvents: ?since= keeps events with effective time >= since (inclusive lower bound)', () => {
@@ -255,8 +344,13 @@ test('filterEvents: selectEvents applies filterEvents then bounds — same filte
     { type: 'error' },
     { platform: 'win32' },
     { appVersion: '0.1.18' },
+    { signature: signatureOf(validError) },
+    { signature: signatureOf(validStall) },
     { since: 150 },
     { type: 'crash', platform: 'darwin', appVersion: '0.1.19', since: 0 },
+    // The maintainer drill-down: BOTH `type` and `signature` copied off a
+    // topSignatures entry, composed (WARDEN-746).
+    { type: 'error', signature: signatureOf(validError) },
   ]) {
     assert.deepEqual(
       selectEvents(events, opts),
@@ -501,6 +595,45 @@ test('selectEvents: a non-string / empty platform applies NO platform filter', (
   assert.equal(selectEvents(all, { platform: undefined }).length, 3);
   assert.equal(selectEvents(all, { platform: '' }).length, 3);
   assert.equal(selectEvents(all, { platform: 123 }).length, 3);
+});
+
+// ── SIGNATURE FILTER (WARDEN-746) ─────────────────────────────────────────────
+// selectEvents delegates the signature filter to filterEvents, then bounds the
+// matches to the newest-N window. Mirrors the platform filter tests directly above.
+
+test('selectEvents: ?signature= filters to events whose signatureOf(e) matches', () => {
+  const out = selectEvents([validError, validCrash, validStall], { signature: signatureOf(validCrash) });
+  assert.equal(out.length, 1);
+  assert.equal(out[0], validCrash);
+  assert.equal(signatureOf(out[0]), signatureOf(validCrash));
+});
+
+test('selectEvents: ?signature= applies BEFORE the newest-N bound (newest N of the matching signature)', () => {
+  // Of the matches, the newest N are returned — not "newest N overall then filtered".
+  // Five errors sharing a signature across timestamps; limit=2 → the newest 2.
+  const sig = signatureOf(validError);
+  const events = [
+    { ...validError, timestamp: 100 },
+    { ...validError, timestamp: 200 },
+    { ...validError, timestamp: 300 },
+    { type: 'error', timestamp: 250, name: 'Other', frames: [{ function: 'x', file: 'y.js', line: 1 }] }, // different sig
+    { ...validError, timestamp: 400 },
+  ];
+  const out = selectEvents(events, { signature: sig, limit: 2 });
+  assert.equal(out.length, 2);
+  assert.deepEqual(out.map((e) => e.timestamp), [300, 400], 'newest 2 of the matching signature');
+  assert.ok(out.every((e) => signatureOf(e) === sig));
+});
+
+test('selectEvents: a null-signature event (nameless error / unknown type) NEVER matches ?signature=', () => {
+  const nameless = { type: 'error', timestamp: 1, name: '', frames: [] };
+  const out = selectEvents([nameless, validError], { signature: signatureOf(validError) });
+  assert.equal(out.length, 1);
+  assert.equal(out[0], validError, 'nameless error (signatureOf → null) never matches');
+});
+
+test('selectEvents: a non-matching ?signature= yields []', () => {
+  assert.deepEqual(selectEvents([validError, validCrash], { signature: 'nope' }), []);
 });
 
 // ── SINCE FILTER (absolute epoch-ms cutoff) ───────────────────────────────────
@@ -864,6 +997,62 @@ test('GET /events: ?type=crash&platform=win32 composes (conjunctive)', async () 
   assert.equal(body.events[0].type, 'crash');
   assert.equal(body.events[0].platform, 'win32');
   assert.equal(body.events[0].reason, 'win-oom');
+});
+
+// ── ?signature= filter (WARDEN-746 — topSignatures drill-down, end-to-end) ────
+
+test('GET /events: ?signature= returns only that distinct failure; total stays the FULL persisted count', async () => {
+  // The maintainer drill-down: a high-count TypeError on /summary.topSignatures
+  // → copy its `signature` here → read THAT failure's message+frames, not every
+  // error mixed together. The signature carries spaces/@/(): URL-encode it.
+  const errSig = signatureOf(validError);
+  const store = readableStore([validError, validCrash, validStall]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ url: `/events?signature=${encodeURIComponent(errSig)}` }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.events.length, 1);
+  assert.equal(body.events[0].name, 'TypeError');
+  assert.equal(body.events[0].message, 'Cannot read properties of undefined', 'the drill-down payload /summary drops');
+  assert.deepEqual(body.events[0].frames, [{ function: 'foo', file: 'app.js', line: 42 }]);
+  assert.equal(body.total, 3, 'total is still the FULL persisted count across all signatures');
+});
+
+test('GET /events: ?type=&signature= compose (conjunctive) — both copied off a topSignatures entry', async () => {
+  const errSig = signatureOf(validError);
+  const other = { ...validError, frames: [{ function: 'bar', file: 'lib.js', line: 7 }] }; // same name, diff sig
+  const store = readableStore([validError, other, validCrash]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ url: `/events?type=error&signature=${encodeURIComponent(errSig)}` }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.events.length, 1);
+  assert.deepEqual(body.events[0].frames, [{ function: 'foo', file: 'app.js', line: 42 }]);
+  assert.equal(body.total, 3);
+});
+
+test('GET /events: a non-matching ?signature= yields [] (total still the full count)', async () => {
+  const store = readableStore([validError, validCrash]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ url: '/events?signature=no-such-failure' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.deepEqual(body.events, []);
+  assert.equal(body.total, 2);
+});
+
+test('GET /events: an empty ?signature= applies NO filter (backward compatible — today behavior)', async () => {
+  // ?signature= (empty value) → searchParams.get returns '' → guard skips → no
+  // filter. The whole set comes back exactly as before the param existed.
+  const store = readableStore([validError, validCrash, validStall]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ url: '/events?signature=' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.events.length, 3);
+  assert.equal(body.total, 3);
 });
 
 // ── ?since= filter ────────────────────────────────────────────────────────────

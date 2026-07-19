@@ -8,13 +8,16 @@
 // /summary only counts — in-product, without SSH-ing to the host to hand-parse
 // telemetry.ndjson with jq.
 //
-// The CONJUNCTIVE FILTER CORE (skip-robust + type/platform/appVersion/since) is
-// extracted as `filterEvents()` (WARDEN-727) so the two read surfaces — `selectEvents`
-// (the /events drill-down) AND the /summary handler (the scoped-OVERVIEW complement)
-// — select the SAME events for the SAME query forever. `selectEvents` calls
-// `filterEvents` and then bounds the matches to the newest-N window (the part
-// /summary does NOT want — it aggregates the whole scoped set). `filterEvents` is
-// the canonical owner of the filter semantics; `selectEvents` owns the bound.
+// The CONJUNCTIVE FILTER CORE (skip-robust + type/platform/appVersion/signature/
+// since) is extracted as `filterEvents()` (WARDEN-727) so the two read surfaces —
+// `selectEvents` (the /events drill-down) AND the /summary handler (the scoped-
+// OVERVIEW complement) — select the SAME events for the SAME query forever.
+// `selectEvents` calls `filterEvents` and then bounds the matches to the newest-N
+// window (the part /summary does NOT want — it aggregates the whole scoped set).
+// `filterEvents` is the canonical owner of the filter semantics; `selectEvents`
+// owns the bound. (`signature` rides the shared core but is wired on /events only
+// — WARDEN-746; /summary does not pass it, so the core's semantics stay shared
+// while the drill-down filter stays an /events concern.)
 //
 // ── TRUST MODEL (do not erode) ────────────────────────────────────────────────
 // This returns events that ALREADY landed — every one was schema-validated by
@@ -32,6 +35,14 @@
 // cap (WARDEN-579). A read of the whole persisted set could be large, so the
 // window is HARD-CAPPED (≤ EVENTS_LIMIT_MAX): a near-full store can never yield a
 // multi-MB response. The default is the recent N (EVENTS_LIMIT_DEFAULT).
+
+// `signatureOf` (summary.mjs) is the single source of truth for the failure-
+// signature key /summary ranks `topSignatures` by (WARDEN-707). Reusing it here
+// keeps the GET /events?signature= drill-down (WARDEN-746) byte-identical to what
+// /summary COUNTS — no drift between the ranked key and the filtered key (drift
+// would silently break the drill-down). One-directional edge events → summary;
+// summary already imports ./schema.ts only, so this introduces NO import cycle.
+import { signatureOf } from './summary.mjs';
 
 // The default + hard cap on the recent-N window (WARDEN-599). The cap is the
 // single bound that keeps a full-fidelity read O(N) and bounded regardless of how
@@ -69,6 +80,17 @@ export const EVENTS_LIMIT_MAX = 200;
  *   - `appVersion` — keep only events whose `appVersion` release label matches
  *     (e.g. '0.1.19', WARDEN-665). Exact match; same omit-excluded + guard
  *     semantics as `platform`.
+ *   - `signature`  — keep only events whose DERIVED failure signature (signatureOf,
+ *     summary.mjs — byte-identical to the keys /summary ranks `topSignatures` by,
+ *     WARDEN-707) exactly matches. The failure-axis drill-down (WARDEN-746): step
+ *     from a /summary.topSignatures ranking straight into THAT distinct failure's
+ *     payloads. A non-string / empty `signature` applies no filter; an event whose
+ *     signatureOf() is null (an unknown type, or a type-specific field gap — a
+ *     nameless error, a reasonless crash, a sourceless stall) never matches — never
+ *     crashes (mirrors the skip-robustness of every other filter). NOTE: wired on
+ *     /events only; /summary does not pass it (scoping the aggregates to one
+ *     signature is not meaningful), so this filter is an /events-only drill-down
+ *     that merely RIDES the shared core.
  *   - `since`      — keep only events whose effective epoch-ms time — `receivedAt` if
  *     present (WARDEN-692), else the client's `timestamp` — is `>= since` (an
  *     ABSOLUTE cutoff). A non-finite `since` applies no time filter; an event
@@ -81,10 +103,10 @@ export const EVENTS_LIMIT_MAX = 200;
  * contract: the filter lives OUTSIDE the aggregator, composed by the handler.
  *
  * @param {object[]} [events]
- * @param {{ type?: string, since?: number, platform?: string, appVersion?: string }} [opts]
+ * @param {{ type?: string, since?: number, platform?: string, appVersion?: string, signature?: string }} [opts]
  * @returns {object[]}
  */
-export function filterEvents(events, { type, since, platform, appVersion } = {}) {
+export function filterEvents(events, { type, since, platform, appVersion, signature } = {}) {
   // Skip-robust up front (mirrors summarize()): drop non-object entries so a
   // partial read or shape drift never crashes the read.
   let list = (Array.isArray(events) ? events : []).filter((e) => e && typeof e === 'object');
@@ -108,6 +130,24 @@ export function filterEvents(events, { type, since, platform, appVersion } = {})
   // and omit-excluded semantics as `platform`.
   if (typeof appVersion === 'string' && appVersion.length > 0) {
     list = list.filter((e) => e.appVersion === appVersion);
+  }
+
+  // Signature filter — keep only events whose DERIVED failure signature
+  // (signatureOf, summary.mjs — byte-identical to the keys /summary ranks
+  // topSignatures by, WARDEN-707) exactly matches. The failure-axis drill-down
+  // (WARDEN-746): a maintainer who spots a high-count distinct failure on
+  // /summary copies its `signature` here to read THAT failure's actual payloads
+  // (message + frames / reason / lagMs) instead of eyeballing ?type=error mixed
+  // with every other error in the window. A non-string / empty signature applies
+  // no filter (the common case: no ?signature= param). An event whose
+  // signatureOf() is null (an unknown type, or a type-specific field gap — a
+  // nameless error, a reasonless crash, a sourceless stall) simply never matches,
+  // never crashes (mirrors the skip-robustness of every other filter). The filter
+  // key is the SAME function /summary ranks by, so the round-trip
+  // /summary.topSignatures[].signature → /events?signature= is exact (no drift
+  // between what is counted and what is filtered).
+  if (typeof signature === 'string' && signature.length > 0) {
+    list = list.filter((e) => signatureOf(e) === signature);
   }
 
   // Since filter — keep events whose effective time (receivedAt if present,
@@ -148,16 +188,19 @@ export function filterEvents(events, { type, since, platform, appVersion } = {})
  * defeat the cap.
  *
  * @param {object[]} [events]
- * @param {{ limit?: number, type?: string, since?: number, platform?: string, appVersion?: string }} [opts]
+ * @param {{ limit?: number, type?: string, since?: number, platform?: string, appVersion?: string, signature?: string }} [opts]
  * @returns {object[]}
  */
-export function selectEvents(events, { limit, type, since, platform, appVersion } = {}) {
-  // The conjunctive filter core (skip-robust + type/platform/appVersion/since) is
-  // the SHARED `filterEvents` helper (WARDEN-727) — the same one the /summary
-  // handler calls — so /events and /summary filter identically forever. selectEvents
-  // then bounds the matches to the newest-N window (the part /summary does NOT
-  // want: it aggregates the whole scoped set, not a bounded tail).
-  const filtered = filterEvents(events, { type, since, platform, appVersion });
+export function selectEvents(events, { limit, type, since, platform, appVersion, signature } = {}) {
+  // The conjunctive filter core (skip-robust + type/platform/appVersion/signature/
+  // since) is the SHARED `filterEvents` helper (WARDEN-727) — the same one the
+  // /summary handler calls — so /events and /summary filter identically forever.
+  // selectEvents then bounds the matches to the newest-N window (the part /summary
+  // does NOT want: it aggregates the whole scoped set, not a bounded tail). The
+  // `signature` filter rides this shared core but is passed by /events only; /summary
+  // does not forward it (WARDEN-746), so its semantics stay shared while the
+  // drill-down stays an /events concern.
+  const filtered = filterEvents(events, { type, since, platform, appVersion, signature });
 
   // Resolve the bound: a missing / non-finite / sub-1 limit → default;
   // above the hard cap → clamped to the cap. A typo or absurd value can never

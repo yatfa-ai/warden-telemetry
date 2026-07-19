@@ -273,6 +273,14 @@ The response is **bounded and filterable**:
 - **`?platform=`** — filter to one OS label (`darwin` | `win32` | `linux`). Exact match; an event whose source
   omitted the field is excluded (a maintainer asking "show me win32" does not want un-attributed events).
 - **`?appVersion=`** — filter to one release label (e.g. `0.1.19`). Exact match.
+- **`?signature=`** — filter to one **distinct failure** by the *exact* key `/summary` ranks `topSignatures` by
+  (error `name` + first frame, crash `reason`, stall `source`). This is the drill-down complement to
+  `topSignatures`: spot a high-count failure on `/summary`, copy its `signature` here, and read *that*
+  failure's actual payloads instead of eyeballing `?type=error` mixed with every other error in the window.
+  The filter key is the same `signatureOf()` `/summary` uses, so the round-trip is byte-identical (no drift
+  between what is counted and what is filtered). An event that yields no signature (a nameless error, a
+  reasonless crash, an unknown type) never matches — never errors. `/summary` itself does not take this
+  filter (scoping the aggregates to one signature is not meaningful); it is an `/events`-only drill-down.
 - **`?since=`** — keep only events whose epoch-ms `timestamp` is `>= since` (an absolute cutoff, inclusive).
   Useful for "what landed since I last looked."
 
@@ -280,6 +288,20 @@ Filters are conjunctive (an event must match all that apply), and the newest-N w
 *filtered* set. `total` is always the **full persisted count** (before the window/filter), so you can see how
 much the window is a window *of*. A fresh receiver with no traffic returns `{ "events": [], "total": 0 }`
 with `200` (parity with `/summary`'s empty-store shape).
+
+The `?signature=` drill-down turns a `topSignatures` ranking straight into inspectable payloads — copy the
+`signature` (and its `type`) off `/summary` into `/events`:
+
+```bash
+# /summary ranked it…
+curl 'http://localhost:7421/summary?type=error'
+#   "topSignatures": [
+#     { "signature": "TypeError @ app.js:42 (foo)", "type": "error", "count": 847 }, ...
+#   ]
+
+# …/events?signature= drills into THAT failure's message + frames (URL-encode the value):
+curl 'http://localhost:7421/events?type=error&signature=TypeError%20%40%20app.js%3A42%20(foo)'
+```
 
 The trust posture is identical to `/summary`: the route reads **only already-persisted, already-schema-
 validated, already-client-redacted** events via the existing store read seam. It introduces no new
