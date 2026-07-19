@@ -52,6 +52,56 @@ export const EVENTS_LIMIT_DEFAULT = 100;
 export const EVENTS_LIMIT_MAX = 200;
 
 /**
+ * Resolve the page bound N for a /events window (≤ EVENTS_LIMIT_MAX). Shared by
+ * `selectEvents` (the bound it applies) and the /events handler (the `limit` it
+ * echoes) so the echoed bound is provably the one that shaped the response — the
+ * two can never drift on what a "page of N" means, the way `filterEvents` keeps
+ * them from drifting on what a filter matches. PURE: a function of the raw
+ * limit value + the exported constants — no fs, no network, no deps.
+ *
+ * A missing / non-finite / sub-1 `limit` → EVENTS_LIMIT_DEFAULT; otherwise
+ * floor + clamp to the hard cap. The guard is `>= 1` (not `> 0`): a sub-1
+ * fraction like 0.5 floors to 0, and `slice(-0)` === `slice(0)` returns the
+ * WHOLE array — which would bypass the cap on a large store. `>= 1` routes such
+ * a value to the default instead, keeping the response bounded for EVERY input.
+ *
+ * @param {number} [limit]
+ * @returns {number}
+ */
+export function resolveLimit(limit) {
+  if (typeof limit === 'number' && Number.isFinite(limit) && limit >= 1) {
+    return Math.min(Math.floor(limit), EVENTS_LIMIT_MAX);
+  }
+  return EVENTS_LIMIT_DEFAULT;
+}
+
+/**
+ * Resolve the /events page offset — how many of the NEWEST matches to skip
+ * before taking the next page (WARDEN-755). Shared by `selectEvents` (the skip
+ * it applies) and the /events handler (the `offset` it echoes) so the echoed
+ * offset is provably the one that shaped the response. PURE: a function of the
+ * raw offset + the matched-set size — no fs, no network, no deps, no reference
+ * clock.
+ *
+ * A missing / non-finite / sub-0 `offset` → 0 (today's newest-N, byte-identical
+ * — backward compatible); otherwise floor + clamp to `matched` (the filtered
+ * set length). Clamping to `matched` keeps a pathological `offset=1e9` from
+ * reaching `slice()` with a huge index AND makes the past-end edge uniform:
+ * `selectEvents` returns `[]` when the resolved skip >= the matched length (no
+ * older page to show).
+ *
+ * @param {number} [offset]
+ * @param {number} matched — the filtered set length (skip is clamped to this)
+ * @returns {number}
+ */
+export function resolveOffset(offset, matched) {
+  if (typeof offset === 'number' && Number.isFinite(offset) && offset > 0) {
+    return Math.min(Math.floor(offset), matched);
+  }
+  return 0;
+}
+
+/**
  * The conjunctive filter core shared by the read surfaces (WARDEN-727).
  *
  * Selects the subset of `events` matching ALL of the supplied filters — the exact
@@ -187,11 +237,23 @@ export function filterEvents(events, { type, since, platform, appVersion, signat
  * array: floor(0.5) is 0, and slicing the last 0 is the entire set, which would
  * defeat the cap.
  *
+ * `offset` (WARDEN-755) pages OLDER matches past the newest-N window. It is how
+ * many of the NEWEST matches to SKIP before taking the next page of N — the
+ * drill-down twin of `/summary`'s `matched` count, closing the silent-truncation
+ * gap where a maintainer reading `/events?type=error` against a 847-match subset
+ * could not tell whether the newest-200 was the whole set or a truncation, nor
+ * reach the older 647. A missing / non-finite / sub-0 `offset` → `0` (today's
+ * newest-N, BYTE-IDENTICAL — backward compatible). A pathological `offset` is
+ * clamped to `filtered.length` so a giant value never reaches `slice()`; once an
+ * offset skips to or past the end of the matched set (`offset >= filtered.length`)
+ * it returns `[]` (no older page). The bound N STAYS ≤ EVENTS_LIMIT_MAX on every
+ * page — `offset` only selects WHICH bounded slice; the response never grows.
+ *
  * @param {object[]} [events]
- * @param {{ limit?: number, type?: string, since?: number, platform?: string, appVersion?: string, signature?: string }} [opts]
+ * @param {{ limit?: number, offset?: number, type?: string, since?: number, platform?: string, appVersion?: string, signature?: string }} [opts]
  * @returns {object[]}
  */
-export function selectEvents(events, { limit, type, since, platform, appVersion, signature } = {}) {
+export function selectEvents(events, { limit, offset, type, since, platform, appVersion, signature } = {}) {
   // The conjunctive filter core (skip-robust + type/platform/appVersion/signature/
   // since) is the SHARED `filterEvents` helper (WARDEN-727) — the same one the
   // /summary handler calls — so /events and /summary filter identically forever.
@@ -202,19 +264,33 @@ export function selectEvents(events, { limit, type, since, platform, appVersion,
   // drill-down stays an /events concern.
   const filtered = filterEvents(events, { type, since, platform, appVersion, signature });
 
-  // Resolve the bound: a missing / non-finite / sub-1 limit → default;
-  // above the hard cap → clamped to the cap. A typo or absurd value can never
-  // unbound the response. The guard is `>= 1` (not `> 0`): a sub-1 fraction
-  // like 0.5 floors to 0, and `slice(-0)` === `slice(0)` returns the WHOLE
-  // array — which would bypass the cap on a large store. `>= 1` routes such a
-  // value to the default instead, keeping the response bounded for EVERY input.
-  let n = EVENTS_LIMIT_DEFAULT;
-  if (typeof limit === 'number' && Number.isFinite(limit) && limit >= 1) {
-    n = Math.min(Math.floor(limit), EVENTS_LIMIT_MAX);
-  }
+  // The bound N and the page offset `skip` are resolved via the SHARED
+  // `resolveLimit` / `resolveOffset` helpers (WARDEN-755) — the SAME helpers the
+  // /events handler calls to echo `limit` / `offset` — so the response's echoed
+  // bound is provably the one that shaped `events`. The two surfaces can never
+  // drift on what "a page of N, offset by skip" means, the way filterEvents
+  // already keeps them from drifting on what a filter matches.
+  const n = resolveLimit(limit);
+  const skip = resolveOffset(offset, filtered.length);
 
-  // Newest N: the store is append-ordered newest-last, so the newest N are the
-  // LAST N. slice(-n) returns exactly the newest N, preserving arrival order
-  // within the window (oldest-of-the-window first, newest last).
-  return filtered.slice(-n);
+  // No older page to show: the offset has skipped to or past the end of the
+  // matched set. Bounded and explicit (never a negative-range slice), so a
+  // maintainer paging `?offset=200&offset=400…` on a finite matching set stops
+  // cleanly at `[]` once every match has been traversed.
+  if (skip >= filtered.length) return [];
+
+  // Newest N (offset 0): the store is append-ordered newest-last, so the newest
+  // N are the LAST N. slice(-n) returns exactly the newest N, preserving arrival
+  // order within the window (oldest-of-the-window first, newest last) —
+  // BYTE-IDENTICAL to the pre-paging behavior (backward compatible).
+  //
+  // Older page (offset > 0): skip the newest `skip` matches and take the next N
+  // before them. slice(-(skip + n), -skip) drops the trailing `skip` (the
+  // already-paged newest matches) and bounds the remainder to N — e.g. skip=200,
+  // n=100 on a 500-match set takes matches [-300:-200], the page right before the
+  // newest-200. The bound N stays ≤ EVENTS_LIMIT_MAX on EVERY page; `offset`
+  // only selects which bounded slice — the response never exceeds the cap.
+  // (offset 0 is special-cased because slice(-n, -0) === slice(-n, 0) === [],
+  // NOT the newest N — -0 collapses to 0 and an explicit 0 end empties the slice.)
+  return skip === 0 ? filtered.slice(-n) : filtered.slice(-(skip + n), -skip);
 }

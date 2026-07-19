@@ -507,6 +507,211 @@ test('selectEvents: default window is also newest-N (the tail), not the head', (
   assert.equal(out[out.length - 1].timestamp, events.length - 1, 'newest is last');
 });
 
+// ── PAGING: offset (WARDEN-755) ───────────────────────────────────────────────
+// offset pages OLDER matches past the newest-N window — how many of the NEWEST
+// matches to skip before taking the next page of N. The store is append-ordered
+// newest-last, so the matches are [oldest … newest]; offset=0 takes the trailing
+// N (newest), offset=N takes the N before them, etc. Each test names the exact
+// slice assertion it makes (arrival order, page boundary, empty edge).
+
+test('selectEvents: offset omitted / undefined / 0 → byte-identical newest-N (backward compatible)', () => {
+  // The load-bearing backward-compat claim: paging defaults to today's behavior.
+  // An offset of 0 (or absent) MUST return exactly what selectEvents returned
+  // before WARDEN-755 — slice(-n), NOT slice(-n, -0) (which is []).
+  const events = Array.from({ length: 10 }, (_, i) => ({ type: 'error', timestamp: i }));
+  const baseline = selectEvents(events, { limit: 3 }); // newest 3: [7,8,9]
+  assert.deepEqual(
+    selectEvents(events, { limit: 3 }).map((e) => e.timestamp),
+    [7, 8, 9],
+    'baseline: newest 3'
+  );
+  assert.deepEqual(selectEvents(events, { limit: 3, offset: undefined }), baseline, 'undefined offset');
+  assert.deepEqual(selectEvents(events, { limit: 3, offset: 0 }), baseline, 'offset: 0');
+  assert.deepEqual(selectEvents(events, { limit: 3, offset: null }), baseline, 'null offset → 0');
+});
+
+test('selectEvents: offset=N skips the newest N matches and returns the next page (arrival order preserved)', () => {
+  // 10 matches [0..9] oldest→newest, limit=3 (page size 3). offset=3 skips the
+  // newest 3 ([7,8,9]) and returns the next 3 going back: [4,5,6], in arrival
+  // order (oldest-of-the-page first, newest-of-the-page last) — same orientation
+  // as the newest-N window, just one page older.
+  const events = Array.from({ length: 10 }, (_, i) => ({ type: 'error', timestamp: i }));
+  const page0 = selectEvents(events, { limit: 3, offset: 0 });
+  const page1 = selectEvents(events, { limit: 3, offset: 3 });
+  assert.deepEqual(page0.map((e) => e.timestamp), [7, 8, 9], 'page 0: newest 3');
+  assert.deepEqual(page1.map((e) => e.timestamp), [4, 5, 6], 'page 1: the 3 before the newest 3');
+  // The pages do NOT overlap — page1's newest (6) is immediately older than
+  // page0's oldest (7). No match is silently duplicated across pages.
+  assert.equal(page1[page1.length - 1].timestamp, 6);
+  assert.equal(page0[0].timestamp, 7);
+});
+
+test('selectEvents: the last offset page is the OLDEST matches (a partial page shorter than N)', () => {
+  // 10 matches, limit=3: pages are [7,8,9] / [4,5,6] / [1,2,3] / [0]. The final
+  // page is the single oldest match — shorter than N, never padded or wrapped.
+  const events = Array.from({ length: 10 }, (_, i) => ({ type: 'error', timestamp: i }));
+  const last = selectEvents(events, { limit: 3, offset: 9 });
+  assert.deepEqual(last.map((e) => e.timestamp), [0], 'offset=9 skips the newest 9, leaves the oldest 1');
+});
+
+test('selectEvents: offset >= filtered.length → [] (no older page to show)', () => {
+  // Once the offset skips to or past the end of the matched set, the page is
+  // empty — bounded and explicit, never a negative-range slice. This is the
+  // clean stop a maintainer hits when paging past every match.
+  const events = Array.from({ length: 10 }, (_, i) => ({ type: 'error', timestamp: i }));
+  assert.deepEqual(selectEvents(events, { limit: 3, offset: 10 }), [], 'offset === length → []');
+  assert.deepEqual(selectEvents(events, { limit: 3, offset: 11 }), [], 'offset > length → []');
+  assert.deepEqual(selectEvents(events, { limit: 3, offset: 1000 }), [], 'offset far past end → []');
+});
+
+test('selectEvents: a missing / non-finite / non-positive offset → 0 (the newest-N page)', () => {
+  // Mirror of the limit guard test (limit=0 → default). A bad offset never skips
+  // anything — it lands on page 0, the newest-N window. Template: the limit guard
+  // tests at the "missing / non-finite / non-positive limit → default" case.
+  const events = Array.from({ length: 10 }, (_, i) => ({ type: 'error', timestamp: i }));
+  const newest3 = [7, 8, 9];
+  for (const bad of [undefined, null, 0, -5, -0.5, NaN, 'nope', Infinity, -Infinity]) {
+    assert.deepEqual(
+      selectEvents(events, { limit: 3, offset: bad }).map((e) => e.timestamp),
+      newest3,
+      `offset=${JSON.stringify(bad)} → 0 (newest-N)`
+    );
+  }
+});
+
+test('selectEvents: a fractional offset is floored (skip the floored count, never a partial skip)', () => {
+  // offset=2.9 floors to 2: skip the newest 2 ([8,9]), take the next 3 ([5,6,7]).
+  // Same floor discipline as `limit`. (offset=0.5 floors to 0 → newest-N — a
+  // sub-1 fraction skips nothing, grouped with the guard case in spirit.)
+  const events = Array.from({ length: 10 }, (_, i) => ({ type: 'error', timestamp: i }));
+  assert.deepEqual(
+    selectEvents(events, { limit: 3, offset: 2.9 }).map((e) => e.timestamp),
+    [5, 6, 7],
+    'offset=2.9 floors to 2 → skip [8,9], take [5,6,7]'
+  );
+  assert.deepEqual(
+    selectEvents(events, { limit: 3, offset: 2.9 }),
+    selectEvents(events, { limit: 3, offset: 2 }),
+    'offset=2.9 === offset=2 (floor discipline)'
+  );
+  assert.deepEqual(
+    selectEvents(events, { limit: 3, offset: 0.5 }).map((e) => e.timestamp),
+    [7, 8, 9],
+    'offset=0.5 floors to 0 → newest-N'
+  );
+});
+
+test('selectEvents: a pathological offset is CLAMPED to filtered.length (never a giant slice, never wraps)', () => {
+  // A hostile / typo'd offset=1e9 must not allocate a huge slice nor wrap around
+  // to return matches — it clamps to filtered.length and then the past-end guard
+  // returns []. (Mirrors limit's "above the cap clamps to the cap" discipline.)
+  const events = Array.from({ length: 10 }, (_, i) => ({ type: 'error', timestamp: i }));
+  assert.deepEqual(selectEvents(events, { limit: 3, offset: 1e9 }), [], '1e9 clamps to length → []');
+  // And clamping reaches the OLDEST partial page when the offset lands just past
+  // a whole page: offset=8 (10 matches, limit=3) → skips newest 8 → [0,1].
+  assert.deepEqual(
+    selectEvents(events, { limit: 3, offset: 8 }).map((e) => e.timestamp),
+    [0, 1],
+    'offset=8 → the 2 oldest (partial final page)'
+  );
+});
+
+test('selectEvents: the bound N stays ≤ EVENTS_LIMIT_MAX on EVERY offset page', () => {
+  // offset only selects WHICH bounded slice; it never grows the page. A large
+  // matched set paged at every offset must never exceed the 200-event cap.
+  const events = Array.from({ length: 847 }, (_, i) => ({ type: 'error', timestamp: i }));
+  for (const offset of [0, 100, 200, 400, 800]) {
+    const page = selectEvents(events, { offset });
+    assert.ok(
+      page.length <= EVENTS_LIMIT_MAX,
+      `offset=${offset} page (${page.length}) must not exceed the hard cap`
+    );
+  }
+});
+
+test('selectEvents: offset + ?type= pages the MATCHED set, not the unfiltered set', () => {
+  // 6 events alternating error/crash. Scoping to type=error yields 3 errors
+  // [err0, err2, err4]; paging that subset must skip/return only ERRORS — a
+  // naive offset over the unfiltered array would silently surface crashes.
+  const events = Array.from({ length: 6 }, (_, i) => ({
+    type: i % 2 === 0 ? 'error' : 'crash',
+    timestamp: i,
+  }));
+  // matched errors: [0,2,4] (length 3). offset=0 → newest 2 errors [2,4];
+  // offset=2 → skip newest 2 errors, leaves [0].
+  assert.deepEqual(
+    selectEvents(events, { type: 'error', limit: 2, offset: 0 }).map((e) => e.timestamp),
+    [2, 4],
+    'page 0 of the error subset'
+  );
+  assert.deepEqual(
+    selectEvents(events, { type: 'error', limit: 2, offset: 2 }).map((e) => e.timestamp),
+    [0],
+    'page 1 of the error subset (oldest error)'
+  );
+  assert.deepEqual(
+    selectEvents(events, { type: 'error', limit: 2, offset: 3 }),
+    [],
+    'past the end of the error subset → []'
+  );
+});
+
+test('selectEvents: offset + ?platform= pages the matched platform subset only', () => {
+  const events = Array.from({ length: 6 }, (_, i) => ({
+    type: 'error',
+    platform: i % 2 === 0 ? 'win32' : 'darwin',
+    timestamp: i,
+  }));
+  // matched win32: [0,2,4]. offset=2 → skip newest 2 win32 → [0].
+  assert.deepEqual(
+    selectEvents(events, { platform: 'win32', limit: 2, offset: 2 }).map((e) => e.timestamp),
+    [0],
+    'pages win32 only (never surfaces a darwin event)'
+  );
+});
+
+test('selectEvents: offset + ?appVersion= pages the matched release subset only', () => {
+  const events = Array.from({ length: 6 }, (_, i) => ({
+    type: 'error',
+    appVersion: i % 2 === 0 ? '0.1.19' : '0.1.20',
+    timestamp: i,
+  }));
+  // matched 0.1.19: [0,2,4]. offset=0 → newest 2 [2,4].
+  assert.deepEqual(
+    selectEvents(events, { appVersion: '0.1.19', limit: 2, offset: 0 }).map((e) => e.timestamp),
+    [2, 4],
+    'pages the 0.1.19 subset only'
+  );
+});
+
+test('selectEvents: offset + ?since= pages the matched time-window subset only', () => {
+  const events = Array.from({ length: 6 }, (_, i) => ({ type: 'error', timestamp: i * 100 }));
+  // since=250 keeps [300,400,500]. offset=2 → skip newest 2 ([400,500]) → [300].
+  assert.deepEqual(
+    selectEvents(events, { since: 250, limit: 2, offset: 2 }).map((e) => e.timestamp),
+    [300],
+    'pages the since-window subset only'
+  );
+});
+
+test('selectEvents: offset traverses the WHOLE matched set — every match reachable, no dups, no gaps', () => {
+  // The success criterion at the unit level: paging offset 0, N, 2N, … over a
+  // matched set reaches every match exactly once. 250 matches, page size 50:
+  // pages at offset 0,50,100,150,200 cover all 250 (last page is the oldest 50).
+  const events = Array.from({ length: 250 }, (_, i) => ({ type: 'error', timestamp: i }));
+  const seen = [];
+  for (let offset = 0; offset < 250; offset += 50) {
+    const page = selectEvents(events, { limit: 50, offset });
+    assert.ok(page.length <= EVENTS_LIMIT_MAX, `offset=${offset} bounded`);
+    seen.push(...page.map((e) => e.timestamp));
+    // The paging stop condition the handler echoes: offset + events.length.
+    if (offset + page.length >= 250) break;
+  }
+  // Every match reached exactly once — union is the full set, no duplicates.
+  assert.equal(seen.length, 250, 'every match paged exactly once');
+  assert.deepEqual([...seen].sort((a, b) => a - b), Array.from({ length: 250 }, (_, i) => i), 'no gaps');
+});
+
 // ── TYPE FILTER ───────────────────────────────────────────────────────────────
 
 test('selectEvents: ?type= filters to a single base type', () => {
@@ -860,13 +1065,23 @@ test('GET /events: total reflects the FULL persisted count, independent of the b
   assert.equal(body.events.length, EVENTS_LIMIT_DEFAULT, 'events = bounded window');
 });
 
-test('GET /events on an empty/missing store → 200 { events: [], total: 0 } (parity with /summary)', async () => {
+test('GET /events on an empty/missing store → 200 with the additive matched/limit/offset shape (parity with /summary)', async () => {
+  // The response is STRICTLY ADDITIVE (WARDEN-755): the pre-existing
+  // { events, total } shape gains matched / limit / offset and nothing else
+  // changes. An empty store: matched=0 (no filter could match), limit echoes
+  // the resolved default (no ?limit= given), offset echoes 0 (no ?offset=).
   const store = readableStore([]);
   const handler = createRequestHandler({ store });
   const res = fakeRes();
   await handler(fakeReq({ url: '/events' }), res);
   assert.equal(res.statusCode, 200);
-  assert.deepEqual(JSON.parse(res.body), { events: [], total: 0 });
+  assert.deepEqual(JSON.parse(res.body), {
+    events: [],
+    total: 0,
+    matched: 0,
+    limit: EVENTS_LIMIT_DEFAULT,
+    offset: 0,
+  });
 });
 
 // ── ?limit= honored + capped at 200 ───────────────────────────────────────────
