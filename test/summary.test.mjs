@@ -603,3 +603,56 @@ test('timeline: an event lacking receivedAt still reads via the timestamp fallba
   );
   assert.deepEqual(t.buckets, [{ bucketStart: 150, bucketEnd: 160, count: 1 }]);
 });
+
+// ── TIME WINDOW — clock-skew robustness via receivedAt (WARDEN-692 / WARDEN-738) ─
+// The `firstSeen`/`lastSeen` overview bounds key off the RECEIVER's `receivedAt`
+// (falling back to the client `timestamp`), the SAME effective time the timeline
+// / retention / ?since surfaces already use — completing the WARDEN-692 cutover
+// for the last skew-broken /summary signal. A skewed client clock can no longer
+// push `lastSeen` into the future or drag `firstSeen` into the past, so the
+// overview bounds now agree with the receivedAt-keyed `timeline` on the SAME
+// response (no more "timeline spikes now, lastSeen points to 2099" contradiction).
+
+test('firstSeen/lastSeen: a future client timestamp does NOT push lastSeen beyond receivedAt', () => {
+  // A fast-clock client stamped `timestamp` far in the future, but the receiver
+  // saw the batch at receivedAt=200. Keyed off receivedAt, lastSeen tracks the
+  // receiver's clock (200) — NOT the client's skewed future (the prior
+  // timestamp-only keying would have set lastSeen to the bogus future value).
+  const s = summarize([
+    { ...validError, timestamp: 100, receivedAt: 100 },
+    { ...validError, timestamp: 4_000_000_000, receivedAt: 200 },
+  ]);
+  assert.equal(s.firstSeen, 100);
+  assert.equal(
+    s.lastSeen, 200,
+    'lastSeen is the receiver receipt time, not the future client timestamp'
+  );
+});
+
+test('firstSeen/lastSeen: a past client timestamp does NOT drag firstSeen below receivedAt', () => {
+  // A slow-clock client stamped `timestamp` in the distant past (0), but the
+  // receiver saw the batch at receivedAt=6000. Keyed off receivedAt, firstSeen
+  // tracks the receiver's clock — NOT the client's skewed past (the prior
+  // timestamp-only keying would have dragged firstSeen down to 0).
+  const s = summarize([
+    { ...validError, timestamp: 5_000, receivedAt: 5_000 },
+    { ...validError, timestamp: 0, receivedAt: 6_000 },
+  ]);
+  assert.equal(
+    s.firstSeen, 5_000,
+    'firstSeen is the receiver receipt time, not the past client timestamp'
+  );
+  assert.equal(s.lastSeen, 6_000);
+});
+
+test('firstSeen/lastSeen: an event lacking receivedAt still reads via the timestamp fallback (graceful backfill, no migration)', () => {
+  // A pre-annotation persisted event (no receivedAt) alongside a receivedAt-
+  // annotated one: the legacy event falls back to its client `timestamp`, so it
+  // still contributes to the bounds unchanged — old surfaces never go blank.
+  const s = summarize([
+    { ...validError, timestamp: 10 }, // no receivedAt → effective time = 10
+    { ...validError, timestamp: 90, receivedAt: 90 },
+  ]);
+  assert.equal(s.firstSeen, 10);
+  assert.equal(s.lastSeen, 90);
+});

@@ -250,9 +250,18 @@ export function summarize(events) {
       if (existing) existing.count += 1;
       else signatureCounts.set(key, { signature, type, count: 1 });
     }
-    if (typeof timestamp === 'number' && Number.isFinite(timestamp)) {
-      if (firstSeen === null || timestamp < firstSeen) firstSeen = timestamp;
-      if (lastSeen === null || timestamp > lastSeen) lastSeen = timestamp;
+    // Time bounds key off the RECEIVER's `receivedAt` (when IT saw the batch,
+    // WARDEN-692) and fall back to the client's `timestamp` only when
+    // `receivedAt` is absent — so a skewed client clock can no longer push
+    // `lastSeen` into the future (or drag `firstSeen` into the past), exactly
+    // the skew-robustness the timeline / retention / ?since surfaces already
+    // have (summarizeTimeline / store applyRetention / selectEvents). Old
+    // persisted events (pre-annotation, no receivedAt) still read via the
+    // fallback, so nothing regresses and no migration is needed.
+    const when = event.receivedAt ?? timestamp;
+    if (typeof when === 'number' && Number.isFinite(when)) {
+      if (firstSeen === null || when < firstSeen) firstSeen = when;
+      if (lastSeen === null || when > lastSeen) lastSeen = when;
     }
   }
 
