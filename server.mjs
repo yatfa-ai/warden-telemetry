@@ -429,7 +429,13 @@ export function createRetentionTrigger(
 // The zeroed shape returned when no tally is wired OR no rejection has been
 // recorded yet — identical to a fresh tally's snapshot(), so an idle receiver
 // reads the same zeroed `rejections` whether or not the tally is wired (parity
-// with today's empty-store /summary: no false alarm on a quiet receiver).
+// with today's empty-store /summary: no false alarm on a quiet receiver). The
+// zeroed `timeline` (WARDEN-798) carries the SAME stable shape a wired tally's
+// empty snapshot does — `buckets: []` + the default `bucketMs` (24h / 48) — so
+// the field is shape-stable whether or not the tally is wired. `bucketMs`
+// conveys granularity (it is the default, NOT 0: only a degenerate config
+// override collapses it to 0, mirroring summarizeTimeline's empty-but-valid vs
+// degenerate distinction).
 const EMPTY_REJECTIONS = Object.freeze({
   total: 0,
   byStatus: {},
@@ -437,6 +443,10 @@ const EMPTY_REJECTIONS = Object.freeze({
   lastStatus: null,
   lastReason: null,
   lastSeen: null,
+  timeline: Object.freeze({
+    buckets: [],
+    bucketMs: DEFAULT_TIMELINE_WINDOW_MS / DEFAULT_TIMELINE_MAX_BUCKETS,
+  }),
 });
 
 /**
@@ -445,13 +455,37 @@ const EMPTY_REJECTIONS = Object.freeze({
  * behavior, exactly like an absent retention dep) with an injected `now` so the
  * tally is unit-testable with a fake clock (no real Date in tests).
  *
- * @param {{ now?: () => number }} [opts]
+ * WARDEN-798 extends the snapshot with a bounded `timeline` — a per-bucket COUNT
+ * of rejections over the SAME rolling window/granularity as the read-path
+ * `timeline` (summarizeTimeline, WARDEN-603) and the persistErrors timeline
+ * (WARDEN-777), so a maintainer reading `rejections.timeline` can tell an ONGOING
+ * schema-drift storm (415s still landing in the newest bucket) from a RESOLVED one
+ * (415s clustered in older buckets, newest bucket empty) — the spike-vs-baseline
+ * question `total + lastSeen` provably cannot answer for the roadmap's flagship
+ * risk (schema drift → a 415 flood).
+ *
+ * `maxBuckets` / `windowMs` default to the read-path `DEFAULT_TIMELINE_*` constants
+ * (imported from summary.mjs) so the two timelines never drift in granularity.
+ *
+ * @param {{ now?: () => number, maxBuckets?: number, windowMs?: number }} [opts]
  * @returns {{
  *   record(rec: { status: number, reason?: string, declaredVersion?: string }): void,
- *   snapshot(): { total: number, byStatus: Record<string, number>, byDeclaredVersion: Record<string, number>, lastStatus: number | null, lastReason: string | null, lastSeen: number | null }
+ *   snapshot(): {
+ *     total: number,
+ *     byStatus: Record<string, number>,
+ *     byDeclaredVersion: Record<string, number>,
+ *     lastStatus: number | null,
+ *     lastReason: string | null,
+ *     lastSeen: number | null,
+ *     timeline: { buckets: { bucketStart: number, bucketEnd: number, count: number }[], bucketMs: number },
+ *   }
  * }}
  */
-export function createRejectionTally({ now = Date.now } = {}) {
+export function createRejectionTally({
+  now = Date.now,
+  maxBuckets = DEFAULT_TIMELINE_MAX_BUCKETS,
+  windowMs = DEFAULT_TIMELINE_WINDOW_MS,
+} = {}) {
   let total = 0;
   const byStatus = {};
   const byDeclaredVersion = {};
@@ -459,11 +493,33 @@ export function createRejectionTally({ now = Date.now } = {}) {
   let lastReason = null;
   let lastSeen = null;
 
+  // Degenerate-config guard mirrors summarizeTimeline (summary.mjs:347-349) and
+  // the persistErrors tally (WARDEN-777): a bad windowMs/maxBuckets override
+  // collapses the timeline to { buckets: [], bucketMs: 0 } — never a huge/NaN
+  // array. The scalar tally (total/byStatus/byDeclaredVersion/lastStatus/
+  // lastReason/lastSeen) is unaffected and keeps working regardless.
+  const validConfig = Number.isFinite(windowMs) && windowMs > 0 && Number.isFinite(maxBuckets) && maxBuckets >= 1;
+  const bucketMs = validConfig ? windowMs / maxBuckets : 0;
+
+  // Counts keyed by ABSOLUTE epoch-aligned bucket slot (floor(when / bucketMs)).
+  // The tally records INCREMENTALLY — one record() at a time, NO retained event
+  // list (unlike summarizeTimeline, a PURE function over a retained event array
+  // with a SINGLE snapshot now()) — so it cannot re-derive buckets from events at
+  // snapshot time. Instead it keys counts by absolute slot and re-relativizes
+  // them against the CURRENT rolling window at snapshot(), dropping slots that
+  // have rolled off. Bounded at maxBuckets by construction: every surviving slot
+  // maps to a relative idx clamped to [0, maxBuckets-1] (mirroring
+  // summarizeTimeline's top-boundary fold), so a sustained drift storm cannot grow
+  // the bucket count.
+  const counts = new Map();
+
   return {
-    /** Record one rejection. Bounded: accumulates a per-status COUNT and tracks
-     *  only the single most-recent {status, reason, ts} — never one entry per call.
-     *  When `declaredVersion` is present (only 415s carry one), buckets
-     *  `String(declaredVersion)` into `byDeclaredVersion` — the drift population. */
+    /** Record one rejection. Bounded: accumulates a per-status COUNT, tracks only
+     *  the single most-recent {status, reason, ts}, and bumps the count in the
+     *  absolute time-bucket the rejection landed in (the timeline's per-bucket
+     *  distribution). When `declaredVersion` is present (only 415s carry one),
+     *  buckets `String(declaredVersion)` into `byDeclaredVersion` — the drift
+     *  population. */
     record({ status, reason, declaredVersion } = {}) {
       if (status == null) return;
       const key = String(status);
@@ -482,12 +538,49 @@ export function createRejectionTally({ now = Date.now } = {}) {
       }
       lastStatus = status;
       lastReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
-      lastSeen = now();
+      // A SINGLE now() read (WARDEN-798) serves both lastSeen and the timeline
+      // slot — one clock read per rejection, never two.
+      const ts = now();
+      lastSeen = ts;
+      if (validConfig) {
+        const slot = Math.floor(ts / bucketMs);
+        counts.set(slot, (counts.get(slot) ?? 0) + 1);
+      }
     },
     /** A stable point-in-time copy of the aggregate (a later record does not mutate
-     *  a previously-returned snapshot). */
+     *  a previously-returned snapshot). The `timeline` re-relativizes the absolute
+     *  per-bucket counts against the current rolling window — buckets older than
+     *  the window have rolled off and are dropped (and garbage-collected from the
+     *  map so a long-lived receiver cannot leak slots without bound). */
     snapshot() {
-      return { total, byStatus: { ...byStatus }, byDeclaredVersion: { ...byDeclaredVersion }, lastStatus, lastReason, lastSeen };
+      if (!validConfig) {
+        return { total, byStatus: { ...byStatus }, byDeclaredVersion: { ...byDeclaredVersion }, lastStatus, lastReason, lastSeen, timeline: { buckets: [], bucketMs: 0 } };
+      }
+      const currentTime = now();
+      const windowStart = currentTime - windowMs;
+      // Re-relativize each absolute slot against the current window (mirrors
+      // summarizeTimeline's idx math, summary.mjs:372-376) and merge into relative
+      // buckets. Rolled-off slots (idx < 0) are deleted for good — a record can
+      // never re-enter a slot whose time has passed, so dropping them on read
+      // bounds the map at ≤ maxBuckets without losing signal.
+      const relative = new Map();
+      for (const [slot, count] of counts) {
+        const bucketStart = slot * bucketMs; // a representative time inside the slot
+        let idx = Math.floor((bucketStart - windowStart) / bucketMs);
+        if (idx < 0) {
+          counts.delete(slot); // rolled off the window — drop for good (memory bound)
+          continue;
+        }
+        if (idx >= maxBuckets) idx = maxBuckets - 1; // fold the top boundary into the newest bucket
+        relative.set(idx, (relative.get(idx) ?? 0) + count);
+      }
+      const buckets = [...relative.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([idx, count]) => {
+          const bucketStart = windowStart + idx * bucketMs;
+          return { bucketStart, bucketEnd: bucketStart + bucketMs, count };
+        });
+      return { total, byStatus: { ...byStatus }, byDeclaredVersion: { ...byDeclaredVersion }, lastStatus, lastReason, lastSeen, timeline: { buckets, bucketMs } };
     },
   };
 }

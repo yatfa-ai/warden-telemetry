@@ -112,7 +112,13 @@ curl http://localhost:7421/summary
 #     "byDeclaredVersion": { "3": 30, "5": 4 },  # 415 drift: declared schema version (enum-bounded, not free-text)
 #     "lastStatus": 415,
 #     "lastReason": "unsupported telemetry schema version...",  # receiver diagnostic, not a payload
-#     "lastSeen": 1720000099000
+#     "lastSeen": 1720000099000,
+#     "timeline": {                          # per-bucket rejection counts over the rolling 24h (WARDEN-798)
+#       "buckets": [
+#         { "bucketStart": 1719998200000, "bucketEnd": 1720000000000, "count": 11 }  # the 415s are still landing in the newest bucket → ONGOING drift
+#       ],
+#       "bucketMs": 1800000                  # 30-min buckets — same window/granularity as the top-level timeline
+#     }
 #   },
 #   "persistErrors": {
 #     "total": 2,                            # count of accepted batches that failed to persist
@@ -163,13 +169,18 @@ extended-tier identifiers), exactly like `firstSeen`/`lastSeen`, and is never pe
 `rejections` is a bounded, in-memory tally of the requests the receiver **hard-rejected** — a `401` at the
 auth gate, a `404` routing miss, a `400` malformed body, or a `400`/`415`/`422` from schema validation. It
 reports a `total` count, a `byStatus` histogram, and the single most-recent sample (`lastStatus` /
-`lastReason` / `lastSeen`). It exists so you can tell **traffic is arriving and being rejected** (e.g. a
-flood of `415`s — typically the first observable symptom of a client/receiver schema-version skew) apart
-from **no traffic at all**: an idle receiver returns a zeroed `rejections` (`total: 0`, empty `byStatus`),
-identical to the empty-store shape, so a quiet receiver never looks like a rejecting one. `lastReason` is
-the receiver's own short diagnostic string — never raw event payloads or extended-tier identifiers. The
-tally is receiver-local and **does not survive a restart** (a misconfiguration detector need not), and it is
-purely additive: it records rejections that already happen, relaxes no check, and routes nothing anywhere.
+`lastReason` / `lastSeen`), plus a bounded `timeline` — per-bucket rejection counts over the same rolling
+24h window as the top-level `timeline` (WARDEN-798) — so you can tell an **ongoing** schema-drift storm
+(`415`s still landing in the newest bucket) from a **resolved** one (`415`s clustered in older buckets,
+newest bucket empty), which `total` + `lastSeen` alone cannot: a sustained drift flood and a spike that
+clients recovered from look identical without the per-bucket distribution. It exists so you can tell
+**traffic is arriving and being rejected** (e.g. a flood of `415`s — typically the first observable symptom
+of a client/receiver schema-version skew) apart from **no traffic at all**: an idle receiver returns a
+zeroed `rejections` (`total: 0`, empty `byStatus`), identical to the empty-store shape, so a quiet receiver
+never looks like a rejecting one. `lastReason` is the receiver's own short diagnostic string — never raw
+event payloads or extended-tier identifiers. The tally is receiver-local and **does not survive a restart**
+(a misconfiguration detector need not), and it is purely additive: it records rejections that already
+happen, relaxes no check, and routes nothing anywhere.
 
 `rejections.byDeclaredVersion` is the drift breakdown of those `415`s: a histogram of the DECLARED schema
 version (`x-telemetry-schema` header) on 415-rejected batches, e.g. `{ "3": 30, "5": 4 }`. During a
