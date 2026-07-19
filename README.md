@@ -171,6 +171,47 @@ than the window are excluded from the distribution but are still counted in `tot
 `firstSeen` / `lastSeen` (those span the full retained set); a quiet store returns `buckets: []` with the
 `bucketMs` granularity still conveyed. It is purely additive — computed on read, it collects nothing new.
 
+#### Scoping the aggregates — `?type=` / `?platform=` / `?appVersion=` / `?since=`
+
+Every aggregate above can be **scoped** to a platform / release / type / time window with the SAME
+conjunctive filters `GET /events` takes — the scoped-OVERVIEW complement to `/events`' scoped drill-down.
+Spot a `win32` spike or a `v0.1.18` volume bubble on `platforms` / `appVersions`, then scope `/summary`
+to answer the follow-through without hand-parsing `/events`:
+
+```bash
+curl 'http://localhost:7421/summary?platform=win32'
+# {
+#   "total": 42,                 # ALWAYS the full persisted count (the whole retained set)
+#   "matched": 17,               # the scoped subset the aggregates below were computed over (≤ total)
+#   "byType": { "error": 15, "crash": 2, "performance-stall": 0 },
+#   "platforms": { "win32": 17 },           # collapses to the scoped platform
+#   "topErrorNames": [{ "name": "TypeError", "count": 11 }, ...],   # win32-only
+#   "timeline": { ... },                     # win32 arrivals only
+#   ...
+# }
+
+# Intersect filters to attribute a regression end-to-end:
+curl 'http://localhost:7421/summary?appVersion=0.1.18&platform=darwin&type=crash'
+```
+
+- **`?type=`** — filter to one base type (`error` | `crash` | `performance-stall`). Exact match.
+- **`?platform=`** — filter to one OS label (`darwin` | `win32` | `linux`). Exact match; an event whose
+  source omitted the field is excluded (a maintainer asking "show me win32" does not want un-attributed
+  events).
+- **`?appVersion=`** — filter to one release label (e.g. `0.1.19`). Exact match.
+- **`?since=`** — keep only events whose effective epoch-ms time (`receivedAt` if present, else the
+  client's `timestamp`) is `>= since` (an absolute cutoff, inclusive). Keying off the receiver's receipt
+  time makes "since the deploy" robust to skewed client clocks.
+
+Filters are conjunctive (an event must match all that apply). `total` is ALWAYS the **full persisted
+count** (independent of any filter); `matched` is the size of the scoped subset, so you can see both the
+retained set and the slice the aggregates describe. `rejections` and `persistErrors` are intentionally
+**unscoped** — they describe receiver health (every rejection / persist site), not the event subset, so a
+platform filter never hides them. With no filters the response is the legacy unscoped aggregate
+(`matched === total`). The trust posture is unchanged: filters only SELECT which already-redacted,
+already-schema-validated events get aggregated — no new collection, no server-side redaction, no tier
+expansion; auth is inherited from the route's existing `AUTH_TOKEN` gate.
+
 ### Verifying the receiver is reachable — `GET /capabilities`
 
 The receiver advertises a small self-description so a Warden client can confirm it has pointed at a
