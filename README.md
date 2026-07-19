@@ -117,6 +117,10 @@ curl http://localhost:7421/summary
 #     "lastReason": "ENOSPC: no space left on device, write",   # store/sink diagnostic, not a payload
 #     "lastSeen": 1720000099000
 #   },
+#   "deduped": {
+#     "total": 7,                            # count of transport-retries the receiver absorbed
+#     "lastSeen": 1720000099000
+#   },
 #   "timeline": {
 #     "buckets": [
 #       { "bucketStart": 1719913600000, "bucketEnd": 1719915400000, "count": 2 },   # earlier baseline
@@ -162,6 +166,8 @@ purely additive. A persist failure is also returned to the client as a clean **r
 socket): the events were already schema-valid, the store may recover, and the client's existing 5xx
 bounded-retry path handles it without a protocol change.
 
+`deduped` is the transport-retry tally: a bounded, in-memory count of the batches the receiver **absorbed as duplicates** via idempotent ingest (WARDEN-666). When the warden client loses a 2xx (a network reset or a read timeout while the receiver did synchronous `appendFile` I/O under disk pressure), it retries the SAME bytes with the SAME `idempotency-key`; the receiver recognizes the key and answers `202 {accepted:0, deduped:true}` WITHOUT re-persisting — so a single crash retried ≤3× lands as ONE event, not 2–4. That correctness mechanism ran silently before this tally: nothing on the receiver recorded it. `deduped` reports a `total` count and the single most-recent `lastSeen`. It exists so you can tell **clients are retrying because my receiver is slow / the network is flaky** (a sustained dedup spike — the receiver's synchronous persist is the retry cause documented at the ingest path) apart from **traffic is flowing cleanly**: an idle receiver returns a zeroed `deduped`, identical to the healthy shape. It is also the only visible symptom of a client-side idempotency-key bug (one key reused across DIFFERENT batches → unique events wrongly absorbed), which would otherwise surface as mysteriously low `/summary` counts with no diagnostic. It carries a COUNT and a timestamp only — never a raw event payload or extended-tier identifier (a dedup absorbs a batch WITHOUT reading or re-persisting its bytes, so there is no payload path to leak; there is no `lastReason`, because a dedup is simply "a batch we'd already accepted came back"). Like `rejections` and `persistErrors`, it is receiver-local, does not survive a restart, and is purely additive — it records a dedup that already happened, relaxes no check (the dedup decision itself still ran), and routes nothing anywhere.
+
 `timeline` is a bounded temporal distribution — event **counts per time bucket** over a rolling recent
 window (the last 24h, split into at most 48 buckets of 30 min each) — so you can distinguish a **recent
 volume spike** (a regression or a deploy event — e.g. 15 errors landing in the newest bucket) from a
@@ -205,9 +211,9 @@ curl 'http://localhost:7421/summary?appVersion=0.1.18&platform=darwin&type=crash
 
 Filters are conjunctive (an event must match all that apply). `total` is ALWAYS the **full persisted
 count** (independent of any filter); `matched` is the size of the scoped subset, so you can see both the
-retained set and the slice the aggregates describe. `rejections` and `persistErrors` are intentionally
-**unscoped** — they describe receiver health (every rejection / persist site), not the event subset, so a
-platform filter never hides them. With no filters the response is the legacy unscoped aggregate
+retained set and the slice the aggregates describe. `rejections`, `persistErrors`, and `deduped` are
+intentionally **unscoped** — they describe receiver health (every rejection / persist / dedup site), not
+the event subset, so a platform filter never hides them. With no filters the response is the legacy unscoped aggregate
 (`matched === total`). The trust posture is unchanged: filters only SELECT which already-redacted,
 already-schema-validated events get aggregated — no new collection, no server-side redaction, no tier
 expansion; auth is inherited from the route's existing `AUTH_TOKEN` gate.

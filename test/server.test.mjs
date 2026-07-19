@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createDedupTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 
@@ -1917,6 +1917,269 @@ test('GET /summary?platform=win32 leaves retention UNSCOPED (receiver operationa
   assert.equal(body.retention.totalPruned, 1, 'retention survives the platform filter (unscoped)');
   assert.equal(body.retention.retainedCount, 2);
   assert.equal(body.retention.last.pruned, 1);
+});
+
+// ── DEDUP TALLY (WARDEN-752) ─────────────────────────────────────────────────
+// The transport-retry twin of the rejections / persistErrors tallies. WARDEN-666
+// built idempotent ingest: a client that lost a 2xx retries the SAME bytes with
+// the SAME idempotency-key, ingest() recognizes the key, and returns 202
+// {accepted:0, deduped:true} WITHOUT re-persisting (so one crash retried ≤3× lands
+// as ONE event). That correctness mechanism was invisible on the receiver — the
+// handler never inspected `result.body.deduped` and GET /summary had no `deduped`
+// field — so a maintainer could not tell "clients are retrying because my receiver
+// is slow / the network is flaky" from "traffic is flowing cleanly". This tally
+// closes that gap: it counts dedup HITS at the ONE detection site and surfaces a
+// bounded `{ total, lastSeen }` on GET /summary. Below: the tally is driven
+// directly with an INJECTED fake clock (mirroring the persistErrors tally unit
+// tests), then the handler is proven to record a dedup ONLY when a retry is
+// absorbed (seenKeys + deduped both wired), keep it a SEPARATE signal from
+// rejections / persistErrors, and stay BOUNDED. Still ZERO real fs, ZERO real
+// network — driven with fake req/res and a sink+source-sharing store (mirroring
+// the WARDEN-666 scenario).
+
+// Wire a handler to a sink+source-sharing store (appends become visible to later
+// reads) + a seenKeys set + a deduped tally with an INJECTED clock (so lastSeen is
+// deterministic). Mirrors wiringWithPersistErrors.
+function wiringWithDedup({ now } = {}) {
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const seenKeys = createSeenKeys();
+  const deduped = createDedupTally(now != null ? { now } : {});
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    seenKeys,
+    deduped,
+  });
+  return { handler, deduped, seenKeys, store };
+}
+
+// Drive GET /summary on the handler and return just the `deduped` aggregate.
+async function summaryDeduped(handler) {
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200, 'summary read must succeed to inspect the tally');
+  return JSON.parse(res.body).deduped;
+}
+
+test('deduped tally: a fresh tally snapshots to the zeroed shape (parity with a healthy receiver)', () => {
+  const tally = createDedupTally({ now: () => 0 });
+  assert.deepEqual(tally.snapshot(), {
+    total: 0,
+    lastSeen: null,
+  });
+});
+
+test('deduped tally: record() accumulates the total + tracks the most-recent occurrence', () => {
+  let clock = 1000;
+  const tally = createDedupTally({ now: () => clock });
+  tally.record();
+  clock = 2000;
+  tally.record();
+
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 2);
+  assert.equal(snap.lastSeen, 2000, 'lastSeen is the injected now() of the most-recent record');
+});
+
+test('deduped tally: snapshot() is a stable point-in-time copy — a later record does not mutate it', () => {
+  let clock = 5000;
+  const tally = createDedupTally({ now: () => clock });
+  tally.record();
+  const snap = tally.snapshot();
+  clock = 6000;
+  tally.record();
+  // the earlier snapshot is unchanged by the later record
+  assert.deepEqual(snap, { total: 1, lastSeen: 5000 });
+  // a fresh snapshot reflects the new state
+  assert.equal(tally.snapshot().total, 2);
+  assert.equal(tally.snapshot().lastSeen, 6000);
+});
+
+test('deduped tally: BOUNDED — many records never grow unbounded (one count, one sample; no per-dedup growth)', () => {
+  // Mirrors "persistErrors tally: BOUNDED". A dedup carries no diagnostic string,
+  // so the shape is the persistErrors shape MINUS `lastReason` — { total, lastSeen }.
+  // 1000 dedups must accumulate to a single COUNT + the single most-recent sample,
+  // never one entry per dedup.
+  let clock = 0;
+  const tally = createDedupTally({ now: () => (clock += 1) });
+  for (let i = 0; i < 1000; i++) {
+    tally.record();
+  }
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 1000);
+  assert.equal(snap.lastSeen, 1000, 'only the single most-recent lastSeen is retained');
+  assert.deepEqual(Object.keys(snap).sort(), ['lastSeen', 'total'], 'shape stays bounded — no per-dedup growth, no reason field');
+});
+
+test('deduped tally: record() ignores any argument — a dedup carries no diagnostic string', () => {
+  // A dedup is "a batch we'd already accepted came back" — there is no reason to
+  // record, so record() takes no payload. Passing one (defensively) must not leak
+  // into the snapshot as an unbounded/garbage field.
+  const tally = createDedupTally({ now: () => 0 });
+  tally.record('should be ignored');
+  tally.record({ anything: true });
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 2);
+  assert.deepEqual(Object.keys(snap).sort(), ['lastSeen', 'total'], 'no reason/payload field is retained');
+});
+
+// ── DEDUP AGGREGATE surfaced in GET /summary (WARDEN-752) ─────────────────────
+// A retried batch (same idempotency-key) is absorbed → recorded into the dedup
+// tally whose snapshot GET /summary reads. Driven through the handler with the
+// sink+source-sharing store; the tally persists across requests on the SAME
+// handler closure.
+
+test('a retried batch (same idempotency-key) increments /summary.deduped — transport-retry made visible', async () => {
+  // seenKeys + deduped both wired (mirrors createReceiver). The SAME bytes posted
+  // twice with the SAME key: the first accepts+persists, the second is a DEDUP.
+  let clock = 4242;
+  const { handler } = wiringWithDedup({ now: () => clock });
+  const headers = { ...schemaHeaders, 'idempotency-key': 'batch-retry' };
+
+  // First POST: accepted + persisted normally (NOT a dedup).
+  const r1 = fakeRes();
+  await handler(fakeReq({ headers, body: validBody }), r1);
+  assert.deepEqual(JSON.parse(r1.body), { accepted: 1 }, 'first post is a normal accept');
+
+  // Second POST — the retry (same key, identical bytes): a 202 DEDUP.
+  const r2 = fakeRes();
+  await handler(fakeReq({ headers, body: validBody }), r2);
+  assert.deepEqual(JSON.parse(r2.body), { accepted: 0, deduped: true }, 'the retry was deduped');
+
+  // The dedup tally counted exactly ONE transport-retry (the retry), not the first
+  // accept, and its lastSeen is the injected now() of the retry.
+  const ded = await summaryDeduped(handler);
+  assert.equal(ded.total, 1, 'the single deduped retry was recorded');
+  assert.equal(ded.lastSeen, 4242, 'lastSeen is the injected now() of the dedup');
+});
+
+test('a fresh accept (distinct keys, no retry) does NOT increment deduped (healthy traffic is never a dedup)', async () => {
+  // Two distinct-key batches both accept normally — neither is a retry, so the
+  // dedup tally must stay at zero.
+  const { handler } = wiringWithDedup({ now: () => 0 });
+  await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'A' }, body: validBody }), fakeRes());
+  await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'B' }, body: validBody }), fakeRes());
+
+  const ded = await summaryDeduped(handler);
+  assert.deepEqual(ded, { total: 0, lastSeen: null }, 'no retry → no dedup recorded');
+});
+
+test('deduped stays BOUNDED across many retries — one count + single most-recent lastSeen', async () => {
+  // Drive many dedups (one accept, then 49 retries of the SAME key); the tally must
+  // accumulate a COUNT and retain only the single most-recent lastSeen (mirroring
+  // the "persistErrors stay BOUNDED" test). lastSeen advances via the injected clock.
+  let clock = 0;
+  const { handler } = wiringWithDedup({ now: () => (clock += 1000) });
+  const headers = { ...schemaHeaders, 'idempotency-key': 'storm' };
+  // First post accepts (and does NOT touch the dedup tally's clock); the remaining
+  // 49 are deduped retries, each advancing the tally's now() by 1000.
+  for (let n = 0; n < 50; n++) {
+    await handler(fakeReq({ headers, body: validBody }), fakeRes());
+  }
+  const ded = await summaryDeduped(handler);
+  assert.equal(ded.total, 49, '49 retries were deduped (the first accept was not)');
+  assert.equal(ded.lastSeen, 49_000, 'lastSeen is the injected now() of the most-recent dedup (49 advances × 1000)');
+  assert.deepEqual(Object.keys(ded).sort(), ['lastSeen', 'total'], 'shape stays bounded — no per-dedup growth');
+});
+
+test('a dedup records into deduped, NOT into rejections or persistErrors (three separate signals)', async () => {
+  // A dedup is a distinct "transport-retry absorbed" class — it must not overload
+  // the rejection tally's HTTP-rejection-sites-only contract nor the persistErrors
+  // "validated but un-storable" contract. Wire ALL THREE tallies; a dedup bumps
+  // deduped and leaves rejections + persistErrors at zero.
+  let clock = 9000;
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const seenKeys = createSeenKeys();
+  const rejections = createRejectionTally({ now: () => clock });
+  const persistErrors = createPersistErrorTally({ now: () => clock });
+  const deduped = createDedupTally({ now: () => clock });
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    seenKeys,
+    rejections,
+    persistErrors,
+    deduped,
+  });
+  const headers = { ...schemaHeaders, 'idempotency-key': 'solo' };
+  await handler(fakeReq({ headers, body: validBody }), fakeRes()); // accept
+  await handler(fakeReq({ headers, body: validBody }), fakeRes()); // dedup
+
+  const summaryRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), summaryRes);
+  const body = JSON.parse(summaryRes.body);
+  assert.equal(body.deduped.total, 1, 'the deduped retry was recorded in its own tally');
+  assert.deepEqual(
+    body.rejections,
+    { total: 0, byStatus: {}, lastStatus: null, lastReason: null, lastSeen: null },
+    'rejections untouched — a dedup is not an HTTP rejection'
+  );
+  assert.deepEqual(
+    body.persistErrors,
+    { total: 0, lastReason: null, lastSeen: null },
+    'persistErrors untouched — a dedup is not a persist failure'
+  );
+});
+
+test('an idle receiver (no traffic) returns zeroed deduped in GET /summary (parity with today — no false alarm)', async () => {
+  const { handler } = wiringWithDedup();
+  const ded = await summaryDeduped(handler);
+  assert.deepEqual(ded, { total: 0, lastSeen: null });
+});
+
+test('GET /summary WITHOUT a wired deduped tally still returns a zeroed deduped field (backward-compatible additive shape)', async () => {
+  // A caller that does not pass a deduped tally still gets the field, zeroed — the
+  // handler is unchanged for callers that don't wire the tally, exactly like an
+  // absent persistErrors dep. Crucially: even when seenKeys IS wired, a dedup
+  // happens but is NOT recorded without a deduped tally (the recording is the
+  // single guarded switch), proving the tally is truly OPTIONAL.
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const seenKeys = createSeenKeys();
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, seenKeys }); // no deduped
+  const headers = { ...schemaHeaders, 'idempotency-key': 'unwired' };
+  await handler(fakeReq({ headers, body: validBody }), fakeRes()); // accept
+  const r2 = fakeRes();
+  await handler(fakeReq({ headers, body: validBody }), r2); // dedup (but not recorded)
+  assert.deepEqual(JSON.parse(r2.body), { accepted: 0, deduped: true }, 'a dedup still happens at the ingest seam');
+
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res.body).deduped, {
+    total: 0,
+    lastSeen: null,
+  });
+});
+
+test('a handler with NO seenKeys dep does NOT dedup, so deduped stays at zero (backward-compatible — today behavior)', async () => {
+  // No seenKeys wired → ingest() never returns deduped:true → the dedup tally is
+  // never bumped, regardless of whether a deduped tally is wired. An unwired
+  // receiver (or an old client that sends no key header) is unchanged.
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const deduped = createDedupTally({ now: () => 0 });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent }, deduped }); // no seenKeys
+  const headers = { ...schemaHeaders, 'idempotency-key': 'no-set' };
+  await handler(fakeReq({ headers, body: validBody }), fakeRes());
+  await handler(fakeReq({ headers, body: validBody }), fakeRes()); // both persist (no dedup)
+
+  const ded = await summaryDeduped(handler);
+  assert.deepEqual(ded, { total: 0, lastSeen: null }, 'no seenKeys → no dedup → tally stays zeroed');
 });
 
 // ── INGEST BODY CAP (WARDEN-627) ─────────────────────────────────────────────

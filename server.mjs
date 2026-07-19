@@ -649,6 +649,78 @@ export function createRetentionTally({ now = Date.now, maxEvents = 0, maxAgeMs =
   };
 }
 
+// ── DEDUP TALLY (WARDEN-752) ─────────────────────────────────────────────────
+// A bounded, in-memory, receiver-local tally of the transport-retries the
+// receiver ABSORBED via idempotent ingest (WARDEN-666). When the warden client
+// loses a 2xx (network reset / read timeout while the receiver did synchronous
+// appendFile I/O under disk pressure), it retries the SAME bytes with the SAME
+// idempotency-key; ingest() recognizes the key and returns 202 {accepted:0,
+// deduped:true} WITHOUT re-persisting. That is the correctness mechanism — a
+// single crash retried ≤3× lands as ONE event, not 2–4. But the receiver recorded
+// NOTHING about the dedup, so a maintainer self-hosting the receiver was blind to
+// it: the handler never inspected `result.body.deduped` and GET /summary had no
+// `deduped` field. A sustained dedup spike is actionable signal ("clients are
+// retrying because my receiver is slow / the network is flaky" vs "traffic is
+// flowing cleanly"), and it is also the only symptom of a client-side
+// idempotency-key bug (a key reused across DIFFERENT batches → unique events
+// wrongly absorbed), which would otherwise surface as mysteriously low /summary
+// counts with no diagnostic.
+//
+// Bounded means: a total count + a SINGLE most-recent `lastSeen` epoch-ms. A
+// dedup carries no diagnostic string — it is "a batch we'd already accepted came
+// back" — so the shape is the persistErrors shape MINUS `lastReason`. It does NOT
+// keep one record per dedup, so a sustained retry storm can't grow it. Like the
+// sibling tallies, it "persists nothing" — it is in-memory and receiver-local (a
+// transport-health signal need not survive a restart), and ADDITIVE ONLY: it
+// records a dedup that ALREADY happened, relaxes no check (handshake / validate /
+// auth / retention / body cap / the dedup decision itself all still run), mirrors
+// no invariant, routes nothing to a third party, and carries a COUNT and a
+// timestamp only — never a raw client payload or extended-tier identifier (a
+// dedup absorbs a batch WITHOUT reading or re-persisting its bytes, so there is
+// no payload path to leak).
+
+// The zeroed shape returned when no tally is wired OR no dedup has been recorded
+// yet — identical to a fresh tally's snapshot(), so a healthy receiver reads the
+// same zeroed `deduped` whether or not the tally is wired (parity with
+// EMPTY_REJECTIONS / EMPTY_PERSIST_ERRORS: no false alarm on a quiet receiver).
+const EMPTY_DEDUPED = Object.freeze({
+  total: 0,
+  lastSeen: null,
+});
+
+/**
+ * Build the dedup tally (WARDEN-752). Mirrors the injected-seam discipline of
+ * `createPersistErrorTally`: an OPTIONAL handler dep (no tally wired = today's
+ * behavior, exactly like an absent persistErrors dep) with an injected `now` so
+ * the tally is unit-testable with a fake clock (no real Date in tests).
+ *
+ * @param {{ now?: () => number }} [opts]
+ * @returns {{
+ *   record(): void,
+ *   snapshot(): { total: number, lastSeen: number | null }
+ * }}
+ */
+export function createDedupTally({ now = Date.now } = {}) {
+  let total = 0;
+  let lastSeen = null;
+
+  return {
+    /** Record one dedup hit. Bounded: accumulates a total COUNT and tracks only
+     *  the single most-recent `lastSeen` — never one entry per call. A dedup
+     *  carries no diagnostic string, so there is no reason sample (unlike the
+     *  rejections / persistErrors tallies). */
+    record() {
+      total += 1;
+      lastSeen = now();
+    },
+    /** A stable point-in-time copy of the aggregate (a later record does not mutate
+     *  a previously-returned snapshot). */
+    snapshot() {
+      return { total, lastSeen };
+    },
+  };
+}
+
 // ── SEEN-KEY DEDUP SET (WARDEN-666) ───────────────────────────────────────────
 // The receiver-local twin of the client's per-batch idempotency-key header. A
 // bounded, in-memory set of keys the receiver has ALREADY accepted a batch for,
@@ -818,6 +890,24 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * `createSeenKeys()`; no `seenKeys` dep = no dedup (backward-compatible with an old
  * client that sends no idempotency-key header).
  *
+ * `deduped` (optional tally, WARDEN-752): a bounded tally of the transport-retries
+ * the receiver ABSORBED via idempotent ingest. When `await ingest(...)` resolves
+ * with `result.body.deduped === true` — a retried batch whose 2xx was lost, whose
+ * idempotency-key ingest() recognized, so it returned 202 {accepted:0,
+ * deduped:true} WITHOUT re-persisting (the WARDEN-666 correctness mechanism) — the
+ * handler records it via `deduped.record()`. GET /summary reads
+ * `deduped.snapshot()` so a maintainer can tell "clients are retrying because my
+ * receiver is slow / the network is flaky" from "traffic is flowing cleanly", and
+ * so a client-side idempotency-key bug (one key reused across DIFFERENT batches →
+ * unique events wrongly absorbed) has a visible symptom instead of mysteriously
+ * low /summary counts. `deduped:true` cleanly distinguishes such a retry from a
+ * normal accept (`{accepted:n}` carries no `deduped` field) and from a rejection
+ * (`!result.ok`, recorded in `rejections`). The tally carries a COUNT and a
+ * timestamp only — never a raw client payload or extended-tier identifier (a dedup
+ * absorbs a batch WITHOUT reading or re-persisting its bytes, so there is no
+ * payload path to leak). No `deduped` dep = a zeroed `deduped` field on /summary
+ * and no recording — today's behavior, exactly like an absent persistErrors dep.
+ *
  * `now` (optional clock, default Date.now): passed THROUGH to `ingest()` as the
  * `receivedAt` stamp source (WARDEN-692). ingest() stamps each accepted event
  * with `now()` so the time-sensitive read surfaces (timeline / retention /
@@ -826,10 +916,10 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * seenKeys / retention-trigger factories) keeps the stamp unit-testable with a
  * fake clock; absent it defaults to Date.now.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void }, maxBodyBytes?: number, now?: () => number, retentionHealth?: { record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void, snapshot(): object } }} deps
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void }, deduped?: { record(): void, snapshot(): object }, maxBodyBytes?: number, now?: () => number, retentionHealth?: { record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void, snapshot(): object } }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, maxBodyBytes = 0, now = Date.now, retentionHealth } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, deduped, maxBodyBytes = 0, now = Date.now, retentionHealth } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
 
   // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
@@ -844,6 +934,12 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
   // dep is the single switch.
   const recordPersistError = (reason) => {
     if (persistErrors) persistErrors.record({ reason });
+  };
+  // Centralized dedup recorder: a guarded no-op when no tally is wired (today's
+  // behavior — no recording, exactly like an absent persistErrors dep). The single
+  // dedup-detection site below reads `recordDedup()`; the tally dep is the switch.
+  const recordDedup = () => {
+    if (deduped) deduped.record();
   };
   return async (req, res) => {
     // AUTH GATE — optional but, when authToken is set, the FIRST thing checked and
@@ -919,17 +1015,18 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           since: searchParams.has('since') ? Number(searchParams.get('since')) : undefined,
         });
         // Compose the bounded `rejections` tally, the bounded `persistErrors`
-        // tally, the bounded `retention` tally, AND the bounded `timeline`
-        // distribution here — NOT inside summarize(). summarize(filtered) stays a
-        // PURE single-arg function of the (already-filtered) event array
-        // (documented + tested that way); all four are handler-composed, exactly
-        // the way the retention TRIGGER is handler-injected rather than
-        // summarize-injected. `rejections`, `persistErrors`, and `retention` are
-        // each the tally's snapshot when wired, or their zeroed EMPTY_* shape
-        // otherwise (stable shape for every caller). They are intentionally
-        // UNSCOPED — they tally the REQUEST/OPERATIONAL seam (every rejection /
-        // persist site / retention prune on THIS receiver), NOT the event subset;
-        // a platform/release filter must not hide receiver-health signal.
+        // tally, the bounded `deduped` tally, the bounded `retention` tally, AND
+        // the bounded `timeline` distribution here — NOT inside summarize().
+        // summarize(filtered) stays a PURE single-arg function of the
+        // (already-filtered) event array (documented + tested that way); all five
+        // are handler-composed, exactly the way the retention TRIGGER is
+        // handler-injected rather than summarize-injected. `rejections`,
+        // `persistErrors`, `deduped`, and `retention` are each the tally's
+        // snapshot when wired, or their zeroed EMPTY_* shape otherwise (stable
+        // shape for every caller). They are intentionally UNSCOPED — they tally
+        // the REQUEST/OPERATIONAL seam (every rejection / persist site / dedup /
+        // retention prune on THIS receiver), NOT the event subset; a
+        // platform/release filter must not hide receiver-health signal.
         // `timeline` is ALWAYS computed — a pure read over the FILTERED events'
         // effective `receivedAt ?? timestamp`s measured back from the injected
         // `now` (default Date.now) — so the field is present for every caller,
@@ -954,6 +1051,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           rejections: rejections ? rejections.snapshot() : EMPTY_REJECTIONS,
           persistErrors: persistErrors ? persistErrors.snapshot() : EMPTY_PERSIST_ERRORS,
           retention: retentionHealth ? retentionHealth.snapshot() : EMPTY_RETENTION,
+          deduped: deduped ? deduped.snapshot() : EMPTY_DEDUPED,
           timeline: summarizeTimeline(filtered, { now }),
         });
       } catch (e) {
@@ -1115,6 +1213,21 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
       return sendJson(res, 503, { error: 'could not persist telemetry batch' });
     }
 
+    // DEDUP TALLY (WARDEN-752) — a transport-retry the receiver ABSORBED via
+    // idempotent ingest (WARDEN-666): the client lost a 2xx and re-sent the SAME
+    // bytes with the SAME idempotency-key, ingest() recognized the key, and
+    // returned 202 {accepted:0, deduped:true} WITHOUT re-persisting. `deduped:true`
+    // cleanly distinguishes such a retry from a normal accept ({accepted:n} carries
+    // no `deduped` field, ingest.mjs step 6) and from a rejection (`!result.ok`,
+    // recorded just below). This is the ONE detection site — the tally counts
+    // transport-retries so a maintainer reading GET /summary can tell "clients are
+    // retrying because my receiver is slow / the network is flaky" from "traffic is
+    // flowing cleanly". A persist failure (caught above) never reaches here, and an
+    // unwired `deduped` dep records nothing (guarded no-op). ADDITIVE ONLY: records
+    // a dedup that already happened, relaxes no check (the dedup decision itself
+    // still ran in ingest()), persists nothing.
+    if (result.body?.deduped === true) recordDedup();
+
     // REJECTIONS (WARDEN-591) — record the ingest-result rejections (400/415/422)
     // for the /summary tally. These are the rejections that come BACK from ingest()
     // as a `result`; the auth-gate 401, the 404, and the body-read 400 were already
@@ -1172,7 +1285,8 @@ export function createReceiver({
   const rejections = createRejectionTally();
   const persistErrors = createPersistErrorTally();
   const seenKeys = createSeenKeys();
-  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors, seenKeys, maxBodyBytes, retentionHealth });
+  const deduped = createDedupTally();
+  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors, seenKeys, deduped, maxBodyBytes, retentionHealth });
   const server = createServer(handler);
 
   // Periodic age-expiry sweep — ONLY when an age window is set. A quiet store
