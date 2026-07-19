@@ -574,6 +574,74 @@ test('GET /summary carries the timeline field for a handler wired WITHOUT an exp
   assert.equal(body.timeline.bucketMs, 1_800_000, 'bucketMs always conveyed');
 });
 
+// ── GET /summary.startedAt — the receiver boot timestamp (WARDEN-768) ─────────
+// A top-level epoch-ms recording when THIS receiver (re)booted, captured ONCE at
+// createRequestHandler construction (the handler owns the receiver's clock via its
+// `now` dep — the boot timestamp IS that clock at construction). It exists so a
+// maintainer reading the restart-wiped tallies (rejections / persistErrors /
+// retention / seenKeys — all in-memory and restart-wiped BY DESIGN per README) can
+// tell a healthy quiet receiver (startedAt = hours ago) from a crash-looping one
+// that zeroed every tally seconds ago (startedAt = seconds ago). Those two states
+// read byte-identical on /summary without this field. The frozen-at-boot contract
+// (now() called once at construction, never per-request) is the load-bearing
+// assertion below: a MUTATING fake clock is used so a per-request regression would
+// actually change startedAt between reads and trip the test. Driven with fake req/
+// res + an INJECTED readable store; ZERO real fs, ZERO real network — same seam as
+// the timeline tests above.
+
+test('GET /summary carries a top-level startedAt epoch-ms equal to the handler injected boot clock', async () => {
+  // Construct with a fixed fake clock = 86_400_000. startedAt is captured once at
+  // construction, so it must equal that boot instant exactly.
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(typeof body.startedAt, 'number', 'startedAt is a number (flat epoch-ms, like firstSeen/lastSeen)');
+  assert.equal(body.startedAt, 86_400_000, 'startedAt equals the boot instant (the injected clock at construction)');
+});
+
+test('GET /summary startedAt is frozen at boot — unchanged across a second read of the SAME handler', async () => {
+  // A MUTATING clock: each now() call advances by 1000. The handler calls now()
+  // ONCE at construction (startedAt = first value), then summarizeTimeline calls
+  // now() again per request. If startedAt were (wrongly) recomputed per request,
+  // the two reads would diverge — this assertion catches that regression.
+  let tick = 0;
+  const now = () => 86_400_000 + 1000 * tick++;
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store, now });
+  // first read (a "later" maintainer read of the same process)
+  const res1 = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res1);
+  const startedAt1 = JSON.parse(res1.body).startedAt;
+  // second read of the SAME handler instance
+  const res2 = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res2);
+  const startedAt2 = JSON.parse(res2.body).startedAt;
+  assert.equal(startedAt1, 86_400_000, 'first read reflects the boot instant (construction-time now())');
+  assert.equal(startedAt2, startedAt1, 'second read is IDENTICAL — now() was called once at boot, not per request');
+});
+
+test('GET /summary startedAt is a plausible epoch-ms under the DEFAULT real clock (backward-compatible shape)', async () => {
+  // A handler wired the production way — { store }, no `now` — captures the real
+  // boot instant. Bracket construction with Date.now() so the assertion is
+  // deterministic: startedAt must fall within [before, after] and be a finite
+  // positive epoch-ms (proving the field is ALWAYS present with a real value,
+  // never an absent key or null that would break a caller).
+  const store = readableStore([]);
+  const before = Date.now();
+  const handler = createRequestHandler({ store }); // no `now` → real clock (default)
+  const after = Date.now();
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const { startedAt } = JSON.parse(res.body);
+  assert.equal(typeof startedAt, 'number', 'startedAt is a number even under the default clock');
+  assert.ok(Number.isFinite(startedAt) && startedAt > 0, 'startedAt is a finite positive epoch-ms');
+  assert.ok(startedAt >= before && startedAt <= after, 'startedAt is the real boot instant (bracketed by handler construction)');
+});
+
 // ── SCOPED /summary — ?type= / ?platform= / ?appVersion= / ?since= (WARDEN-727) ─
 // The scoped-OVERVIEW complement to /events' scoped drill-down: the SAME conjunctive
 // filters select which ALREADY-redacted, ALREADY-validated events get aggregated, so

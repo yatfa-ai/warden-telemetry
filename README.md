@@ -105,6 +105,7 @@ curl http://localhost:7421/summary
 #   "schemaVersions": { "1": 42 },
 #   "firstSeen": 1719820800000,
 #   "lastSeen": 1720000000000,
+#   "startedAt": 1719980000000,                 # epoch-ms this receiver (re)booted — the observation window for the tallies below
 #   "rejections": {
 #     "total": 13,                          # count of hard-rejected requests
 #     "byStatus": { "415": 11, "401": 2 },  # histogram keyed by HTTP status
@@ -131,8 +132,22 @@ The response carries **counts and histograms only** — it never echoes raw even
 identifiers (chat/session names). `total` is the record count; `byType` is always the full
 `{ error, crash, performance-stall }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
 error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen`/`lastSeen` bound the
-observed time window (`null` on an empty store). A fresh receiver with no traffic returns `total: 0` with
-zeroed counters.
+observed time window (`null` on an empty store); `startedAt` is the epoch-ms at which **this receiver
+(re)booted**. A fresh receiver with no traffic returns `total: 0` with zeroed counters.
+
+`startedAt` is the key that makes the **restart-wiped** tallies below (`rejections`, `persistErrors`,
+`retention`, `seenKeys`) interpretable. All four are in-memory and zeroed on every restart BY DESIGN — a
+misconfiguration detector need not survive a restart. That design has a hole without `startedAt`: a
+maintainer reading `rejections.total = 0`, `persistErrors.total = 0` cannot tell a **healthy quiet
+receiver** (up for hours, genuinely saw zero rejections) from a **crash-looping one** that zeroed every
+tally — including the `415` flood that crashed it — seconds ago. The two states read byte-identical on
+`/summary`. `startedAt` closes that hole: read it alongside the tallies. A maintainer reading
+`rejections.total = 0` alongside `startedAt = <2 minutes ago>` knows the tally only covers 2 minutes, not
+that the receiver has been stably quiet; a `startedAt` of hours or days ago means the zeroed tallies
+genuinely reflect that whole window. `startedAt` is itself receiver-local and in-memory — it does **not**
+survive a restart, so after a restart it shows the **new** boot time, immediately self-documenting that the
+tallies were just zeroed. It is operational metadata about the process (an epoch-ms, never raw events or
+extended-tier identifiers), exactly like `firstSeen`/`lastSeen`, and is never persisted.
 
 `rejections` is a bounded, in-memory tally of the requests the receiver **hard-rejected** — a `401` at the
 auth gate, a `404` routing miss, a `400` malformed body, or a `400`/`415`/`422` from schema validation. It
