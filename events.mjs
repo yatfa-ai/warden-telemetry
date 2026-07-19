@@ -42,9 +42,17 @@ export const EVENTS_LIMIT_MAX = 200;
  *
  * Filters (all optional, all conjunctive — an event is kept iff it survives all
  * that apply):
- *   - `type`  — keep only events whose `type` matches (e.g. 'error' | 'crash' |
+ *   - `type`       — keep only events whose `type` matches (e.g. 'error' | 'crash' |
  *     'performance-stall'). A non-string / empty `type` applies no type filter.
- *   - `since` — keep only events whose effective epoch-ms time — `receivedAt` if
+ *   - `platform`   — keep only events whose `platform` OS label matches (one of
+ *     'darwin' | 'win32' | 'linux', WARDEN-684). Exact match; an event whose source
+ *     omitted the field (`platform === undefined`) is excluded — a maintainer asking
+ *     "show me win32" does not want un-attributed events (mirrors `type` semantics
+ *     exactly). A non-string / empty `platform` applies no filter.
+ *   - `appVersion` — keep only events whose `appVersion` release label matches
+ *     (e.g. '0.1.19', WARDEN-665). Exact match; same omit-excluded + guard
+ *     semantics as `platform`.
+ *   - `since`      — keep only events whose effective epoch-ms time — `receivedAt` if
  *     present (WARDEN-692), else the client's `timestamp` — is `>= since` (an
  *     ABSOLUTE cutoff). A non-finite `since` applies no time filter; an event
  *     without a finite effective time does not satisfy the window (dropped by the
@@ -65,10 +73,10 @@ export const EVENTS_LIMIT_MAX = 200;
  * array. The handler composes it, exactly as it composes `summarize()`.
  *
  * @param {object[]} [events]
- * @param {{ limit?: number, type?: string, since?: number }} [opts]
+ * @param {{ limit?: number, type?: string, since?: number, platform?: string, appVersion?: string }} [opts]
  * @returns {object[]}
  */
-export function selectEvents(events, { limit, type, since } = {}) {
+export function selectEvents(events, { limit, type, since, platform, appVersion } = {}) {
   // Skip-robust up front (mirrors summarize()): drop non-object entries so a
   // partial read or shape drift never crashes the read.
   let list = (Array.isArray(events) ? events : []).filter((e) => e && typeof e === 'object');
@@ -77,6 +85,21 @@ export function selectEvents(events, { limit, type, since } = {}) {
   // filter (the common case: no ?type= query param).
   if (typeof type === 'string' && type.length > 0) {
     list = list.filter((e) => e.type === type);
+  }
+
+  // Platform filter — exact match on the OS label (WARDEN-684). A non-string /
+  // empty platform applies no filter (the common case: no ?platform= param). An
+  // event whose source omitted the field (`platform === undefined`) correctly
+  // fails the match and is excluded — a maintainer asking "show me win32" does not
+  // want un-attributed events (mirrors ?type= semantics exactly).
+  if (typeof platform === 'string' && platform.length > 0) {
+    list = list.filter((e) => e.platform === platform);
+  }
+
+  // appVersion filter — exact match on the release label (WARDEN-665). Same guard
+  // and omit-excluded semantics as `platform`.
+  if (typeof appVersion === 'string' && appVersion.length > 0) {
+    list = list.filter((e) => e.appVersion === appVersion);
   }
 
   // Since filter — keep events whose effective time (receivedAt if present,

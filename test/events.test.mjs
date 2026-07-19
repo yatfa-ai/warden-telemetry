@@ -199,6 +199,69 @@ test('selectEvents: a non-string / empty type applies NO type filter', () => {
   assert.equal(selectEvents(all, { type: 123 }).length, 3);
 });
 
+// ── PLATFORM + APPVERSION FILTERS (WARDEN-665 / WARDEN-684) ──────────────────
+// Mirror ?type= exactly: exact-match string filters over ALREADY-persisted
+// non-identifying labels. The canonical fixtures do NOT carry platform/appVersion
+// (a v3 source may legitimately omit them), so they are spread in — exactly as the
+// ?since= tests spread `timestamp` into the fixtures.
+
+test('selectEvents: ?platform= filters to a single OS label', () => {
+  const events = [
+    { ...validError, platform: 'win32' },
+    { ...validCrash, platform: 'darwin' },
+    { ...validStall, platform: 'win32' },
+  ];
+  const out = selectEvents(events, { platform: 'win32' });
+  assert.equal(out.length, 2);
+  assert.ok(out.every((e) => e.platform === 'win32'));
+  assert.equal(out[0].type, 'error');
+  assert.equal(out[1].type, 'performance-stall');
+});
+
+test('selectEvents: ?appVersion= filters to a single release label', () => {
+  const events = [
+    { ...validError, appVersion: '0.1.19' },
+    { ...validCrash, appVersion: '0.1.20' },
+    { ...validStall, appVersion: '0.1.19' },
+  ];
+  const out = selectEvents(events, { appVersion: '0.1.19' });
+  assert.equal(out.length, 2);
+  assert.ok(out.every((e) => e.appVersion === '0.1.19'));
+});
+
+test('selectEvents: a non-matching platform yields [] (the filter is exact, not "contains")', () => {
+  const events = [
+    { ...validError, platform: 'win32' },
+    { ...validCrash, platform: 'darwin' },
+  ];
+  assert.deepEqual(selectEvents(events, { platform: 'linux' }), []);
+});
+
+test('selectEvents: ?platform= excludes events whose source OMITTED the field (undefined !== "win32")', () => {
+  // A v3 event from a source that cannot read process.platform legitimately omits
+  // the field (schema WARDEN-684). It has platform === undefined, which correctly
+  // fails === 'win32' — a maintainer asking "show me win32" does not want
+  // un-attributed events (mirrors ?type= semantics exactly).
+  const events = [
+    { ...validError, platform: 'win32' },
+    validCrash, // no platform field
+  ];
+  const out = selectEvents(events, { platform: 'win32' });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].platform, 'win32');
+});
+
+test('selectEvents: a non-string / empty platform applies NO platform filter', () => {
+  const all = [
+    { ...validError, platform: 'win32' },
+    { ...validCrash, platform: 'darwin' },
+    { ...validStall, platform: 'linux' },
+  ];
+  assert.equal(selectEvents(all, { platform: undefined }).length, 3);
+  assert.equal(selectEvents(all, { platform: '' }).length, 3);
+  assert.equal(selectEvents(all, { platform: 123 }).length, 3);
+});
+
 // ── SINCE FILTER (absolute epoch-ms cutoff) ───────────────────────────────────
 
 test('selectEvents: ?since= keeps events with timestamp >= since (inclusive lower bound)', () => {
@@ -294,6 +357,25 @@ test('selectEvents: type + since are conjunctive, then newest-N is taken from th
   assert.deepEqual(
     out.map((e) => e.name),
     ['e3']
+  );
+});
+
+test('selectEvents: platform + type + since are conjunctive, then newest-N is taken from the matches', () => {
+  // Of the matches, the newest N are returned. platform narrows within type, and
+  // since narrows within that — all three must hold (mirrors the type + since
+  // composition test directly above).
+  const events = [
+    { type: 'crash', platform: 'win32', timestamp: 50, reason: 'old-win-crash' },
+    { type: 'crash', platform: 'darwin', timestamp: 100, reason: 'mac-crash' },
+    { type: 'crash', platform: 'win32', timestamp: 200, reason: 'win-crash-1' },
+    { type: 'crash', platform: 'win32', timestamp: 300, reason: 'win-crash-2' },
+  ];
+  // type=crash AND platform=win32 AND since=150 → [win-crash-1, win-crash-2];
+  // newest 1 → [win-crash-2].
+  const out = selectEvents(events, { type: 'crash', platform: 'win32', since: 150, limit: 1 });
+  assert.deepEqual(
+    out.map((e) => e.reason),
+    ['win-crash-2']
   );
 });
 
@@ -487,6 +569,60 @@ test('GET /events: ?type=performance-stall filters to that type', async () => {
   assert.equal(body.events.length, 2);
   assert.ok(body.events.every((e) => e.type === 'performance-stall'));
   assert.equal(body.total, 4, 'total is the full set across all types');
+});
+
+// ── ?platform= / ?appVersion= filters (WARDEN-665 / WARDEN-684) ───────────────
+
+test('GET /events: ?platform=win32 returns only win32 events; total is the full set across all platforms', async () => {
+  // Mirrors the ?type= handler test: the window is filtered, but `total` stays the
+  // FULL persisted count so a maintainer sees how much the window is a window OF.
+  const store = readableStore([
+    { ...validError, platform: 'win32' },
+    { ...validCrash, platform: 'darwin' },
+    { ...validStall, platform: 'win32' },
+    { ...validError, platform: 'darwin', name: 'mac-err' },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ url: '/events?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.events.length, 2);
+  assert.ok(body.events.every((e) => e.platform === 'win32'));
+  assert.equal(body.total, 4, 'total is the full set across all platforms');
+});
+
+test('GET /events: ?appVersion=0.1.19 returns only that release label', async () => {
+  const store = readableStore([
+    { ...validError, appVersion: '0.1.19' },
+    { ...validCrash, appVersion: '0.1.20' },
+    { ...validStall, appVersion: '0.1.19' },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ url: '/events?appVersion=0.1.19' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.events.length, 2);
+  assert.ok(body.events.every((e) => e.appVersion === '0.1.19'));
+  assert.equal(body.total, 3, 'total is the full persisted count');
+});
+
+test('GET /events: ?type=crash&platform=win32 composes (conjunctive)', async () => {
+  // Mirrors the ?type=error&since=200 composition test — all filters combine.
+  const store = readableStore([
+    { ...validError, platform: 'win32' },
+    { ...validCrash, platform: 'darwin' },
+    { ...validCrash, platform: 'win32', reason: 'win-oom' },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ url: '/events?type=crash&platform=win32' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.events.length, 1);
+  assert.equal(body.events[0].type, 'crash');
+  assert.equal(body.events[0].platform, 'win32');
+  assert.equal(body.events[0].reason, 'win-oom');
 });
 
 // ── ?since= filter ────────────────────────────────────────────────────────────
