@@ -115,7 +115,13 @@ curl http://localhost:7421/summary
 #   "persistErrors": {
 #     "total": 2,                            # count of accepted batches that failed to persist
 #     "lastReason": "ENOSPC: no space left on device, write",   # store/sink diagnostic, not a payload
-#     "lastSeen": 1720000099000
+#     "lastSeen": 1720000099000,
+#     "timeline": {                          # per-bucket failure counts over the rolling 24h (WARDEN-777)
+#       "buckets": [
+#         { "bucketStart": 1719998200000, "bucketEnd": 1720000000000, "count": 2 }   # both failures clustered in one recent bucket
+#       ],
+#       "bucketMs": 1800000                  # 30-min buckets — same window/granularity as the top-level timeline
+#     }
 #   },
 #   "deduped": {
 #     "total": 7,                            # count of transport-retries the receiver absorbed
@@ -154,7 +160,12 @@ every other request — see below.
 `persistErrors` is the write-path twin of `rejections`: a bounded, in-memory tally of the accepted batches
 that **validated but could not be persisted** — a persist failure (`store.appendEvents()` throwing: disk
 full, `EACCES`, `EISDIR`, a missing/rewritten store file, a sink rejection). It reports a `total` count and
-the single most-recent sample (`lastReason` / `lastSeen`). It exists so you can tell **traffic is arriving,
+the single most-recent sample (`lastReason` / `lastSeen`), plus a bounded `timeline` — per-bucket failure
+counts over the same rolling 24h window as the top-level `timeline` (WARDEN-777) — so you can tell an
+**ongoing** store outage (failures still landing in the newest bucket) from a **resolved** one (failures
+clustered in older buckets, newest bucket empty), which `total` + `lastSeen` alone cannot: a sustained
+outage and a spike that recovered look identical without the per-bucket distribution. It exists so you can
+tell **traffic is arriving,
 validating, but the store is refusing writes** apart from **no traffic at all**: an idle receiver returns a
 zeroed `persistErrors`, identical to the healthy shape. It is a **separate signal** from `rejections` by
 design — a persist failure is a distinct "validated but un-storable" class, not an HTTP rejection, so it does
