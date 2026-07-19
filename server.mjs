@@ -941,6 +941,28 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
 export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, deduped, maxBodyBytes = 0, now = Date.now, retentionHealth } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
 
+  // Boot timestamp (WARDEN-768): captured ONCE here at handler construction
+  // (the receiver's clock at boot) and frozen for the process — NOT re-read per
+  // request. Emitted as a top-level epoch-ms on GET /summary so a maintainer
+  // reading the restart-wiped tallies (rejections / persistErrors / retention /
+  // seenKeys) can tell a healthy quiet receiver (startedAt = hours ago, so the
+  // zeroed tallies genuinely mean "no rejections in that whole window") apart
+  // from a crash-looping one that zeroed every tally seconds ago (startedAt =
+  // seconds ago). Those two states read byte-identical on /summary without this
+  // field — the exact silent-empty-state hole the tallies were added to close,
+  // applied to the restart boundary they themselves create. Captured HERE
+  // (createRequestHandler) rather than createReceiver because the handler
+  // already owns the receiver's clock via its `now` dep (default Date.now,
+  // documented above as "the RECEIVER's clock … kept unit-testable with a fake
+  // clock") — the boot timestamp IS that clock at construction, so this reuses
+  // the existing injected-clock seam (the same `now: () => 86_400_000` pattern
+  // used ~10× in test/server.test.mjs) with no createReceiver signature change.
+  // Like the tallies it disambiguates, startedAt is receiver-local and
+  // in-memory (captured once, never persisted) — it intentionally does NOT
+  // survive a restart; after a restart it reflects the NEW boot, immediately
+  // self-documenting that the tallies were just zeroed.
+  const startedAt = now();
+
   // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
   // behavior — no recording, exactly like an absent retention dep). Every rejection
   // site below reads `recordRejection(...)`; the tally dep is the single switch.
@@ -1069,6 +1091,18 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           ...summarize(filtered),
           total: events.length,
           matched: filtered.length,
+          // `startedAt` (WARDEN-768): top-level epoch-ms recording when THIS
+          // receiver (re)booted, captured once at handler construction (frozen
+          // for the process — see the capture site above). It is the key that
+          // makes the restart-wiped tallies below interpretable: a maintainer
+          // reading `rejections.total = 0` alongside `startedAt = <2 minutes
+          // ago>` knows the tally only covers 2 minutes, not that the receiver
+          // has been stably quiet. Flat top-level epoch-ms, exactly like
+          // firstSeen / lastSeen / total / matched. Receiver-local: after a
+          // restart it shows the NEW boot time (self-documenting the zeroed
+          // tallies). Never persisted — operational metadata about the process,
+          // counts/epoch-ms only, no JSONB allow-list concern.
+          startedAt,
           rejections: rejections ? rejections.snapshot() : EMPTY_REJECTIONS,
           persistErrors: persistErrors ? persistErrors.snapshot() : EMPTY_PERSIST_ERRORS,
           retention: retentionHealth ? retentionHealth.snapshot() : EMPTY_RETENTION,
