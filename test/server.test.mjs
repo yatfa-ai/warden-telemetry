@@ -13,6 +13,8 @@ import { EventEmitter } from 'node:events';
 import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createDedupTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, readBody } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
+import { EVENTS_LIMIT_DEFAULT, EVENTS_LIMIT_MAX } from '../events.mjs';
+import { signatureOf } from '../summary.mjs';
 
 // A fake IncomingMessage: an EventEmitter whose body chunks emit on nextTick
 // (mimicking a real readable stream). readBody consumes via .on('data'|'end').
@@ -803,6 +805,311 @@ test('GET /summary ignores an unrecognized query param (no spurious scoping — 
   const body = JSON.parse(res.body);
   assert.equal(body.total, 2);
   assert.equal(body.matched, 2, 'an unknown param does not scope the aggregates');
+});
+
+// ── MATCHED + PAGING on GET /events — ?offset= (WARDEN-755) ──────────────────
+// The /events-side twin of the truncation WARDEN-727 closed on /summary: the
+// drill-down surface silently capped at the newest-200 with no way to tell a
+// complete window from a truncation, nor to page the older matches. /events now
+// carries `matched` (how many events match the filters, pre-bound — via the SAME
+// shared filterEvents core /summary uses, never a third path) + `limit` / `offset`
+// (the RESOLVED bound + page offset actually applied) and accepts `?offset=` to
+// page older matches. Driven with fake req/res + an INJECTED readable store; ZERO
+// real fs, ZERO real network. Mirrors the scoped-/summary block above field-for-
+// field: `total` stays the FULL persisted count, `matched` is the scoped subset
+// (≤ total), and with NO filters matched === total (strictly additive).
+
+test('GET /events with NO filters is backward compatible — additive matched/limit/offset, matched === total', async () => {
+  // The pre-existing { events, total } response gains matched/limit/offset and
+  // NOTHING else changes. Un-filtered: matched === total (every event matches),
+  // limit echoes the resolved default (no ?limit= given), offset echoes 0.
+  const store = readableStore([errorEvent, crashEvent]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(Array.isArray(body.events), true);
+  assert.equal(body.events.length, 2);
+  assert.equal(body.total, 2, 'total is the full persisted count');
+  assert.equal(body.matched, 2, 'matched === total when no filter is applied');
+  assert.equal(body.limit, EVENTS_LIMIT_DEFAULT, 'limit echoes the resolved default');
+  assert.equal(body.offset, 0, 'offset echoes 0 when no ?offset= is given');
+  assert.ok(body.matched <= body.total, 'matched never exceeds total');
+});
+
+test('GET /events?platform=win32 scopes matched + the events window to win32 only', async () => {
+  // Mirrors GET /summary?platform=win32: total stays the full set across
+  // platforms; matched is the win32 subset; the bounded events array holds only
+  // win32 payloads. limit/offset echo the (default) resolved bound + 0 offset.
+  const store = readableStore([
+    { ...errorEvent, platform: 'win32', name: 'win-err' },
+    { ...errorEvent, platform: 'darwin', name: 'mac-err' },
+    { ...crashEvent, platform: 'win32', reason: 'win-oom' },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 3, 'total is the full persisted count, unfiltered');
+  assert.equal(body.matched, 2, 'matched is the win32 subset');
+  assert.ok(body.matched < body.total, 'a scoped filter makes matched < total');
+  assert.ok(body.matched <= body.total, 'matched never exceeds total');
+  assert.equal(body.events.length, 2, 'the window holds only win32 payloads');
+  assert.ok(body.events.every((e) => e.platform === 'win32'), 'every returned event is win32');
+  assert.equal(body.limit, EVENTS_LIMIT_DEFAULT);
+  assert.equal(body.offset, 0);
+});
+
+test('GET /events?type=crash scopes matched to a single base type', async () => {
+  const store = readableStore([
+    { ...errorEvent, name: 'TypeError' },
+    { ...crashEvent, reason: 'oom' },
+    { ...crashEvent, reason: 'killed' },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?type=crash' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 3, 'total is the full set across types');
+  assert.equal(body.matched, 2, 'matched is the crash subset');
+  assert.ok(body.events.every((e) => e.type === 'crash'));
+});
+
+test('GET /events?appVersion=0.1.19 scopes matched to a single release label', async () => {
+  const store = readableStore([
+    { ...errorEvent, appVersion: '0.1.19' },
+    { ...crashEvent, appVersion: '0.1.20' },
+    { ...errorEvent, appVersion: '0.1.19', name: 'second' },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?appVersion=0.1.19' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 3);
+  assert.equal(body.matched, 2);
+  assert.ok(body.events.every((e) => e.appVersion === '0.1.19'));
+});
+
+test('GET /events?since= scopes matched to events at/after the cutoff (receivedAt ?? timestamp)', async () => {
+  const store = readableStore([
+    { ...errorEvent, timestamp: 100, receivedAt: 100 },
+    { ...errorEvent, timestamp: 200, receivedAt: 200 },
+    { ...errorEvent, timestamp: 300, receivedAt: 300 },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?since=200' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 3);
+  assert.equal(body.matched, 2, '200 (>=) + 300 survive; 100 dropped');
+  assert.deepEqual(body.events.map((e) => e.timestamp), [200, 300]);
+});
+
+test('GET /events?signature= scopes matched to that distinct failure (signature × matched compose — WARDEN-746 × WARDEN-755 merge seam)', async () => {
+  // THE MERGE SEAM: matched is `filterEvents(events, filterOpts).length` and
+  // filterOpts carries `signature` (WARDEN-746 threaded it; WARDEN-755 added the
+  // matched field + the filterOpts restructure). So a ?signature= drill-down MUST
+  // scope matched to that distinct failure exactly — the two features compose on
+  // the shared filterEvents core, never a third path. total stays the full
+  // persisted count (mirrors /summary). (Signature became a filter axis on main
+  // AFTER this PR was proposed, so the original per-axis matched matrix listed
+  // only type/platform/appVersion/since — this closes the gap the merge opened.)
+  const sigErr = signatureOf(errorEvent); // 'TypeError' (name-only, empty frames)
+  const store = readableStore([
+    { ...errorEvent, name: 'TypeError' },                       // MATCH (sigErr)
+    { ...errorEvent, name: 'RangeError', message: 'r' },        // different name → different sig
+    crashEvent,                                                  // crash:oom → different sig
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: `/events?signature=${encodeURIComponent(sigErr)}` }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 3, 'total is the full persisted count, unfiltered');
+  assert.equal(body.matched, 1, 'matched is the single TypeError-distinct failure');
+  assert.ok(body.matched < body.total, 'a signature drill-down makes matched < total');
+  assert.ok(body.matched <= body.total, 'matched never exceeds total');
+  assert.equal(body.events.length, 1, 'the window holds only that distinct failure');
+  assert.equal(signatureOf(body.events[0]), sigErr, 'the returned payload is that distinct failure');
+  assert.equal(body.offset, 0, 'offset echoes 0 (no ?offset= given)');
+});
+
+test('GET /events?type=crash&platform=win32 intersects all filters in matched (regression attribution)', async () => {
+  // The same conjunctive intersection /summary tests: only the events surviving
+  // EVERY filter are counted in matched and returned in the window.
+  const store = readableStore([
+    { ...crashEvent, platform: 'darwin', reason: 'mac-oom' },  // wrong platform
+    { ...crashEvent, platform: 'win32', reason: 'win-oom' },   // MATCH
+    { ...errorEvent, platform: 'win32', name: 'win-err' },     // wrong type
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?type=crash&platform=win32' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 3);
+  assert.equal(body.matched, 1, 'only the win32 crash survives the intersection');
+  assert.equal(body.events.length, 1);
+  assert.equal(body.events[0].reason, 'win-oom');
+});
+
+test('GET /events echoes the RESOLVED limit actually applied, not the raw query (the bound that shaped the page)', async () => {
+  // The echo contract: ?limit=50000 surfaces as limit: 200 (the cap that bound
+  // the page), never the raw 50000; ?limit=3 → 3; no ?limit= → the default. The
+  // echoed value is provably the bound selectEvents applied (resolveLimit is the
+  // shared helper both call), so a maintainer reading `limit` knows the page size.
+  const events = Array.from({ length: 500 }, (_, i) => ({ type: 'error', timestamp: i }));
+  const store = readableStore(events);
+  const handler = createRequestHandler({ store });
+
+  const over = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?limit=50000' }), over);
+  const overBody = JSON.parse(over.body);
+  assert.equal(overBody.limit, EVENTS_LIMIT_MAX, '?limit=50000 echoes the cap (200), not 50000');
+  assert.equal(overBody.events.length, EVENTS_LIMIT_MAX, 'the page is the cap');
+
+  const exact = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?limit=3' }), exact);
+  assert.equal(JSON.parse(exact.body).limit, 3, '?limit=3 echoes 3');
+
+  const none = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events' }), none);
+  assert.equal(JSON.parse(none.body).limit, EVENTS_LIMIT_DEFAULT, 'no ?limit= echoes the default');
+});
+
+test('GET /events echoes the RESOLVED offset actually applied (0 by default, the skip when ?offset= is set)', async () => {
+  const events = Array.from({ length: 500 }, (_, i) => ({ type: 'error', timestamp: i }));
+  const store = readableStore(events);
+  const handler = createRequestHandler({ store });
+
+  const none = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events' }), none);
+  assert.equal(JSON.parse(none.body).offset, 0, 'no ?offset= echoes 0');
+
+  const paged = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?offset=200' }), paged);
+  assert.equal(JSON.parse(paged.body).offset, 200, '?offset=200 echoes 200');
+
+  const explicit0 = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?offset=0' }), explicit0);
+  assert.equal(JSON.parse(explicit0.body).offset, 0, '?offset=0 echoes 0');
+});
+
+test('GET /events?offset= pages OLDER matches — against a >200 scoped subset, offset=200 returns the next page', async () => {
+  // The ticket's success criterion: a maintainer reading /events?type=error
+  // against a large scoped subset sees matched alongside the newest page and
+  // pages by offset until offset + events.length >= matched — reaching every
+  // matching payload without the response ever exceeding the 200 cap.
+  // 500 type=error events (+ 5 crashes so total != matched). ?type=error&limit=200.
+  const events = [
+    ...Array.from({ length: 500 }, (_, i) => ({ type: 'error', timestamp: i })),
+    ...Array.from({ length: 5 }, (_, i) => ({ type: 'crash', timestamp: 1000 + i })),
+  ];
+  const store = readableStore(events);
+  const handler = createRequestHandler({ store });
+
+  const page0 = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?type=error&limit=200' }), page0);
+  const b0 = JSON.parse(page0.body);
+  assert.equal(b0.matched, 500, 'matched is the full error subset');
+  assert.equal(b0.total, 505, 'total is the full persisted set (errors + crashes)');
+  assert.equal(b0.events.length, 200, 'page 0 is the newest 200 errors');
+  assert.ok(b0.events.length <= EVENTS_LIMIT_MAX, 'never exceeds the 200 cap');
+  // page 0 = the NEWEST 200 errors → timestamps 300..499 (newest last).
+  assert.deepEqual(
+    b0.events.map((e) => e.timestamp),
+    Array.from({ length: 200 }, (_, i) => 300 + i)
+  );
+
+  const page1 = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?type=error&limit=200&offset=200' }), page1);
+  const b1 = JSON.parse(page1.body);
+  assert.equal(b1.matched, 500, 'matched is unchanged across pages');
+  assert.equal(b1.offset, 200, 'the echoed offset is the page requested');
+  assert.equal(b1.events.length, 200, 'page 1 is the next 200 errors');
+  assert.ok(b1.events.length <= EVENTS_LIMIT_MAX);
+  assert.deepEqual(
+    b1.events.map((e) => e.timestamp),
+    Array.from({ length: 200 }, (_, i) => 100 + i),
+    'page 1 = timestamps 100..299 (the 200 before the newest 200)'
+  );
+
+  const page2 = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?type=error&limit=200&offset=400' }), page2);
+  const b2 = JSON.parse(page2.body);
+  assert.equal(b2.events.length, 100, 'the final page is the oldest 100 errors (a partial page)');
+  assert.ok(b2.events.length <= EVENTS_LIMIT_MAX);
+  // offset + events.length has now reached matched — every error has been paged.
+  assert.equal(400 + b2.events.length, 500, 'offset + events.length === matched → traversal complete');
+  assert.deepEqual(
+    b2.events.map((e) => e.timestamp),
+    Array.from({ length: 100 }, (_, i) => 0 + i),
+    'page 2 = timestamps 0..99 (the oldest errors)'
+  );
+
+  // Paging past the end → [] (clean stop; the maintainer knows they're done).
+  const past = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?type=error&limit=200&offset=500' }), past);
+  const bp = JSON.parse(past.body);
+  assert.equal(bp.matched, 500);
+  assert.equal(bp.events.length, 0, 'offset === matched → empty page (no older matches)');
+});
+
+test('GET /events?offset= never exceeds the 200-event cap on ANY page and pages only MATCHED events', async () => {
+  // 847 errors (the ticket's scenario size) + a few crashes. Page the error
+  // subset at the default limit; every page is bounded, and offset never
+  // surfaces a crash — it pages the MATCHED set, not the unfiltered set.
+  const events = [
+    ...Array.from({ length: 847 }, (_, i) => ({ type: 'error', timestamp: i })),
+    ...Array.from({ length: 3 }, (_, i) => ({ type: 'crash', timestamp: 9000 + i })),
+  ];
+  const store = readableStore(events);
+  const handler = createRequestHandler({ store });
+  const seen = [];
+  for (let offset = 0; offset < 847; offset += EVENTS_LIMIT_DEFAULT) {
+    const res = fakeRes();
+    await handler(fakeReq({ method: 'GET', url: `/events?type=error&offset=${offset}` }), res);
+    const body = JSON.parse(res.body);
+    assert.equal(body.matched, 847, 'matched is the full error subset on every page');
+    assert.ok(body.events.length <= EVENTS_LIMIT_MAX, `offset=${offset} page bounded by the cap`);
+    assert.ok(body.events.every((e) => e.type === 'error'), 'no crash ever leaks into an offset page');
+    seen.push(...body.events.map((e) => e.timestamp));
+    if (offset + body.events.length >= body.matched) break;
+  }
+  // Every error reached exactly once — union is the full matched set, no dups/gaps.
+  assert.equal(seen.length, 847, 'every matched error paged exactly once');
+  assert.deepEqual(
+    [...seen].sort((a, b) => a - b),
+    Array.from({ length: 847 }, (_, i) => i),
+    'no gaps, no duplicates across pages'
+  );
+});
+
+test('GET /events?platform=win32 on a store with NO win32 events → matched 0, events [], total full', async () => {
+  const store = readableStore([
+    { ...errorEvent, platform: 'darwin' },
+    { ...crashEvent, platform: 'linux' },
+  ]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?platform=win32' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 2, 'total is still the full persisted count');
+  assert.equal(body.matched, 0, 'nothing matched the win32 filter');
+  assert.deepEqual(body.events, [], 'an empty window for an empty matched set');
+  assert.equal(body.offset, 0);
+});
+
+test('GET /events ignores an unrecognized query param (no spurious matched — backward compatible)', async () => {
+  // A param the filter does not consume (?foo=bar) applies NO filter: matched === total.
+  const store = readableStore([errorEvent, crashEvent]);
+  const handler = createRequestHandler({ store });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events?foo=bar' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 2);
+  assert.equal(body.matched, 2, 'an unknown param does not scope the window');
 });
 
 // ── RETENTION (WARDEN-579) ────────────────────────────────────────────────────

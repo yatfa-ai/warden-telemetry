@@ -65,7 +65,7 @@ import { SCHEMA_VERSION, validateEvent } from './schema.ts';
 import { createNdjsonStore, fileSink, fileSource, fileRewrite } from './store.mjs';
 import { ingest } from './ingest.mjs';
 import { summarize, summarizeTimeline } from './summary.mjs';
-import { selectEvents, filterEvents } from './events.mjs';
+import { selectEvents, filterEvents, resolveLimit, resolveOffset } from './events.mjs';
 
 export const DEFAULT_PORT = 7421;
 export const DEFAULT_STORE_PATH = new URL('./telemetry.ndjson', import.meta.url).pathname;
@@ -1102,10 +1102,32 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // the shared filterEvents core. An event whose signatureOf() is null never
     // matches, never crashes; no param = today's behavior exactly (backward compatible).
     //
+    // `matched` + `?offset=` (WARDEN-755) close the silent-truncation gap on this
+    // drill-down: `matched` is how many events match the filters (pre-bound, via
+    // the SAME shared filterEvents core /summary uses — never a third path), and
+    // `?offset=` pages OLDER matches past the newest-N window. A maintainer reading
+    // /events?type=error&platform=win32 against an 847-match subset now sees
+    // `matched: 847` alongside the newest 200, KNOWS 647 older matches exist, and
+    // pages `?offset=200` (then 400, 600) until `offset + events.length >= matched`
+    // — reaching every matching payload without the response ever exceeding the
+    // 200-event cap. The /events-side twin of the truncation WARDEN-727 closed on
+    // /summary (which got `matched`/`total`); /events has the SAME gap AND could
+    // not be paged. `total` stays the FULL persisted count (mirrors /summary);
+    // `matched` is the scoped subset size (≤ total). `limit` / `offset` echo the
+    // RESOLVED bound actually applied (via resolveLimit / resolveOffset — the SAME
+    // helpers selectEvents uses internally), so a `?limit=50000` surfaces as
+    // `limit: 200` (the cap that bound the page), not the raw 50000.
+    //
     // Reads ONLY already-persisted, already-schema-validated, already-client-
     // redacted events via the existing readEvents() seam — no new collection, no
     // re-collection, no third party, no server-side redaction, no tier expansion.
     // The identical trust posture as /summary, full-fidelity instead of aggregate.
+    // The ≤200-per-page bound STAYS; `offset` only selects WHICH bounded slice.
+    //
+    // Strictly ADDITIVE: with no filters `matched === total`, and with no `?offset=`
+    // the window is byte-identical to today (`offset` echoes 0). An un-filtered
+    // /events response is unchanged except for the added `matched` / `limit` /
+    // `offset` fields.
     //
     // Gated by the auth block above like every other route (the read surface
     // inherits the shared secret — auth is NOT re-implemented here). Unknown method
@@ -1118,15 +1140,35 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
         // exactly as it composes summarize. `total` is the FULL persisted count
         // (pre-bound) so a maintainer sees how much the window is a window OF; the
         // bounded `events` array is the newest-N matching the filters.
-        const selected = selectEvents(events, {
+        //
+        // `matched` is computed via the shared `filterEvents` core — the EXACT twin
+        // of /summary's `matched` (same helper, same opts) so the two surfaces
+        // cannot drift on what "type=error&platform=win32" matches. It is the
+        // scoped subset size pre-bound, so a maintainer can tell a complete 200-
+        // match window from a truncation of a larger set — and know how far to
+        // page. `limit` / `offset` echo the RESOLVED bound + page offset actually
+        // applied, via resolveLimit / resolveOffset — the SAME helpers selectEvents
+        // calls internally — so the echoed values are provably the ones that shaped
+        // `events` (a clamped / past-end query surfaces as the bound that ran, not
+        // the raw query string).
+        const filterOpts = {
           type: searchParams.get('type') ?? undefined,
           platform: searchParams.get('platform') ?? undefined,
           appVersion: searchParams.get('appVersion') ?? undefined,
           signature: searchParams.get('signature') ?? undefined,
-          limit: searchParams.has('limit') ? Number(searchParams.get('limit')) : undefined,
           since: searchParams.has('since') ? Number(searchParams.get('since')) : undefined,
+        };
+        const limit = searchParams.has('limit') ? Number(searchParams.get('limit')) : undefined;
+        const offset = searchParams.has('offset') ? Number(searchParams.get('offset')) : undefined;
+        const matched = filterEvents(events, filterOpts).length;
+        const selected = selectEvents(events, { ...filterOpts, limit, offset });
+        return sendJson(res, 200, {
+          events: selected,
+          total: events.length,
+          matched,
+          limit: resolveLimit(limit),
+          offset: resolveOffset(offset, matched),
         });
-        return sendJson(res, 200, { events: selected, total: events.length });
       } catch (e) {
         return sendJson(res, 500, { error: `could not read events: ${e?.message ?? e}` });
       }
