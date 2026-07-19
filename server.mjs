@@ -47,7 +47,13 @@
 // retryable 503 on a persist failure instead of hanging the socket) — AND a
 // bounded `timeline` distribution (WARDEN-603) — event counts per time bucket
 // over a rolling recent window, so a maintainer can distinguish a recent volume
-// spike (a regression / deploy) from a long-running baseline. The client POSTs
+// spike (a regression / deploy) from a long-running baseline — AND a bounded
+// `retention` tally (WARDEN-743) — configured bounds + retained count + a
+// running total + the most-recent sample of what retention pruned, so a
+// maintainer can tell their overview spans only the retained window (a capped/
+// aged store) instead of mistaking it for the full history: the third "silent
+// signal-loss" path (pruned events), made legible the way rejections + persist
+// errors already are. The client POSTs
 // the batch verbatim to its configured endpointUrl (e.g.
 // http://host:7421/ingest) and never rewrites the host, so these route paths
 // are the receiver's to define.
@@ -296,8 +302,20 @@ function tokensMatch(provided, expected) {
  * `setTimer` / `clearTimer` / `now` are injected so the trigger is unit-testable
  * with a fake clock and a deterministic scheduler — no real timer in tests.
  *
+ * `retention` (optional tally, WARDEN-743): an OPTIONAL retention-HEALTH tally
+ * (built by `createRetentionTally`). On a SUCCESSFUL prune the trigger records
+ * prune()'s already-computed {before, after, pruned, rewrote} (plus
+ * `retainedCount: after`) via `retention.record(...)` so GET /summary can surface
+ * what retention removed — the third "silent signal-loss" path, made legible.
+ * The record call lives in `.then` (success), NOT `.catch`/`.finally`: a FAILED
+ * prune removed nothing and must not record a spurious sample. No `retention`
+ * tally wired = today's behavior exactly (the prune result is discarded, as
+ * before) — the optional-dep discipline shared with the sibling tallies. Named
+ * `retention` here (the trigger's opts have no such field today, so there is no
+ * collision); the handler dep + /summary response use a distinct name.
+ *
  * @param {{ prune(opts: object): Promise<void> }} store
- * @param {{ maxEvents?: number, maxAgeMs?: number, debounceMs?: number, now?: () => number, setTimer?: (fn: () => void, ms: number) => unknown, clearTimer?: (id: unknown) => void }} [opts]
+ * @param {{ maxEvents?: number, maxAgeMs?: number, debounceMs?: number, now?: () => number, setTimer?: (fn: () => void, ms: number) => unknown, clearTimer?: (id: unknown) => void, retention?: { record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void } }} [opts]
  * @returns {{ afterAppend(count?: number): void, sweep(): void, cancel(): void }}
  */
 export function createRetentionTrigger(
@@ -309,6 +327,7 @@ export function createRetentionTrigger(
     now = Date.now,
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = (id) => clearTimeout(id),
+    retention = null,
   } = {}
 ) {
   let timerId = null;
@@ -324,6 +343,25 @@ export function createRetentionTrigger(
     running = true;
     appendedSincePrune = 0;
     Promise.resolve(store.prune({ maxEvents, maxAgeMs, now: now() }))
+      .then((res) => {
+        // WARDEN-743: a prune that COMPLETED — record its already-computed
+        // result {before, after, pruned, rewrote} so GET /summary can surface
+        // what retention removed (the third "silent signal-loss" path, now
+        // legible). This MUST live in `.then` (success), NOT `.catch`/
+        // `.finally`: a FAILED prune (the `.catch` below) removed nothing and
+        // must not record a spurious sample. `retainedCount: after` carries the
+        // post-prune store size. No tally wired (retention == null) = today's
+        // behavior exactly (the result is discarded, as before).
+        if (retention && res && typeof res === 'object') {
+          retention.record({
+            before: res.before,
+            after: res.after,
+            pruned: res.pruned,
+            rewrote: res.rewrote,
+            retainedCount: res.after,
+          });
+        }
+      })
       .catch(() => {
         // A prune failure must NEVER kill the receiver (telemetry is best-effort).
         // The atomic rename in `fileRewrite` means a failed compaction leaves the
@@ -506,6 +544,111 @@ export function createPersistErrorTally({ now = Date.now } = {}) {
   };
 }
 
+// ── RETENTION-HEALTH TALLY (WARDEN-743) ──────────────────────────────────────
+// The third and last "silent signal-loss" path on the receiver. An event a
+// client sends can leave the pipeline in exactly three ways after ingest accepts
+// it; the receiver already makes TWO visible on GET /summary:
+//   1. Rejected at ingest (415/400/422) → `rejections` tally (WARDEN-591).
+//   2. Failed to persist (store.appendEvents throws) → `persistErrors` tally
+//      (WARDEN-607).
+//   3. Pruned by retention (count cap / age window) → was INVISIBLE. ← this tally.
+// `store.prune()` already computes {before, after, pruned, rewrote}, but
+// createRetentionTrigger DISCARDED it (a .catch().finally() chain with no
+// .then), so a busy self-hosted receiver silently evicted old signal on every
+// persist once full — /summary.total flatlined at the cap, firstSeen/lastSeen
+// crept forward — and the maintainer could not tell their overview spanned only
+// the retained window. This tally observes prune()'s ALREADY-computed result (it
+// changes no prune behavior) and surfaces it on GET /summary so a truncated
+// signal is LEGIBLE instead of silent. It is a SEPARATE axis from the queued
+// drill-down proposals: those are about drilling INTO the retained set; this is
+// about knowing what retention has REMOVED (receiver operational health).
+//
+// Bounded means: the configured bounds + a retained count + a running total of
+// pruned events + a SINGLE most-recent prune sample {before, after, pruned,
+// rewrote, ts}. It does NOT keep one record per prune, so a sustained compaction
+// storm can't grow it. Like the sibling tallies, it "persists nothing" — it is
+// in-memory and receiver-local (a misconfiguration signal need not survive a
+// restart), and ADDITIVE ONLY: it records what retention already does, relaxes
+// no check, mirrors no invariant, routes nothing, touches no redaction. The
+// recorded `last` carries only counts + a timestamp — never raw event bytes or
+// extended-tier identifiers (the trust model is preserved, same as the sibling
+// tallies).
+
+// The zeroed shape returned when no tally is wired OR no prune has run yet.
+// `configured` is {maxEvents:0, maxAgeMs:0} here (the "unset" shape an absent dep
+// yields); a WIRED tally carries the active bounds instead. A fresh wired tally
+// whose prune has not fired yet also reads zeroed EXCEPT `configured` reflects
+// the real bounds — so an idle receiver never false-alarms (parity with
+// EMPTY_REJECTIONS / EMPTY_PERSIST_ERRORS), but a maintainer still sees the cap.
+const EMPTY_RETENTION = Object.freeze({
+  configured: { maxEvents: 0, maxAgeMs: 0 },
+  retainedCount: 0,
+  totalPruned: 0,
+  last: null,
+});
+
+/**
+ * Build the retention-health tally (WARDEN-743). Mirrors the injected-seam
+ * discipline of `createRejectionTally` / `createPersistErrorTally`: an OPTIONAL
+ * handler dep (no tally wired = today's behavior, exactly like an absent
+ * rejections dep) with an injected `now` so the tally is unit-testable with a
+ * fake clock (no real Date in tests). `maxEvents` / `maxAgeMs` capture the
+ * ACTIVE retention bounds so a maintainer reading GET /summary can see what the
+ * retained count is measured against (the trigger is created with the same
+ * bounds, so the tally and the trigger agree on the configured window).
+ *
+ * @param {{ now?: () => number, maxEvents?: number, maxAgeMs?: number }} [opts]
+ * @returns {{
+ *   record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void,
+ *   snapshot(): { configured: { maxEvents: number, maxAgeMs: number }, retainedCount: number, totalPruned: number, last: { before: number, after: number, pruned: number, rewrote: boolean, ts: number } | null }
+ * }}
+ */
+export function createRetentionTally({ now = Date.now, maxEvents = 0, maxAgeMs = 0 } = {}) {
+  const configured = { maxEvents, maxAgeMs };
+  let totalPruned = 0;
+  let retainedCount = 0;
+  let last = null;
+
+  return {
+    /** Record one COMPLETED prune. Called ONLY on a SUCCESSFUL prune (the
+     *  trigger's `.then`, never `.catch`/`.finally`) — a failed prune removed
+     *  nothing and must not record a spurious sample. Bounded: accumulates a
+     *  running `totalPruned` and overwrites `last` with the single most-recent
+     *  {before, after, pruned, rewrote, ts} — never one entry per call. A no-op
+     *  prune (pruned:0) does NOT inflate `totalPruned` but DOES refresh `last`,
+     *  so a maintainer sees when retention last RAN even on a quiet store.
+     *  `retainedCount` carries the post-prune store size (the trigger passes
+     *  `after`), so the snapshot reads "retained vs. cap" at a glance. */
+    record({ before, after, pruned, rewrote, retainedCount: rc } = {}) {
+      // A real prune result always carries finite before/after counts. A bare or
+      // empty call (defensive misuse) records nothing — parity with
+      // createRejectionTally's `if (status == null) return` guard (no spurious
+      // sample, no false "retention ran" signal on an idle receiver).
+      if (!Number.isFinite(before) && !Number.isFinite(after)) return;
+      const dropped = Number.isFinite(pruned) ? pruned : 0;
+      totalPruned += dropped;
+      retainedCount = Number.isFinite(rc) ? rc : retainedCount;
+      last = {
+        before,
+        after,
+        pruned: dropped,
+        rewrote: Boolean(rewrote),
+        ts: now(),
+      };
+    },
+    /** A stable point-in-time copy of the aggregate (a later record does not
+     *  mutate a previously-returned snapshot). */
+    snapshot() {
+      return {
+        configured: { ...configured },
+        retainedCount,
+        totalPruned,
+        last: last ? { ...last } : null,
+      };
+    },
+  };
+}
+
 // ── SEEN-KEY DEDUP SET (WARDEN-666) ───────────────────────────────────────────
 // The receiver-local twin of the client's per-batch idempotency-key header. A
 // bounded, in-memory set of keys the receiver has ALREADY accepted a batch for,
@@ -625,6 +768,22 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * `persistErrors` dep = a zeroed `persistErrors` field on /summary and no
  * recording — today's behavior, exactly like an absent rejections dep.
  *
+ * `retentionHealth` (optional tally, WARDEN-743): the retention-HEALTH tally
+ * built by `createRetentionTally({ maxEvents, maxAgeMs })`. It is passed BOTH to
+ * the handler (here, for /summary) AND into `createRetentionTrigger` (so the
+ * trigger can `record()` on a successful prune). It is DISTINCTLY named from the
+ * `retention` TRIGGER dep (which exposes `afterAppend/sweep/cancel` and has no
+ * `.snapshot()`): the in-process variable is `retentionHealth` to avoid that
+ * collision, while the /summary response KEY stays `retention` (what a
+ * maintainer reads). GET /summary reads `retentionHealth.snapshot()` so a
+ * maintainer sees (a) the configured retention bound (`maxEvents` + `maxAgeMs`),
+ * (b) the current retained count against that bound, and (c) whether/when
+ * retention last pruned and how many it dropped — so a truncated signal is
+ * LEGIBLE instead of silent. Like `rejections`/`persistErrors`, it is UNSCOPED
+ * by the /summary event filters (it tallies receiver operational health, not the
+ * event subset). No `retentionHealth` dep = the zeroed `EMPTY_RETENTION` shape
+ * on /summary — today's behavior, exactly like an absent persistErrors dep.
+ *
  * `now` (optional clock, WARDEN-603): the GET /summary `timeline` distribution
  * is a rolling recent window measured back from `now`, so the handler — the
  * testable seam — takes an injectable `now` (default `Date.now`) to stay
@@ -667,10 +826,10 @@ export function createSeenKeys({ ttlMs = DEFAULT_DEDUP_TTL_MS, maxKeys = DEFAULT
  * seenKeys / retention-trigger factories) keeps the stamp unit-testable with a
  * fake clock; absent it defaults to Date.now.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void }, maxBodyBytes?: number, now?: () => number }} deps
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void }, maxBodyBytes?: number, now?: () => number, retentionHealth?: { record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void, snapshot(): object } }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, maxBodyBytes = 0, now = Date.now } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, maxBodyBytes = 0, now = Date.now, retentionHealth } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
 
   // Centralized rejection recorder: a guarded no-op when no tally is wired (today's
@@ -760,20 +919,27 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           since: searchParams.has('since') ? Number(searchParams.get('since')) : undefined,
         });
         // Compose the bounded `rejections` tally, the bounded `persistErrors`
-        // tally, AND the bounded `timeline` distribution here — NOT inside
-        // summarize(). summarize(filtered) stays a PURE single-arg function of the
-        // (already-filtered) event array (documented + tested that way); all three
-        // are handler-composed, exactly the way `retention` is handler-injected
-        // rather than summarize-injected. `rejections` and `persistErrors` are each
-        // the tally's snapshot when wired, or their zeroed EMPTY_* shape otherwise
-        // (stable shape for every caller). They are intentionally UNSCOPED — they
-        // tally the REQUEST seam (every rejection / persist site on THIS receiver),
-        // NOT the event subset; a platform/release filter must not hide receiver-
-        // health signal. `timeline` is ALWAYS computed — a pure read over the
-        // FILTERED events' effective `receivedAt ?? timestamp`s measured back from
-        // the injected `now` (default Date.now) — so the field is present for every
-        // caller, wired or not, and now reflects the scoped subset. Counts only;
-        // never raw events or extended-tier names.
+        // tally, the bounded `retention` tally, AND the bounded `timeline`
+        // distribution here — NOT inside summarize(). summarize(filtered) stays a
+        // PURE single-arg function of the (already-filtered) event array
+        // (documented + tested that way); all four are handler-composed, exactly
+        // the way the retention TRIGGER is handler-injected rather than
+        // summarize-injected. `rejections`, `persistErrors`, and `retention` are
+        // each the tally's snapshot when wired, or their zeroed EMPTY_* shape
+        // otherwise (stable shape for every caller). They are intentionally
+        // UNSCOPED — they tally the REQUEST/OPERATIONAL seam (every rejection /
+        // persist site / retention prune on THIS receiver), NOT the event subset;
+        // a platform/release filter must not hide receiver-health signal.
+        // `timeline` is ALWAYS computed — a pure read over the FILTERED events'
+        // effective `receivedAt ?? timestamp`s measured back from the injected
+        // `now` (default Date.now) — so the field is present for every caller,
+        // wired or not, and now reflects the scoped subset. Counts only; never
+        // raw events or extended-tier names.
+        //
+        // `retention` (WARDEN-743) is sourced from the `retentionHealth` dep (the
+        // tally), NOT the `retention` trigger — the trigger has no `.snapshot()`.
+        // The response KEY stays `retention` (what a maintainer reads); only the
+        // in-process variable is renamed to dodge the collision.
         //
         // `total` overrides summarize()'s own `total` (which would be
         // `filtered.length`) to stay the FULL persisted count — `events.length`,
@@ -787,6 +953,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           matched: filtered.length,
           rejections: rejections ? rejections.snapshot() : EMPTY_REJECTIONS,
           persistErrors: persistErrors ? persistErrors.snapshot() : EMPTY_PERSIST_ERRORS,
+          retention: retentionHealth ? retentionHealth.snapshot() : EMPTY_RETENTION,
           timeline: summarizeTimeline(filtered, { now }),
         });
       } catch (e) {
@@ -1000,11 +1167,12 @@ export function createReceiver({
   maxBodyBytes = envRetentionInt('INGEST_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES),
 } = {}) {
   const maxAgeMs = maxAgeHours > 0 ? maxAgeHours * HOUR_MS : 0;
-  const retention = createRetentionTrigger(store, { maxEvents, maxAgeMs });
+  const retentionHealth = createRetentionTally({ maxEvents, maxAgeMs });
+  const retention = createRetentionTrigger(store, { maxEvents, maxAgeMs, retention: retentionHealth });
   const rejections = createRejectionTally();
   const persistErrors = createPersistErrorTally();
   const seenKeys = createSeenKeys();
-  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors, seenKeys, maxBodyBytes });
+  const handler = createRequestHandler({ store, schema, authToken, retention, rejections, persistErrors, seenKeys, maxBodyBytes, retentionHealth });
   const server = createServer(handler);
 
   // Periodic age-expiry sweep — ONLY when an age window is set. A quiet store
