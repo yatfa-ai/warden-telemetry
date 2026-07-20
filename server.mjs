@@ -416,6 +416,91 @@ export function createRetentionTrigger(
   };
 }
 
+// ── BOUNDED ROLLING TIMELINE (WARDEN-834) ────────────────────────────────────
+// The shared STATEFUL rolling-window timeline machinery extracted from the three
+// tallies (createRejectionTally / createPersistErrorTally / createDedupTally),
+// which had each inlined it byte-for-byte identically (modulo their scalar tally
+// fields). This is the stateful twin of the PURE summarizeTimeline (summary.mjs):
+// the tallies record INCREMENTALLY — one record() at a time, NO retained event
+// list (unlike summarizeTimeline, a pure function over a retained event array with
+// a single snapshot now()) — so they key counts by ABSOLUTE epoch-aligned bucket
+// slot and re-relativize them against the CURRENT rolling window at snapshot(),
+// dropping slots that have rolled off. Bounded at maxBuckets by construction:
+// every surviving slot maps to a relative idx clamped to [0, maxBuckets-1].
+//
+// `bump(ts)` takes the externally-read timestamp (it does NOT call now() itself),
+// so a tally's single now() read serves both its scalar `lastSeen` and the slot —
+// preserving the WARDEN-798 "one clock read per record, never two" invariant.
+/**
+ * Build the shared bounded rolling-window timeline (WARDEN-834). Composed by the
+ * three tallies so the bucket math exists in exactly ONE place.
+ *
+ * @param {{now?: () => number, maxBuckets?: number, windowMs?: number}} [opts]
+ * @returns {{bump: (ts: number) => void, snapshot: () => {buckets: Array<{bucketStart: number, bucketEnd: number, count: number}>, bucketMs: number}}}
+ */
+export function createBoundedRollingTimeline({
+  now = Date.now,
+  maxBuckets = DEFAULT_TIMELINE_MAX_BUCKETS,
+  windowMs = DEFAULT_TIMELINE_WINDOW_MS,
+} = {}) {
+  // Degenerate-config guard mirrors summarizeTimeline (summary.mjs:347-349): a bad
+  // windowMs/maxBuckets override collapses the timeline to { buckets: [], bucketMs: 0 }
+  // — never a huge/NaN array. The composing tally's scalar bookkeeping is unaffected
+  // and keeps working regardless.
+  const validConfig = Number.isFinite(windowMs) && windowMs > 0 && Number.isFinite(maxBuckets) && maxBuckets >= 1;
+  const bucketMs = validConfig ? windowMs / maxBuckets : 0;
+
+  // Counts keyed by ABSOLUTE epoch-aligned bucket slot (floor(when / bucketMs)).
+  const counts = new Map();
+
+  return {
+    /** Record one hit at absolute epoch-ms `ts`. Computes the absolute slot
+     *  (floor(ts / bucketMs)) and increments its count. No-op under a degenerate
+     *  config (the snapshot collapses to { buckets: [], bucketMs: 0 } anyway). */
+    bump(ts) {
+      if (!validConfig) return;
+      const slot = Math.floor(ts / bucketMs);
+      counts.set(slot, (counts.get(slot) ?? 0) + 1);
+    },
+    /** A stable point-in-time copy of the timeline (a later bump does not mutate a
+     *  previously-returned snapshot). Re-relativizes the absolute per-bucket counts
+     *  against the current rolling window — buckets older than the window have rolled
+     *  off and are dropped (and garbage-collected from the map so a long-lived
+     *  receiver cannot leak slots without bound). Returns { buckets, bucketMs }, or
+     *  { buckets: [], bucketMs: 0 } under a degenerate config. */
+    snapshot() {
+      if (!validConfig) {
+        return { buckets: [], bucketMs: 0 };
+      }
+      const currentTime = now();
+      const windowStart = currentTime - windowMs;
+      // Re-relativize each absolute slot against the current window (mirrors
+      // summarizeTimeline's idx math, summary.mjs:372-376) and merge into relative
+      // buckets. Rolled-off slots (idx < 0) are deleted for good — a record can
+      // never re-enter a slot whose time has passed, so dropping them on read bounds
+      // the map at ≤ maxBuckets without losing signal.
+      const relative = new Map();
+      for (const [slot, count] of counts) {
+        const bucketStart = slot * bucketMs; // a representative time inside the slot
+        let idx = Math.floor((bucketStart - windowStart) / bucketMs);
+        if (idx < 0) {
+          counts.delete(slot); // rolled off the window — drop for good (memory bound)
+          continue;
+        }
+        if (idx >= maxBuckets) idx = maxBuckets - 1; // fold the top boundary into the newest bucket
+        relative.set(idx, (relative.get(idx) ?? 0) + count);
+      }
+      const buckets = [...relative.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([idx, count]) => {
+          const bucketStart = windowStart + idx * bucketMs;
+          return { bucketStart, bucketEnd: bucketStart + bucketMs, count };
+        });
+      return { buckets, bucketMs };
+    },
+  };
+}
+
 // ── REJECTIONS TALLY (WARDEN-591) ────────────────────────────────────────────
 // A bounded, in-memory, receiver-local tally of the rejections that ALREADY
 // happen at every rejection site in this handler (the auth-gate 401, the 404
@@ -535,7 +620,8 @@ export function createRejectionTally({
 
   // Effective distinct-key cap (WARDEN-829): a finite positive int, else the
   // default — never unbounded under any misconfiguration (mirrors the
-  // validConfig discipline below: a bad override can't reopen the DoS).
+  // validConfig discipline in createBoundedRollingTimeline: a bad override
+  // can't reopen the DoS).
   const maxDeclared = Number.isFinite(maxDeclaredVersions) && maxDeclaredVersions >= 1
     ? Math.floor(maxDeclaredVersions)
     : DEFAULT_REJECTION_MAX_DECLARED_VERSIONS;
@@ -544,25 +630,11 @@ export function createRejectionTally({
   // count semantics are identical). Chosen to be an unlikely real schema version.
   const OVERFLOW_KEY = '__overflow__';
 
-  // Degenerate-config guard mirrors summarizeTimeline (summary.mjs:347-349) and
-  // the persistErrors tally (WARDEN-777): a bad windowMs/maxBuckets override
-  // collapses the timeline to { buckets: [], bucketMs: 0 } — never a huge/NaN
-  // array. The scalar tally (total/byStatus/byDeclaredVersion/lastStatus/
-  // lastReason/lastSeen) is unaffected and keeps working regardless.
-  const validConfig = Number.isFinite(windowMs) && windowMs > 0 && Number.isFinite(maxBuckets) && maxBuckets >= 1;
-  const bucketMs = validConfig ? windowMs / maxBuckets : 0;
-
-  // Counts keyed by ABSOLUTE epoch-aligned bucket slot (floor(when / bucketMs)).
-  // The tally records INCREMENTALLY — one record() at a time, NO retained event
-  // list (unlike summarizeTimeline, a PURE function over a retained event array
-  // with a SINGLE snapshot now()) — so it cannot re-derive buckets from events at
-  // snapshot time. Instead it keys counts by absolute slot and re-relativizes
-  // them against the CURRENT rolling window at snapshot(), dropping slots that
-  // have rolled off. Bounded at maxBuckets by construction: every surviving slot
-  // maps to a relative idx clamped to [0, maxBuckets-1] (mirroring
-  // summarizeTimeline's top-boundary fold), so a sustained drift storm cannot grow
-  // the bucket count.
-  const counts = new Map();
+  // The bounded rolling-window timeline (WARDEN-834): the stateful twin of the
+  // pure summarizeTimeline, now shared by all three tallies via a single helper.
+  // See createBoundedRollingTimeline for the degenerate-config guard, the
+  // absolute-slot + re-relativize math, the rolloff GC, and the top-boundary fold.
+  const timeline = createBoundedRollingTimeline({ now, maxBuckets, windowMs });
 
   return {
     /** Record one rejection. Bounded: accumulates a per-status COUNT, tracks only
@@ -612,48 +684,18 @@ export function createRejectionTally({
       lastStatus = status;
       lastReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
       // A SINGLE now() read (WARDEN-798) serves both lastSeen and the timeline
-      // slot — one clock read per rejection, never two.
+      // slot — one clock read per rejection, never two. The helper's bump() takes
+      // that externally-read timestamp rather than reading now() itself.
       const ts = now();
       lastSeen = ts;
-      if (validConfig) {
-        const slot = Math.floor(ts / bucketMs);
-        counts.set(slot, (counts.get(slot) ?? 0) + 1);
-      }
+      timeline.bump(ts);
     },
     /** A stable point-in-time copy of the aggregate (a later record does not mutate
-     *  a previously-returned snapshot). The `timeline` re-relativizes the absolute
-     *  per-bucket counts against the current rolling window — buckets older than
-     *  the window have rolled off and are dropped (and garbage-collected from the
-     *  map so a long-lived receiver cannot leak slots without bound). */
+     *  a previously-returned snapshot). The `timeline` is delegated to
+     *  createBoundedRollingTimeline, which re-relativizes the absolute per-bucket
+     *  counts against the current rolling window and drops rolled-off buckets. */
     snapshot() {
-      if (!validConfig) {
-        return { total, byStatus: { ...byStatus }, byDeclaredVersion: { ...byDeclaredVersion }, lastStatus, lastReason, lastSeen, timeline: { buckets: [], bucketMs: 0 } };
-      }
-      const currentTime = now();
-      const windowStart = currentTime - windowMs;
-      // Re-relativize each absolute slot against the current window (mirrors
-      // summarizeTimeline's idx math, summary.mjs:372-376) and merge into relative
-      // buckets. Rolled-off slots (idx < 0) are deleted for good — a record can
-      // never re-enter a slot whose time has passed, so dropping them on read
-      // bounds the map at ≤ maxBuckets without losing signal.
-      const relative = new Map();
-      for (const [slot, count] of counts) {
-        const bucketStart = slot * bucketMs; // a representative time inside the slot
-        let idx = Math.floor((bucketStart - windowStart) / bucketMs);
-        if (idx < 0) {
-          counts.delete(slot); // rolled off the window — drop for good (memory bound)
-          continue;
-        }
-        if (idx >= maxBuckets) idx = maxBuckets - 1; // fold the top boundary into the newest bucket
-        relative.set(idx, (relative.get(idx) ?? 0) + count);
-      }
-      const buckets = [...relative.entries()]
-        .sort((a, b) => a[0] - b[0])
-        .map(([idx, count]) => {
-          const bucketStart = windowStart + idx * bucketMs;
-          return { bucketStart, bucketEnd: bucketStart + bucketMs, count };
-        });
-      return { total, byStatus: { ...byStatus }, byDeclaredVersion: { ...byDeclaredVersion }, lastStatus, lastReason, lastSeen, timeline: { buckets, bucketMs } };
+      return { total, byStatus: { ...byStatus }, byDeclaredVersion: { ...byDeclaredVersion }, lastStatus, lastReason, lastSeen, timeline: timeline.snapshot() };
     },
   };
 }
@@ -742,23 +784,11 @@ export function createPersistErrorTally({
   let lastReason = null;
   let lastSeen = null;
 
-  // Degenerate-config guard mirrors summarizeTimeline (summary.mjs:347-349): a bad
-  // windowMs/maxBuckets override collapses the timeline to { buckets: [], bucketMs: 0 }
-  // — never a huge/NaN array. The scalar tally (total/lastReason/lastSeen) is
-  // unaffected and keeps working regardless.
-  const validConfig = Number.isFinite(windowMs) && windowMs > 0 && Number.isFinite(maxBuckets) && maxBuckets >= 1;
-  const bucketMs = validConfig ? windowMs / maxBuckets : 0;
-
-  // Counts keyed by ABSOLUTE epoch-aligned bucket slot (floor(when / bucketMs)). The
-  // tally records INCREMENTALLY — one record() at a time, NO retained event list
-  // (unlike summarizeTimeline, a PURE function over a retained event array with a
-  // SINGLE snapshot now()) — so it cannot re-derive buckets from events at snapshot
-  // time. Instead it keys counts by absolute slot and re-relativizes them against
-  // the CURRENT rolling window at snapshot(), dropping slots that have rolled off.
-  // Bounded at maxBuckets by construction: every surviving slot maps to a relative
-  // idx clamped to [0, maxBuckets-1] (mirroring summarizeTimeline's top-boundary
-  // fold), so a sustained outage cannot grow the bucket count.
-  const counts = new Map();
+  // The bounded rolling-window timeline (WARDEN-834): the stateful twin of the
+  // pure summarizeTimeline, shared by all three tallies via a single helper. See
+  // createBoundedRollingTimeline for the degenerate-config guard, the absolute-slot
+  // + re-relativize math, the rolloff GC, and the top-boundary fold.
+  const timeline = createBoundedRollingTimeline({ now, maxBuckets, windowMs });
 
   return {
     /** Record one persist failure. Bounded: accumulates a total COUNT, tracks only
@@ -767,46 +797,18 @@ export function createPersistErrorTally({
     record({ reason } = {}) {
       total += 1;
       lastReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
+      // A SINGLE now() read serves both lastSeen and the timeline slot — one clock
+      // read per failure, never two. The helper's bump() takes that externally-read
+      // timestamp rather than reading now() itself.
       lastSeen = now();
-      if (validConfig) {
-        const slot = Math.floor(lastSeen / bucketMs);
-        counts.set(slot, (counts.get(slot) ?? 0) + 1);
-      }
+      timeline.bump(lastSeen);
     },
     /** A stable point-in-time copy of the aggregate (a later record does not mutate
-     *  a previously-returned snapshot). The `timeline` re-relativizes the absolute
-     *  per-bucket counts against the current rolling window — buckets older than the
-     *  window have rolled off and are dropped (and garbage-collected from the map so
-     *  a long-lived receiver cannot leak slots without bound). */
+     *  a previously-returned snapshot). The `timeline` is delegated to
+     *  createBoundedRollingTimeline, which re-relativizes the absolute per-bucket
+     *  counts against the current rolling window and drops rolled-off buckets. */
     snapshot() {
-      if (!validConfig) {
-        return { total, lastReason, lastSeen, timeline: { buckets: [], bucketMs: 0 } };
-      }
-      const currentTime = now();
-      const windowStart = currentTime - windowMs;
-      // Re-relativize each absolute slot against the current window (mirrors
-      // summarizeTimeline's idx math, summary.mjs:372-376) and merge into relative
-      // buckets. Rolled-off slots (idx < 0) are deleted for good — a record can
-      // never re-enter a slot whose time has passed, so dropping them on read bounds
-      // the map at ≤ maxBuckets without losing signal.
-      const relative = new Map();
-      for (const [slot, count] of counts) {
-        const bucketStart = slot * bucketMs; // a representative time inside the slot
-        let idx = Math.floor((bucketStart - windowStart) / bucketMs);
-        if (idx < 0) {
-          counts.delete(slot); // rolled off the window — drop for good (memory bound)
-          continue;
-        }
-        if (idx >= maxBuckets) idx = maxBuckets - 1; // fold the top boundary into the newest bucket
-        relative.set(idx, (relative.get(idx) ?? 0) + count);
-      }
-      const buckets = [...relative.entries()]
-        .sort((a, b) => a[0] - b[0])
-        .map(([idx, count]) => {
-          const bucketStart = windowStart + idx * bucketMs;
-          return { bucketStart, bucketEnd: bucketStart + bucketMs, count };
-        });
-      return { total, lastReason, lastSeen, timeline: { buckets, bucketMs } };
+      return { total, lastReason, lastSeen, timeline: timeline.snapshot() };
     },
   };
 }
@@ -1014,24 +1016,11 @@ export function createDedupTally({
   let total = 0;
   let lastSeen = null;
 
-  // Degenerate-config guard mirrors summarizeTimeline / createPersistErrorTally: a
-  // bad windowMs/maxBuckets override collapses the timeline to { buckets: [], bucketMs: 0 }
-  // — never a huge/NaN array. The scalar tally (total/lastSeen) is unaffected and
-  // keeps working regardless.
-  const validConfig = Number.isFinite(windowMs) && windowMs > 0 && Number.isFinite(maxBuckets) && maxBuckets >= 1;
-  const bucketMs = validConfig ? windowMs / maxBuckets : 0;
-
-  // Counts keyed by ABSOLUTE epoch-aligned bucket slot (floor(when / bucketMs)) — the
-  // same absolute-slot-then-re-relativize timeline as createPersistErrorTally. The
-  // tally records INCREMENTALLY — one record() at a time, NO retained event list
-  // (unlike summarizeTimeline, a PURE function over a retained event array with a
-  // SINGLE snapshot now()) — so it cannot re-derive buckets from events at snapshot
-  // time. Instead it keys counts by absolute slot and re-relativizes them against
-  // the CURRENT rolling window at snapshot(), dropping slots that have rolled off.
-  // Bounded at maxBuckets by construction: every surviving slot maps to a relative
-  // idx clamped to [0, maxBuckets-1] (mirroring summarizeTimeline's top-boundary
-  // fold), so a sustained retry storm cannot grow the bucket count.
-  const counts = new Map();
+  // The bounded rolling-window timeline (WARDEN-834): the stateful twin of the
+  // pure summarizeTimeline, shared by all three tallies via a single helper. See
+  // createBoundedRollingTimeline for the degenerate-config guard, the absolute-slot
+  // + re-relativize math, the rolloff GC, and the top-boundary fold.
+  const timeline = createBoundedRollingTimeline({ now, maxBuckets, windowMs });
 
   return {
     /** Record one dedup hit. Bounded: accumulates a total COUNT, tracks only the
@@ -1041,46 +1030,18 @@ export function createDedupTally({
      *  no reason sample (unlike the rejections / persistErrors tallies). */
     record() {
       total += 1;
+      // A SINGLE now() read serves both lastSeen and the timeline slot — one clock
+      // read per dedup, never two. The helper's bump() takes that externally-read
+      // timestamp rather than reading now() itself.
       lastSeen = now();
-      if (validConfig) {
-        const slot = Math.floor(lastSeen / bucketMs);
-        counts.set(slot, (counts.get(slot) ?? 0) + 1);
-      }
+      timeline.bump(lastSeen);
     },
     /** A stable point-in-time copy of the aggregate (a later record does not mutate
-     *  a previously-returned snapshot). The `timeline` re-relativizes the absolute
-     *  per-bucket counts against the current rolling window — buckets older than the
-     *  window have rolled off and are dropped (and garbage-collected from the map so
-     *  a long-lived receiver cannot leak slots without bound). */
+     *  a previously-returned snapshot). The `timeline` is delegated to
+     *  createBoundedRollingTimeline, which re-relativizes the absolute per-bucket
+     *  counts against the current rolling window and drops rolled-off buckets. */
     snapshot() {
-      if (!validConfig) {
-        return { total, lastSeen, timeline: { buckets: [], bucketMs: 0 } };
-      }
-      const currentTime = now();
-      const windowStart = currentTime - windowMs;
-      // Re-relativize each absolute slot against the current window (mirrors
-      // summarizeTimeline's idx math) and merge into relative buckets. Rolled-off
-      // slots (idx < 0) are deleted for good — a record can never re-enter a slot
-      // whose time has passed, so dropping them on read bounds the map at
-      // ≤ maxBuckets without losing signal.
-      const relative = new Map();
-      for (const [slot, count] of counts) {
-        const bucketStart = slot * bucketMs; // a representative time inside the slot
-        let idx = Math.floor((bucketStart - windowStart) / bucketMs);
-        if (idx < 0) {
-          counts.delete(slot); // rolled off the window — drop for good (memory bound)
-          continue;
-        }
-        if (idx >= maxBuckets) idx = maxBuckets - 1; // fold the top boundary into the newest bucket
-        relative.set(idx, (relative.get(idx) ?? 0) + count);
-      }
-      const buckets = [...relative.entries()]
-        .sort((a, b) => a[0] - b[0])
-        .map(([idx, count]) => {
-          const bucketStart = windowStart + idx * bucketMs;
-          return { bucketStart, bucketEnd: bucketStart + bucketMs, count };
-        });
-      return { total, lastSeen, timeline: { buckets, bucketMs } };
+      return { total, lastSeen, timeline: timeline.snapshot() };
     },
   };
 }
