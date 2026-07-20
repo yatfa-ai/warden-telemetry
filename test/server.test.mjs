@@ -226,6 +226,14 @@ const crashEvent = {
   timestamp: 9,
   reason: 'oom',
 };
+const stallEvent = {
+  schemaVersion: 1,
+  type: 'performance-stall',
+  runtime: 'main',
+  timestamp: 7,
+  lagMs: 750,
+  source: 'event-loop',
+};
 
 test('GET /summary returns the aggregate over a pre-populated store → 200 + JSON', async () => {
   const store = readableStore([errorEvent, crashEvent]);
@@ -688,6 +696,31 @@ test('GET /summary?platform=win32 scopes byType / topErrorNames / topSignatures 
   ]);
   // platforms collapses to the scoped platform only.
   assert.deepEqual(body.platforms, { win32: 2 }, 'platforms collapses to {win32: matched}');
+});
+
+test('GET /summary?platform=win32 scopes the stalls magnitude aggregate to win32 stalls only', async () => {
+  // The new `stalls` field flows through the `...summarize(filtered)` spread, so
+  // the SAME pre-summarize filter (WARDEN-727) scopes it for free: a maintainer who
+  // spots a win32 freeze spike can scope /summary?platform=win32 and read that
+  // platform's stall SEVERITY with no new filter. Seed a darwin 50ms micro-hitch +
+  // a win32 5s hard freeze; scoping to win32 must drop the darwin stall entirely
+  // (count === matched, max reflects ONLY the win32 freeze).
+  const store = readableStore([
+    { ...stallEvent, platform: 'darwin', lagMs: 50, source: 'event-loop', timestamp: 1_800_000 },
+    { ...stallEvent, platform: 'win32', lagMs: 5000, source: 'unresponsive', timestamp: 1_800_000 },
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.matched, 1, 'only the win32 stall survives the filter');
+  assert.equal(body.stalls.count, 1, 'count === the scoped subset');
+  assert.equal(body.stalls.count, body.byType['performance-stall'], 'count-match invariant holds when scoped');
+  assert.equal(body.stalls.max, 5000, 'max reflects ONLY the win32 freeze, not the dropped darwin hitch');
+  assert.deepEqual(body.stalls.bySource, {
+    unresponsive: { count: 1, min: 5000, avg: 5000, max: 5000 },
+  });
 });
 
 test('GET /summary?platform=win32 scopes the TIMELINE to win32 arrivals only', async () => {

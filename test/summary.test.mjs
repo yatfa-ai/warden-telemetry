@@ -356,6 +356,106 @@ test('platforms is empty when no events carry an OS label', () => {
   assert.deepEqual(s.platforms, {});
 });
 
+// ── STALL SEVERITY — magnitude aggregate split by source (WARDEN-854) ──────────
+// `stalls` is the MAGNITUDE axis the stall COUNT (`byType` / `topSignatures`)
+// cannot show: 500 × 50ms micro-hitches and 500 × 5s hard freezes read byte-
+// identically on every other surface. It captures the `lagMs` distribution
+// (min / avg / max — the real user-perceived freeze duration) of performance-stall
+// events, split by `source`. Mirrors the appVersions / platforms discipline:
+// `count === byType['performance-stall']` (the magnitude + count surfaces agree),
+// min/avg/max over the finite-lagMs subset, a clean zeroed empty shape, skip-robust
+// on a non-finite / absent lagMs (skipped from stats, STILL counted), and it never
+// echoes raw events or identifiers.
+
+test('stalls.count matches byType[performance-stall] and max is the headline freeze duration', () => {
+  // 50 / 200 / 5000 across both sources → max = 5000 (the freeze a user actually
+  // felt, not buried in the average), avg = 1750, min = 50.
+  const events = [
+    { ...validStall, lagMs: 50, source: 'event-loop' },
+    { ...validStall, lagMs: 5000, source: 'unresponsive' },
+    { ...validStall, lagMs: 200, source: 'event-loop' },
+  ];
+  const s = summarize(events);
+  assert.equal(s.stalls.count, 3);
+  assert.equal(
+    s.stalls.count, s.byType['performance-stall'],
+    'the magnitude count agrees with the count surface'
+  );
+  assert.equal(s.stalls.min, 50);
+  assert.equal(s.stalls.avg, 1750);
+  assert.equal(s.stalls.max, 5000, 'max is the worst freeze a user actually felt');
+});
+
+test('stalls.bySource splits event-loop jank from unresponsive renderer hangs', () => {
+  const events = [
+    { ...validStall, lagMs: 50, source: 'event-loop' },
+    { ...validStall, lagMs: 100, source: 'event-loop' },
+    { ...validStall, lagMs: 5000, source: 'unresponsive' },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.stalls.bySource, {
+    'event-loop': { count: 2, min: 50, avg: 75, max: 100 },
+    unresponsive: { count: 1, min: 5000, avg: 5000, max: 5000 },
+  });
+});
+
+test('stalls is a clean zeroed shape on a stall-free store (no false alarm)', () => {
+  // Non-stall events contribute nothing — stalls reads only performance-stall.
+  const s = summarize([validError, validCrash]);
+  assert.deepEqual(s.stalls, { count: 0, min: null, avg: 0, max: null, bySource: {} });
+  // empty input too
+  assert.deepEqual(summarize([]).stalls, { count: 0, min: null, avg: 0, max: null, bySource: {} });
+});
+
+test('stalls: a non-finite lagMs (NaN / Infinity) is skipped from stats but STILL counted', () => {
+  // The load-bearing guard: validateBaseEvent only typeof-checks lagMs (schema.ts),
+  // so NaN / Infinity can reach summarize(). An unguarded Math.min/max or running
+  // average would poison the whole aggregate from a single bad record.
+  const events = [
+    { ...validStall, lagMs: NaN, source: 'event-loop' },
+    { ...validStall, lagMs: Infinity, source: 'event-loop' },
+    { ...validStall, lagMs: 500, source: 'event-loop' },
+  ];
+  const s = summarize(events);
+  assert.equal(s.stalls.count, 3, 'the bad records are still counted');
+  assert.equal(s.stalls.count, s.byType['performance-stall'], 'count-match invariant holds');
+  assert.equal(s.stalls.min, 500);
+  assert.equal(s.stalls.avg, 500);
+  assert.equal(s.stalls.max, 500, 'min/avg/max reflect ONLY the finite record');
+  // the per-source bucket counts the bad records too, but its stats stay finite
+  assert.deepEqual(s.stalls.bySource, {
+    'event-loop': { count: 3, min: 500, avg: 500, max: 500 },
+  });
+});
+
+test('stalls: an absent lagMs is skipped from stats but STILL counted', () => {
+  const events = [
+    { ...validStall, lagMs: undefined, source: 'event-loop' },
+    { ...validStall, lagMs: 500, source: 'event-loop' },
+  ];
+  const s = summarize(events);
+  assert.equal(s.stalls.count, 2);
+  assert.equal(s.stalls.count, s.byType['performance-stall']);
+  assert.equal(s.stalls.avg, 500);
+  assert.equal(s.stalls.max, 500);
+});
+
+test('stalls: a sourceless stall is counted overall but not bucketed in bySource', () => {
+  // A stall with no `source` is malformed; it is counted (count-match invariant)
+  // and its magnitude still feeds the overall rollup, but it yields no per-source
+  // bucket (mirrors signatureOf, which returns null for a sourceless stall).
+  const events = [
+    { ...validStall, lagMs: 500, source: 'event-loop' },
+    { type: 'performance-stall', lagMs: 9000 }, // no source
+  ];
+  const s = summarize(events);
+  assert.equal(s.stalls.count, 2);
+  assert.equal(s.stalls.max, 9000, 'overall max still reflects the sourceless stall');
+  assert.deepEqual(s.stalls.bySource, {
+    'event-loop': { count: 1, min: 500, avg: 500, max: 500 },
+  });
+});
+
 // ── TIME WINDOW ───────────────────────────────────────────────────────────────
 
 test('firstSeen/lastSeen are the min/max of finite timestamps', () => {
@@ -387,6 +487,19 @@ test('the summary never echoes raw events or extended-tier identifiers (aggregat
       chatName: 'Refactor auth',
       sessionName: 'claude-7b3a2f1',
     },
+    // A stall carrying the SAME redacted free-text + extended-tier identifiers, to
+    // extend the trust model over the new `stalls` magnitude aggregate (WARDEN-854):
+    // its `lagMs` (a non-identifying magnitude) + `source` ARE aggregated, but the
+    // message / chatName / sessionName MUST NOT reach the summary any more than the
+    // error's do.
+    {
+      ...validStall,
+      lagMs: 5000,
+      source: 'unresponsive',
+      message: 'super secret stack detail',
+      chatName: 'Refactor auth',
+      sessionName: 'claude-7b3a2f1',
+    },
   ];
   const s = summarize(events);
   const json = JSON.stringify(s);
@@ -404,7 +517,18 @@ test('the summary never echoes raw events or extended-tier identifiers (aggregat
   assert.equal(json.includes('renderChat'), true, 'non-identifying frame function is in a signature');
   assert.deepEqual(s.topSignatures, [
     { signature: 'TypeError @ App.tsx:142 (renderChat)', type: 'error', count: 1 },
+    // the added stall yields a `stall:unresponsive` signature (count 1, tie-broken
+    // after the error by signature asc — 'T' < 's').
+    { signature: 'stall:unresponsive', type: 'performance-stall', count: 1 },
   ]);
+  // The stalls aggregate reads ONLY the non-identifying `lagMs` magnitude + `source`
+  // — the freeze duration is aggregated (max = the 5000ms a user felt) and the
+  // source is a bucket key, but the stall's message / identifiers never appear.
+  assert.equal(s.stalls.count, 1);
+  assert.equal(s.stalls.max, 5000);
+  assert.deepEqual(s.stalls.bySource, {
+    unresponsive: { count: 1, min: 5000, avg: 5000, max: 5000 },
+  });
 });
 
 // ── SKIP-ROBUST ───────────────────────────────────────────────────────────────

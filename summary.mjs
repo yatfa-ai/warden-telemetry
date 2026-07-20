@@ -51,6 +51,25 @@
 // `chatName`/`sessionName` (the only identifiers ever present); an error whose
 // frames are empty / lack the location fields degrades to the bare `name` (exactly
 // the `topErrorNames` bucket), so nothing regresses.
+//
+// `stalls` (WARDEN-854) is the MAGNITUDE axis the stall COUNT (`byType` /
+// `topSignatures`) cannot show: 500 × 50ms micro-hitches and 500 × 5s hard freezes
+// read byte-identically on every other surface. It captures the `lagMs`
+// distribution (min / avg / max — the REAL user-perceived freeze duration the
+// client already populates end-to-end) of `performance-stall` events, split by
+// `source` so a maintainer can tell event-loop jank (`'event-loop'`) from renderer
+// hangs (`'unresponsive'`); `max` is the headline (the worst freeze a user actually
+// felt, not buried in the average). `count` is ALL `performance-stall` events (it
+// MUST equal `byType['performance-stall']` so the magnitude surface and the count
+// surface agree); `min`/`avg`/`max` are computed over the FINITE-`lagMs` subset.
+// `lagMs` is a non-identifying magnitude (an epoch-ms-free integer ≥ 0) already
+// enumerated in the consent / verifiability surface, so this introduces NO new
+// collection, wire field, or schema bump — a pure read-side aggregate over
+// already-accepted events, identical in posture to `appVersions`/`platforms`. A
+// non-finite `lagMs` (NaN / Infinity — which `validateBaseEvent` does NOT reject,
+// since `typeof NaN === 'number'`) is SKIPPED from `min`/`avg`/`max` but the event
+// is STILL counted, so one bad record can never poison the whole aggregate to
+// NaN/Infinity (the failure `summarize()` documents it defends against).
 
 import { BASE_EVENT_TYPES } from './schema.ts';
 
@@ -163,6 +182,28 @@ function _frameSegment(frame) {
 }
 
 /**
+ * Render a stall-severity accumulator (overall OR per-source) as the public
+ * `{ count, min, avg, max }` snapshot (WARDEN-854). `count` is EVERY stall in the
+ * accumulator (it underpins the `count === byType['performance-stall']` invariant);
+ * `min`/`avg`/`max` reflect ONLY the finite-`lagMs` subset. With no finite record
+ * seen, `min`/`max` are `null` (mirrors `firstSeen`/`lastSeen`; `lagMs ≥ 0` makes
+ * `0` an ambiguous empty sentinel) and `avg` is `0` (the guarded `sum / count`,
+ * so the empty case can never read as `NaN`).
+ *
+ * @param {{ count: number, sum: number, finiteCount: number, min: number | null, max: number | null }} acc
+ * @returns {{ count: number, min: number | null, avg: number, max: number | null }}
+ * @private
+ */
+function _stallSnapshot({ count, sum, finiteCount, min, max }) {
+  return {
+    count,
+    min: finiteCount > 0 ? min : null,
+    avg: finiteCount > 0 ? sum / finiteCount : 0,
+    max: finiteCount > 0 ? max : null,
+  };
+}
+
+/**
  * Summarize a batch of persisted telemetry events into aggregate signal.
  *
  * Pure and total: a non-array (or empty) input yields a fully-zeroed summary so
@@ -180,6 +221,8 @@ function _frameSegment(frame) {
  *   schemaVersions: Record<string, number>,
  *   appVersions: Record<string, number>,
  *   platforms: Record<string, number>,
+ *   stalls: { count: number, min: number | null, avg: number, max: number | null,
+ *             bySource: Record<string, { count: number, min: number | null, avg: number, max: number | null }> },
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
@@ -196,6 +239,16 @@ export function summarize(events) {
   const schemaVersions = {};
   const appVersions = {};
   const platforms = {};
+  // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
+  // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
+  // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
+  // seen shape; lagMs ≥ 0 per schema, so 0 would be an ambiguous empty sentinel).
+  let stallCount = 0;
+  let stallSum = 0;
+  let stallFiniteCount = 0;
+  let stallMin = null;
+  let stallMax = null;
+  const stallBySource = new Map();
   // Failure signatures (WARDEN-707). Keyed by `${type} ${signature}` so two
   // events of different types can NEVER collide into one bucket even if their
   // signature strings happened to match (defensive — in practice each type's
@@ -212,7 +265,7 @@ export function summarize(events) {
     if (!event || typeof event !== 'object') continue;
     total += 1;
 
-    const { type, name, schemaVersion, timestamp, appVersion, platform } = event;
+    const { type, name, schemaVersion, timestamp, appVersion, platform, lagMs, source } = event;
 
     if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(byType, type)) {
       byType[type] += 1;
@@ -238,6 +291,42 @@ export function summarize(events) {
     // malformed value never crashes or produces a junk bucket.
     if (typeof platform === 'string' && platform.length > 0) {
       platforms[platform] = (platforms[platform] ?? 0) + 1;
+    }
+    // Stall MAGNITUDE aggregate (WARDEN-854): the `lagMs` distribution the stall
+    // COUNT (byType / topSignatures) discards. `count` is EVERY performance-stall
+    // event (it MUST equal byType['performance-stall'] so the magnitude + count
+    // surfaces agree); min/avg/max are computed over the FINITE-`lagMs` subset.
+    // The Number.isFinite guard is load-bearing: validateBaseEvent only
+    // typeof-checks lagMs (schema.ts), so NaN / Infinity can reach here — an
+    // unguarded Math.min/max or running average would poison the whole aggregate
+    // from one bad record. A non-finite / absent lagMs is skipped from the stats
+    // but the event is STILL counted. Split by `source` (a PRESENT non-empty
+    // string, matching signatureOf's stall rule) so event-loop jank is
+    // distinguishable from renderer hangs; a sourceless stall is counted overall
+    // but not bucketed in bySource.
+    if (type === 'performance-stall') {
+      stallCount += 1;
+      const finiteLag = typeof lagMs === 'number' && Number.isFinite(lagMs);
+      if (finiteLag) {
+        stallFiniteCount += 1;
+        stallSum += lagMs;
+        if (stallMin === null || lagMs < stallMin) stallMin = lagMs;
+        if (stallMax === null || lagMs > stallMax) stallMax = lagMs;
+      }
+      if (typeof source === 'string' && source.length > 0) {
+        let acc = stallBySource.get(source);
+        if (!acc) {
+          acc = { count: 0, sum: 0, finiteCount: 0, min: null, max: null };
+          stallBySource.set(source, acc);
+        }
+        acc.count += 1;
+        if (finiteLag) {
+          acc.finiteCount += 1;
+          acc.sum += lagMs;
+          if (acc.min === null || lagMs < acc.min) acc.min = lagMs;
+          if (acc.max === null || lagMs > acc.max) acc.max = lagMs;
+        }
+      }
     }
     // Failure signature (WARDEN-707): rank DISTINCT failures across ALL base
     // types in one list. `signatureOf` is skip-robust (returns null for an
@@ -285,6 +374,16 @@ export function summarize(events) {
     .slice(0, TOP_SIGNATURES_CAP)
     .map(({ signature, type, count }) => ({ signature, type, count }));
 
+  // Stall-severity rollup (WARDEN-854): the overall magnitude snapshot plus the
+  // per-source breakdown (insertion order — a maintainer reads the sources in the
+  // order they first appeared; deepEqual is order-insensitive, so tests are stable).
+  const stalls = {
+    ..._stallSnapshot({ count: stallCount, sum: stallSum, finiteCount: stallFiniteCount, min: stallMin, max: stallMax }),
+    bySource: Object.fromEntries(
+      [...stallBySource.entries()].map(([source, acc]) => [source, _stallSnapshot(acc)])
+    ),
+  };
+
   return {
     total,
     byType,
@@ -293,6 +392,7 @@ export function summarize(events) {
     schemaVersions,
     appVersions,
     platforms,
+    stalls,
     firstSeen,
     lastSeen,
   };
