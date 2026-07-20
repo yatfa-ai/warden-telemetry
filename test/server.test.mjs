@@ -1607,10 +1607,12 @@ test('rejections tally: record() with a non-string reason stores null (no unboun
 });
 
 // ── byDeclaredVersion: the 415 drift breakdown (WARDEN-761) ───────────────────
-// A bounded histogram of the DECLARED schema version on 415-rejected batches —
-// the drift population (which client versions are still sending during a bump).
-// Enum-bounded like `byStatus`, populated ONLY by 415s (only they pass a
-// declaredVersion), mirroring summary.mjs's `schemaVersions` presence rule.
+// A histogram of the DECLARED schema version on 415-rejected batches — the drift
+// population (which client versions are still sending during a bump). Bounded by a
+// top-N distinct-key cap + ONE overflow bucket (WARDEN-829), NOT enum-bounded: a
+// client-declared version is the raw, attacker-controlled `x-telemetry-schema`
+// header, NOT a fixed enum like `byStatus`. Populated ONLY by 415s (only they pass
+// a declaredVersion); the cap is exercised in the WARDEN-829 adversarial test below.
 
 test('byDeclaredVersion: 415s with DIFFERENT declared versions bucket distinctly (one drifting client vs many)', () => {
   const tally = createRejectionTally({ now: () => 0 });
@@ -1660,6 +1662,69 @@ test('byDeclaredVersion: BOUNDED — a sustained drift storm collapses to enum k
   const snap = tally.snapshot();
   assert.equal(snap.total, 1000);
   assert.deepEqual(snap.byDeclaredVersion, { '3': 500, '5': 500 }, 'two enum keys — not 1000 entries');
+});
+
+test('byDeclaredVersion: WARDEN-829 adversarial bound — ≥10k UNIQUE declared versions collapse to N+1 keys (no memory/response growth)', () => {
+  // The receiver is OPEN by default; `x-telemetry-schema` is raw attacker-controlled
+  // header text. Pre-WARDEN-829 every distinct value grew `byDeclaredVersion` by one
+  // key FOREVER — unbounded live memory + an ever-growing GET /summary payload (one-
+  // sided amplification: a cheap probe per distinct header value). The top-N +
+  // overflow cap must bound the distinct-key cardinality regardless of input size.
+  // N is set tiny (4) so the cap is exercised deterministically, independent of the
+  // 32 default, and the first-N insertion-order tracking is observable exactly.
+  const N = 4;
+  const tally = createRejectionTally({ now: () => 0, maxDeclaredVersions: N });
+  const UNIQUE = 10_000;
+  for (let i = 0; i < UNIQUE; i++) {
+    tally.record({ status: 415, reason: 'drift', declaredVersion: `v${i}` }); // 10k DISTINCT values
+  }
+  const snap = tally.snapshot();
+
+  // (a) Cardinality bound: exactly N tracked buckets + ONE overflow bucket — NOT 10000 keys.
+  //     This is the /summary-payload-does-not-grow-linearly-with-request-count check.
+  assert.equal(Object.keys(snap.byDeclaredVersion).length, N + 1, 'collapses to N+1 keys regardless of input cardinality — /summary stays bounded');
+
+  // (b) The first N distinct values are tracked as their own buckets (insertion order);
+  //     every further distinct value folds into the single counted `__overflow__` bucket.
+  assert.deepEqual(
+    snap.byDeclaredVersion,
+    { v0: 1, v1: 1, v2: 1, v3: 1, __overflow__: UNIQUE - N },
+    'first N distinct values tracked; the remaining UNIQUE-N fold into ONE overflow bucket',
+  );
+
+  // (c) No count loss: the overflow COUNTS (not drops), so the sum of byDeclaredVersion
+  //     values still reflects every recorded 415...
+  const sum = Object.values(snap.byDeclaredVersion).reduce((a, b) => a + b, 0);
+  assert.equal(sum, UNIQUE, 'overflow counts — every 415 is still tallied, none silently dropped');
+  // ...and `total` / byStatus carry the true count (not a capped approximation).
+  assert.equal(snap.total, UNIQUE, 'total is the true count, not a capped approximation');
+  assert.equal(snap.byStatus['415'], UNIQUE, 'byStatus is the true 415 count (the bound is on inner cardinality, not total)');
+});
+
+test('byDeclaredVersion: WARDEN-829 — repeats of an already-tracked version bump their OWN bucket, never overflow', () => {
+  // Once a distinct version occupies one of the N tracked slots, further 415s from
+  // that SAME version must increment its own bucket — NOT the overflow bucket (only
+  // a NEW distinct value over the cap overflows). Otherwise legit drift signal (a
+  // single stubborn version hammered repeatedly) would be mis-counted as overflow.
+  const tally = createRejectionTally({ now: () => 0, maxDeclaredVersions: 2 });
+  tally.record({ status: 415, declaredVersion: '3' }); // tracked slot 1
+  tally.record({ status: 415, declaredVersion: '5' }); // tracked slot 2 → cap reached
+  tally.record({ status: 415, declaredVersion: '3' }); // REPEAT of a tracked version → own bucket
+  tally.record({ status: 415, declaredVersion: '9' }); // NEW distinct value over cap → overflow
+  const { byDeclaredVersion: dv } = tally.snapshot();
+  assert.deepEqual(dv, { '3': 2, '5': 1, __overflow__: 1 }, 'repeats bump the tracked bucket; only a NEW distinct value over the cap overflows');
+});
+
+test('byDeclaredVersion: WARDEN-829 — the default cap (32) preserves a realistic distinct-version set with NO overflow', () => {
+  // The cap sits comfortably above the realistic distinct-version count (a handful
+  // during a coordinated bump), so legit drift signal is fully enumerated — only a
+  // broad storm (>32 distinct values) reaches the overflow bucket. Confirms the bound
+  // does not blind the maintainer to ordinary drift.
+  const tally = createRejectionTally({ now: () => 0 }); // default cap = DEFAULT_REJECTION_MAX_DECLARED_VERSIONS (32)
+  for (let i = 1; i <= 10; i++) tally.record({ status: 415, declaredVersion: String(i) }); // 10 realistic versions
+  const { byDeclaredVersion: dv } = tally.snapshot();
+  assert.equal(Object.keys(dv).length, 10, 'all 10 realistic versions tracked distinctly');
+  assert.equal(dv.__overflow__, undefined, 'no overflow bucket — realistic distinct counts stay under the cap');
 });
 
 test('byDeclaredVersion: snapshot() copies the histogram — a later record does not mutate a prior snapshot', () => {

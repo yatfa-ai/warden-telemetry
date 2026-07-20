@@ -433,9 +433,29 @@ export function createRetentionTrigger(
 // ts), plus a `byDeclaredVersion` histogram of the DECLARED schema version on
 // 415-rejected batches (the drift population, WARDEN-761). It does NOT keep one
 // record per rejection or an unbounded set of reason strings, so a sustained
-// drift storm can't grow it without limit. `byDeclaredVersion` is enum-bounded
-// (schema versions are a small set like HTTP statuses in `byStatus`), NOT
-// free-text reason histogramming — the unbounded axis WARDEN-591 scoped out.
+// drift storm can't grow it without limit. `byDeclaredVersion` is bounded by a
+// top-N distinct-key cap + ONE overflow bucket (WARDEN-829): a client-declared
+// schema version is the raw, attacker-controlled `x-telemetry-schema` header on
+// an OPEN-by-default receiver (AUTH_TOKEN unset = OPEN, see createRequestHandler),
+// NOT a fixed enum like the HTTP statuses in `byStatus` — so the distinct keys are
+// CAPPED (≤ maxDeclaredVersions+1) rather than trusted to stay small. This closes
+// the unbounded-memory + response-amplification DoS the prior "enum-bounded"
+// comment falsely ruled out (the receiver is a network listener; one cheap probe
+// per distinct header value grew both the live map and every GET /summary payload).
+
+// The distinct-key cap on `byDeclaredVersion` (WARDEN-829). The declared schema
+// version is the raw `x-telemetry-schema` header — free-text attacker input on an
+// OPEN-by-default receiver, NOT a fixed enum — so unlike `byStatus` (HTTP statuses,
+// a tiny fixed set) the distinct keys CANNOT be trusted to stay small. We track at
+// most `DEFAULT_REJECTION_MAX_DECLARED_VERSIONS` distinct values as their own
+// buckets; every further distinct value folds into ONE counted `__overflow__`
+// bucket, so snapshot().byDeclaredVersion holds ≤ N+1 keys regardless of input
+// cardinality. 32 sits comfortably ABOVE the realistic distinct-version set (a
+// handful like 1/2/3/4 during a coordinated bump — the legit drift signal is
+// preserved) and far below unbounded. Mirrors the COUNT-cap discipline of
+// createSeenKeys's `maxKeys`, adapted to a histogram: top-N + overflow (NOT FIFO
+// eviction) so an early legit version is never evicted by a later adversarial flood.
+export const DEFAULT_REJECTION_MAX_DECLARED_VERSIONS = 32;
 
 // The zeroed shape returned when no tally is wired OR no rejection has been
 // recorded yet — identical to a fresh tally's snapshot(), so an idle receiver
@@ -450,7 +470,7 @@ export function createRetentionTrigger(
 const EMPTY_REJECTIONS = Object.freeze({
   total: 0,
   byStatus: {},
-  byDeclaredVersion: {}, // 415 drift axis (WARDEN-761) — enum-bounded, zeroed when idle
+  byDeclaredVersion: {}, // 415 drift axis (WARDEN-761) — top-N + overflow bounded (WARDEN-829), zeroed when idle
   lastStatus: null,
   lastReason: null,
   lastSeen: null,
@@ -478,7 +498,11 @@ const EMPTY_REJECTIONS = Object.freeze({
  * `maxBuckets` / `windowMs` default to the read-path `DEFAULT_TIMELINE_*` constants
  * (imported from summary.mjs) so the two timelines never drift in granularity.
  *
- * @param {{ now?: () => number, maxBuckets?: number, windowMs?: number }} [opts]
+ * `maxDeclaredVersions` (WARDEN-829) caps the distinct-key cardinality of
+ * `byDeclaredVersion` (top-N + overflow). Optional + defaulted like the timeline
+ * knobs so a test can pass a small N to exercise the cap deterministically.
+ *
+ * @param {{ now?: () => number, maxBuckets?: number, windowMs?: number, maxDeclaredVersions?: number }} [opts]
  * @returns {{
  *   record(rec: { status: number, reason?: string, declaredVersion?: string }): void,
  *   snapshot(): {
@@ -496,13 +520,29 @@ export function createRejectionTally({
   now = Date.now,
   maxBuckets = DEFAULT_TIMELINE_MAX_BUCKETS,
   windowMs = DEFAULT_TIMELINE_WINDOW_MS,
+  maxDeclaredVersions = DEFAULT_REJECTION_MAX_DECLARED_VERSIONS,
 } = {}) {
   let total = 0;
   const byStatus = {};
   const byDeclaredVersion = {};
+  // Distinct declared-version buckets currently tracked as their OWN keys in
+  // `byDeclaredVersion` (excludes the `__overflow__` sentinel). Maintained in
+  // lockstep with record() so the cap check is O(1) — never recomputed by scan.
+  let distinctDeclaredVersions = 0;
   let lastStatus = null;
   let lastReason = null;
   let lastSeen = null;
+
+  // Effective distinct-key cap (WARDEN-829): a finite positive int, else the
+  // default — never unbounded under any misconfiguration (mirrors the
+  // validConfig discipline below: a bad override can't reopen the DoS).
+  const maxDeclared = Number.isFinite(maxDeclaredVersions) && maxDeclaredVersions >= 1
+    ? Math.floor(maxDeclaredVersions)
+    : DEFAULT_REJECTION_MAX_DECLARED_VERSIONS;
+  // Sentinel for the single overflow bucket. A client value that literally equals
+  // `__overflow__` is indistinguishable from the aggregate (benign: same bound, the
+  // count semantics are identical). Chosen to be an unlikely real schema version.
+  const OVERFLOW_KEY = '__overflow__';
 
   // Degenerate-config guard mirrors summarizeTimeline (summary.mjs:347-349) and
   // the persistErrors tally (WARDEN-777): a bad windowMs/maxBuckets override
@@ -536,16 +576,38 @@ export function createRejectionTally({
       const key = String(status);
       total += 1;
       byStatus[key] = (byStatus[key] ?? 0) + 1;
-      // byDeclaredVersion (WARDEN-761): bucket the DECLARED schema version of a
-      // 415-rejected batch — the drift population (a wrong/old client version
-      // still sending during a coordinated bump). Enum-bounded like `byStatus`,
-      // NOT reason-string histogramming. Mirror summary.mjs's `schemaVersions`
-      // pattern: bucket any PRESENT value (incl. scanner non-numerics like "abc"
-      // / ""); absent/missing (undefined/null) → no bucket. Only the 415 seams
-      // pass a declaredVersion, so this naturally reflects drift alone.
+      // byDeclaredVersion (WARDEN-761 / WARDEN-829): bucket the DECLARED schema
+      //  version of a 415-rejected batch — the drift population (a wrong/old client
+      //  version still sending during a coordinated bump). Top-N + overflow (NOT
+      //  enum-bounded): a client-declared version is the raw, free-text
+      //  `x-telemetry-schema` header on an OPEN-by-default receiver, so unlike
+      //  `byStatus` (HTTP statuses, a fixed set) the distinct keys are CAPPED, not
+      //  trusted to stay small. The first `maxDeclared` distinct values get their
+      //  own bucket; every further distinct value folds into ONE counted
+      //  `__overflow__` bucket — so the histogram holds ≤ maxDeclared+1 keys no
+      //  matter how many distinct adversarial values arrive (WARDEN-829 closed the
+      //  unbounded-memory + response-amplification DoS). The overflow COUNT is
+      //  preserved (not dropped) so a maintainer still sees "drift across >N
+      //  versions" without enumerating every adversarial value. Cardinality-cap
+      //  precedent: createSeenKeys's `maxKeys` COUNT cap (top-N + overflow here, not
+      //  FIFO eviction, so an early legit version is never evicted by a later flood).
+      //  Bucket any PRESENT value (incl. scanner non-numerics like "abc" / "");
+      //  absent/missing (undefined/null) → no bucket. Only the 415 seams pass a
+      //  declaredVersion, so this naturally reflects drift alone. hasOwnProperty
+      //  (not `in`/bracket-truthiness) keeps attacker keys like "toString" /
+      //  "constructor" bucketing as ordinary own keys.
       if (declaredVersion !== undefined && declaredVersion !== null) {
         const dvKey = String(declaredVersion);
-        byDeclaredVersion[dvKey] = (byDeclaredVersion[dvKey] ?? 0) + 1;
+        if (Object.prototype.hasOwnProperty.call(byDeclaredVersion, dvKey)) {
+          byDeclaredVersion[dvKey] += 1; // an already-tracked distinct version bumps its own bucket
+        } else if (distinctDeclaredVersions < maxDeclared) {
+          byDeclaredVersion[dvKey] = 1; // new distinct version under the cap → its own bucket
+          distinctDeclaredVersions += 1;
+        } else {
+          // Cap reached → fold this and every further NEW distinct version into the
+          // single overflow bucket: bounded cardinality, no count loss.
+          byDeclaredVersion[OVERFLOW_KEY] = (byDeclaredVersion[OVERFLOW_KEY] ?? 0) + 1;
+        }
       }
       lastStatus = status;
       lastReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
