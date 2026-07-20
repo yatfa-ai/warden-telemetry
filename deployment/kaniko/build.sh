@@ -88,10 +88,24 @@ else
   die "build failed — see logs above"
 fi
 
-# Verify the image is present in the registry before deploying.
-kubectl exec deploy/registry -- sh -c \
-  "wget -qO- http://localhost:5000/v2/warden-telemetry/manifests/${TAG} >/dev/null && echo OK" \
-  || die "registry missing tag ${TAG}"
+# Verify the image is present in the registry before deploying. The registry
+# requires htpasswd auth even on localhost:5000, so authenticate with the creds
+# from the shared yatfa-registry-pull pull secret (same creds kaniko pushed
+# with). We check tags/list (not the manifests endpoint) because kaniko pushes
+# OCI manifests and a manifest GET without the matching Accept media-type 404s
+# regardless of whether the tag exists.
+AUTH="$(kubectl -n default get secret yatfa-registry-pull \
+  -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null | base64 -d 2>/dev/null \
+  | grep -oE '"auth"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+  | sed -E 's/.*:.*"([^"]*)"$/\1/' || true)"
+if [ -n "$AUTH" ]; then
+  TAGS="$(kubectl exec deploy/registry -- sh -c \
+    "wget -qO- --header='Authorization: Basic ${AUTH}' http://localhost:5000/v2/warden-telemetry/tags/list" 2>/dev/null || true)"
+  echo "$TAGS" | grep -q "\"${TAG}\"" \
+    || die "registry missing tag ${TAG} (tags/list: ${TAGS:-<empty>})"
+else
+  echo "  (skip registry verify: could not read pull-secret creds — kaniko reported Pushed; relying on the rollout pull below)"
+fi
 
 # Pin the Deployment to the explicit sha tag (not :latest) and roll out.
 c_blu "== pinning Deployment/warden-telemetry → ${REGISTRY}/warden-telemetry:${TAG} =="
