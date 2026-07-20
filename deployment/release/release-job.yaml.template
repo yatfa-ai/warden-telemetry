@@ -1,0 +1,199 @@
+# In-cluster release orchestrator for warden-telemetry. One Job does the whole
+# deploy:
+#   1. clone warden-telemetry at __REL_GIT_REF__
+#   2. render + apply the kaniko build (deployment/kaniko/kaniko-job.yaml.template)
+#   3. kubectl wait for it to complete
+#   4. pin deployment/warden-telemetry to the exact sha-<short> image tag
+#   5. delete the kaniko Job
+#
+# GitHub Actions (yatfa-ai/warden-telemetry's .github/workflows/build-image.yml)
+# applies this manifest and exits in seconds — the build + deploy happen entirely
+# in-cluster (no GHA minutes billed while waiting).
+#
+# Placeholders (substituted by .github/workflows/build-image.yml). Namespaced
+# __REL_*__ on purpose: build-image.yml runs sed over this WHOLE file, so any
+# token also used as a kaniko-template placeholder (__JOB_NAME__, __GIT_REF__,
+# __IMAGE_TAG__, __REPO_URL__, __GIT_PASSWORD__) would be pre-substituted here
+# and corrupt the runtime kaniko render. Keep __REL_*__ distinct.
+#   __REL_JOB_NAME__   unique, e.g. warden-telemetry-release-abc1234
+#   __REL_GIT_REF__    branch/tag to build + deploy, e.g. prod
+#   __REL_IMAGE_TAG__  e.g. sha-abc1234
+#   __REL_SHORT_SHA__  7-char sha
+#   __REL_REPO_URL__   e.g. github.com/yatfa-ai/warden-telemetry.git
+#
+# Authentication — NO PAT. The release Job clones warden-telemetry as the GitHub
+# App `tinker-ai-app` (installed on yatfa-ai/warden-telemetry with contents:read).
+# It reuses the SAME App creds as yatfa-web / yatfa-router — nothing
+# warden-telemetry-specific to create:
+#   - Secret/yatfa-github-app   → PEM, mounted at /etc/github-app/privkey.pem
+#   - ConfigMap/yatfa-config    → GH_APP_ID (read via configMapKeyRef)
+# Needed because GHA's GITHUB_TOKEN expires when the dispatching workflow exits,
+# but the kaniko clone runs ~minutes later in-cluster. Mirrors yatfa-router's
+# release Job (minus the version-stamp — warden-telemetry has no VERSION file).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __REL_JOB_NAME__
+  namespace: default
+  labels:
+    app: warden-telemetry
+    component: release
+spec:
+  backoffLimit: 0        # don't retry — a half-pinned image is worse than a failed build
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: github-actions
+      containers:
+        - name: release
+          # ruby:3.2-slim has ruby + bundler; kubectl + git added at runtime
+          # (~5s) so we don't maintain a custom image. Same base as yatfa's
+          # release Job.
+          image: ruby:3.2-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            # All values quoted: a purely numeric SHORT_SHA would render as an
+            # int and k8s would reject it.
+            - name: GIT_REF
+              value: "__REL_GIT_REF__"
+            - name: IMAGE_TAG
+              value: "__REL_IMAGE_TAG__"
+            - name: SHORT_SHA
+              value: "__REL_SHORT_SHA__"
+            - name: REPO
+              value: "__REL_REPO_URL__"
+            - name: GH_APP_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: yatfa-config
+                  key: GH_APP_ID
+            # Telegram failure notifier (on_exit trap below). Reuses the shared
+            # bot token from yatfa-secret; chat id is the shared ops chat. Same
+            # convention as yatfa / yatfa-router release Jobs.
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: yatfa-secret
+                  key: TELEGRAM_BOT_TOKEN
+            - name: TELEGRAM_CHAT_ID
+              value: "988261932"
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              # --- Failure notifier (traps EXIT) ---
+              on_exit() {
+                local rc=$?
+                [ "$rc" -eq 0 ] && return 0
+                set +e
+                local step="${STEP:-setup}"
+                local detail=""
+                if [ -n "${BUILD_JOB:-}" ]; then
+                  detail="$(kubectl logs "job/${BUILD_JOB}" --tail=50 2>/dev/null \
+                    | grep -iE 'aborted|error|fail|cannot|not found|exception|keyerror|undefined|exit status' \
+                    | grep -vE 'INFO\[|Resolving srcs|snapshot|COPY |^[[:space:]]' | tail -8)"
+                fi
+                [ -n "$detail" ] || detail="(see release Job log: kubectl -n default logs job/__REL_JOB_NAME__)"
+                local msg
+                printf -v msg '❌ warden-telemetry deploy failed — %s\n\nStep: %s\n%s\n\nReceiver is still on the previous image. GitHub Actions may show green.' \
+                  "${SHORT_SHA:-?}" "$step" "$detail"
+                curl -s --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                  --data-urlencode "text=${msg}" \
+                  >/dev/null 2>&1
+              }
+              trap on_exit EXIT
+
+              STEP="setup (install kubectl/git)"
+              apt-get update -qq
+              apt-get install -y --no-install-recommends git curl ca-certificates >/dev/null
+              KUBECTL_VER="$(curl -sSL https://dl.k8s.io/release/stable.txt)"
+              curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VER}/bin/linux/amd64/kubectl"
+              chmod +x /usr/local/bin/kubectl
+              kubectl version --client
+
+              STEP="GitHub App token mint"
+              # --- Mint a GitHub App installation token (no PAT) ---
+              # Authenticate as `tinker-ai-app` (installed on the repo). Sign an
+              # RS256 JWT with the mounted PEM (iss = GH_APP_ID), discover the
+              # installation id for THIS repo, exchange for a 1h token. $GH_TOKEN
+              # is consumed by the clone and substituted as __GIT_PASSWORD__ in
+              # the kaniko template. Pure stdlib ruby for the JWT; curl for the
+              # API calls. Verbatim from yatfa's release Job.
+              OWNER_REPO="${REPO%.git}"; OWNER_REPO="${OWNER_REPO#github.com/}"
+              PEM="/etc/github-app/privkey.pem"
+              [ -r "$PEM" ] || { echo "!! $PEM missing — Secret/yatfa-github-app not mounted"; exit 1; }
+              JWT=$(APP_ID="${GH_APP_ID:?GH_APP_ID missing from ConfigMap/yatfa-config}" \
+                ruby -rjson -ropenssl -rbase64 -e '
+                  app_id = ENV.fetch("APP_ID")
+                  key    = OpenSSL::PKey::RSA.new(File.read("/etc/github-app/privkey.pem"))
+                  b64    = ->(s) { Base64.urlsafe_encode64(s, padding: false) }
+                  now    = Time.now.to_i
+                  header  = b64.call({ alg: "RS256", typ: "JWT" }.to_json)
+                  payload = b64.call({ iat: now - 60, exp: now + 540, iss: app_id }.to_json)
+                  input   = "#{header}.#{payload}"
+                  print "#{input}.#{b64.call(key.sign(OpenSSL::Digest::SHA256.new, input))}"
+                ') || { echo "!! JWT signing failed (is ruby openssl present in the image?)"; exit 1; }
+
+              INSTALL_ID=$(curl -fsSL -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${OWNER_REPO}/installation") \
+                || { echo "!! GitHub App not installed on ${OWNER_REPO} (or GH_APP_ID/PEM wrong)"; exit 1; }
+              INSTALL_ID=$(printf '%s' "$INSTALL_ID" | ruby -rjson -e 'print JSON.parse(STDIN.read)["id"]')
+
+              GH_TOKEN=$(curl -fsSL -X POST -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens") \
+                || { echo "!! installation access token mint failed"; exit 1; }
+              GH_TOKEN=$(printf '%s' "$GH_TOKEN" | ruby -rjson -e 'print JSON.parse(STDIN.read)["token"]')
+              export GH_TOKEN
+              echo "GitHub App token minted (installation ${INSTALL_ID}, repo ${OWNER_REPO})"
+
+              STEP="git clone ${GIT_REF}"
+              git clone --depth 1 --branch "$GIT_REF" \
+                "https://x-access-token:${GH_TOKEN}@${REPO}" /work
+              cd /work
+
+              BUILD_JOB="warden-telemetry-build-${SHORT_SHA}"
+              BUILD_JOB="${BUILD_JOB:0:63}"; BUILD_JOB="${BUILD_JOB%-}"
+
+              STEP="kaniko build (${BUILD_JOB})"
+              # Delete any prior kaniko Job for this SHA before applying: Job
+              # spec.template is immutable and GIT_PASSWORD changes each run
+              # (fresh token), so an apply over a completed Job is rejected.
+              kubectl delete job "${BUILD_JOB}" --ignore-not-found
+              sed \
+                -e "s|__JOB_NAME__|${BUILD_JOB}|g" \
+                -e "s|__GIT_REF__|${GIT_REF}|g" \
+                -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
+                -e "s|__REPO_URL__|${REPO}|g" \
+                -e "s|__GIT_PASSWORD__|${GH_TOKEN}|g" \
+                deployment/kaniko/kaniko-job.yaml.template \
+                | kubectl apply -f -
+
+              echo "=== Waiting for kaniko build (timeout 30m) ==="
+              if ! kubectl wait --for=condition=complete --timeout=1800s "job/${BUILD_JOB}"; then
+                echo "!!! ${BUILD_JOB} failed — last 200 log lines:"
+                kubectl logs "job/${BUILD_JOB}" --tail=200 || true
+                exit 1
+              fi
+
+              STEP="pin deployment/warden-telemetry (${IMAGE_TAG})"
+              kubectl set image "deployment/warden-telemetry" \
+                "warden-telemetry=registry.tinkerai.win/warden-telemetry:${IMAGE_TAG}"
+              kubectl rollout status "deployment/warden-telemetry" --timeout=180s
+              echo "pinned warden-telemetry:${IMAGE_TAG}"
+
+              # --- Cleanup kaniko Job ---
+              kubectl delete job "$BUILD_JOB" --ignore-not-found || true
+
+              echo "=== warden-telemetry release ${IMAGE_TAG} complete ==="
+          volumeMounts:
+            - name: github-app-key
+              mountPath: /etc/github-app
+              readOnly: true
+      volumes:
+        - name: github-app-key
+          secret:
+            secretName: yatfa-github-app
+            defaultMode: 0400

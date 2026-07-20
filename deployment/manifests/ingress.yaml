@@ -1,0 +1,34 @@
+# Warden Telemetry Ingress — exposes the receiver at https://telemetry.yatfa.ai.
+#
+# TLS is terminated by Cloudflare (the yatfa.ai zone is proxied at the edge;
+# Traefik has no ACME resolver — cert-manager is not installed in this cluster).
+# Origin is plain HTTP — mirrors the sibling yatfa-router-ingress / yatfa-ingress
+# (entrypoints web,websecure). Cloudflare SSL mode "Full" accepts Traefik's
+# default 443 cert.
+#
+# DNS PREREQ (one-time, in Cloudflare): add a proxied A record
+#   telemetry.yatfa.ai → 159.195.194.69   (orange cloud)
+# The zone currently has no records; until this is added the public hostname
+# won't resolve. The origin itself works immediately (test with a Host header).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: warden-telemetry-ingress
+  namespace: default
+  labels:
+    app: warden-telemetry
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: telemetry.yatfa.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: warden-telemetry
+                port:
+                  number: 80

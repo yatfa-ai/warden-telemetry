@@ -1,0 +1,46 @@
+# Release warden-telemetry: fast-forward `prod` to `main`, then dispatch the
+# build-and-deploy workflow on prod. Triggered manually from the Actions UI
+# ("Run workflow"). Mirrors yatfa-router's release.yml minus the VERSION bump
+# (warden-telemetry has no VERSION file / version contract yet — add a
+# bump-version.sh later if you want one).
+#
+# The push to prod below is made with GITHUB_TOKEN, which GitHub suppresses from
+# spawning push-triggered workflows — so build-image.yml's `push: prod` trigger
+# would NOT fire. We dispatch it explicitly to guarantee the new prod tip
+# actually deploys.
+name: Release (Advance prod & Deploy)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fast-forward prod to main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git checkout main
+          git push origin main:prod
+
+      - name: Trigger build-and-deploy on prod
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-image.yml --ref prod
