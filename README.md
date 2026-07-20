@@ -109,7 +109,7 @@ curl http://localhost:7421/summary
 #   "rejections": {
 #     "total": 13,                          # count of hard-rejected requests
 #     "byStatus": { "415": 11, "401": 2 },  # histogram keyed by HTTP status
-#     "byDeclaredVersion": { "3": 30, "5": 4 },  # 415 drift: declared schema version (enum-bounded, not free-text)
+#     "byDeclaredVersion": { "3": 30, "5": 4 },  # 415 drift: declared schema version (top-N + overflow bounded, not free-text)
 #     "lastStatus": 415,
 #     "lastReason": "unsupported telemetry schema version...",  # receiver diagnostic, not a payload
 #     "lastSeen": 1720000099000,
@@ -195,13 +195,16 @@ happen, relaxes no check, and routes nothing anywhere.
 version (`x-telemetry-schema` header) on 415-rejected batches, e.g. `{ "3": 30, "5": 4 }`. During a
 coordinated schema bump — a change across both repos, when multiple client versions coexist sending to one
 receiver — it tells you **which declared versions are still drifting**, so you know when the bump is safe
-to complete (one stubborn client version vs many). It is **enum-bounded** (schema versions are a small set,
-like the HTTP statuses in `byStatus`), NOT free-text reason histogramming, so a sustained drift storm can't
-grow it without limit. Only `415`s carry a declared version — `401`/`404`/`400`/`413`/`422` populate no
-bucket — so the histogram reflects **only** the drift population. A missing header records nothing; a
-scanner's non-numeric value (`"abc"`, `""`) is bucketed verbatim (real signal is never silently dropped).
-The declared version is the single digit the client already sends in the header — non-identifying, same
-posture as `byStatus`.
+to complete (one stubborn client version vs many). It is **bounded by a top-N distinct-key cap plus a single
+overflow bucket** — the declared version is the raw, attacker-controlled `x-telemetry-schema` header (this
+receiver is OPEN by default), not a fixed enum like the HTTP statuses in `byStatus`, so the distinct keys are
+capped (the first ~32 distinct values get their own bucket; any further distinct value folds into one counted
+`__overflow__` bucket). A sustained storm of unique header values therefore cannot grow it — or the
+`/summary` payload — without limit. Only `415`s carry a declared version — `401`/`404`/`400`/`413`/`422`
+populate no bucket — so the histogram reflects **only** the drift population. A missing header records
+nothing; a scanner's non-numeric value (`"abc"`, `""`) is bucketed verbatim (real signal is never silently
+dropped). The declared version is the single digit the client already sends in the header — non-identifying,
+same posture as `byStatus`.
 When `AUTH_TOKEN` is set, add the bearer header (e.g. `-H "Authorization: Bearer <token>"`) to this and
 every other request — see below.
 
