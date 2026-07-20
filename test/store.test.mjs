@@ -76,6 +76,29 @@ test('parseNdjson skips an unparseable line (a partial append) instead of throwi
   assert.deepEqual(parseNdjson(text), [{ good: 1 }, { good: 2 }]);
 });
 
+test('parseNdjson: the OPTIONAL onSkip observer is invoked with each skipped line and never for a good one (WARDEN-825)', () => {
+  // The onSkip seam is how the read path tallies unreadable lines (the silent-
+  // signal-loss the write-path tallies miss). It must fire ONCE per bad line with
+  // the trimmed text, and NEVER for a parseable or blank line.
+  const text = '{"good":1}\n{"bad": tru   ← partial\n\n{"alsoBad": }\n{"good":2}\n';
+  const skipped = [];
+  const out = parseNdjson(text, (line) => skipped.push(line));
+  // The return is unchanged whether or not an observer is supplied (purity).
+  assert.deepEqual(out, [{ good: 1 }, { good: 2 }]);
+  // Exactly the two unparseable lines were observed, in order, trimmed — and never
+  // the good records or the blank line.
+  assert.deepEqual(skipped, ['{"bad": tru   ← partial', '{"alsoBad": }']);
+});
+
+test('parseNdjson: a non-function onSkip (the default-omitted case) is a no-op, never throws', () => {
+  // The deepEqual tests above pass NO second arg; passing undefined / a non-fn
+  // must behave identically (the observer is optional and defensively typed).
+  const text = '{"good":1}\n{"bad": partial\n{"good":2}\n';
+  assert.deepEqual(parseNdjson(text, undefined), [{ good: 1 }, { good: 2 }]);
+  assert.deepEqual(parseNdjson(text, null), [{ good: 1 }, { good: 2 }]);
+  assert.deepEqual(parseNdjson(text, 'not-a-fn'), [{ good: 1 }, { good: 2 }]);
+});
+
 test('readEvents() round-trips appended events through an injected in-memory source (zero real fs)', async () => {
   // An in-memory store: the sink captures NDJSON lines into `lines`; the source
   // parses them back — exactly the contract the production fileSink/fileSource
@@ -106,6 +129,35 @@ test('readEvents() on a source-less store throws a loud TypeError (fail loud, no
   // Mirrors createRequestHandler's synchronous "requires a store" throw: the
   // error surfaces at the call, not as a silent [] or a swallowed rejection.
   assert.throws(() => store.readEvents(), /source/);
+});
+
+test('readEvents({ onSkip }) threads the observer to a source that parses with it (WARDEN-825)', async () => {
+  // A source that does its OWN parseNdjson(text, onSkip) — the contract
+  // fileSource(path) satisfies in production. readEvents must forward onSkip so a
+  // read-path caller can count unreadable lines; a source that returns a
+  // pre-parsed array simply ignores it (no skips to observe).
+  const rawText = '{"a":1}\n{"bad": partial\n{"b":2}\n';
+  const store = createNdjsonStore({
+    sink: async () => {},
+    source: (onSkip) => parseNdjson(rawText, onSkip),
+  });
+  const skipped = [];
+  const events = await store.readEvents({
+    onSkip: (line) => skipped.push(line),
+  });
+  assert.deepEqual(events, [{ a: 1 }, { b: 2 }]);
+  assert.deepEqual(skipped, ['{"bad": partial']);
+});
+
+test('readEvents() with no onSkip still returns the good-only array (backward-compatible default)', async () => {
+  // The default-omitted call (the shape /events and every pre-WARDEN-825 caller
+  // uses) must behave identically — onSkip is optional and defaults to a no-op.
+  const rawText = '{"a":1}\n{"bad": partial\n{"b":2}\n';
+  const store = createNdjsonStore({
+    sink: async () => {},
+    source: (onSkip) => parseNdjson(rawText, onSkip),
+  });
+  assert.deepEqual(await store.readEvents(), [{ a: 1 }, { b: 2 }]);
 });
 
 // ── RETENTION (WARDEN-579) ────────────────────────────────────────────────────
@@ -341,6 +393,79 @@ test('after prune, readEvents reflects the retained set (post-prune round-trip)'
   await store.prune({ maxEvents: 2 });
   // readEvents is the exact surface /summary uses — it must see the post-prune set.
   assert.deepEqual(await store.readEvents(), [{ i: 3 }, { i: 4 }]);
+});
+
+// ── UNREADABLE-LINE SELF-HEAL (WARDEN-825) ───────────────────────────────────
+// The unreadable count is a STATE read off the on-disk file. A retention
+// compaction rewrites the file via serializeNdjson, which re-serializes ONLY the
+// parsed events — so an unparseable line is dropped on the next compaction and
+// the count self-heals to 0. This harness mirrors inMemoryFile but its source
+// forwards the OPTIONAL onSkip observer (the contract fileSource satisfies), so
+// readEvents can count the skipped lines the way the /summary handler does.
+function unreadableAwareFile() {
+  let text = '';
+  return {
+    sink: async (line) => {
+      text += `${line}\n`;
+    },
+    source: (onSkip) => parseNdjson(text, onSkip),
+    rewrite: async (newText) => {
+      text = newText;
+    },
+    raw: () => text,
+  };
+}
+
+test('a truncated NDJSON line is counted as unreadable on readEvents (the read-path signal-loss the write-path tallies miss)', async () => {
+  const f = unreadableAwareFile();
+  // Seed the file WITH a deliberately truncated line in the middle — the exact
+  // partial append a process killed mid-write leaves (createReceiver has no
+  // SIGTERM handler). The good records on either side survive the parse.
+  f.rewrite('{"i":1}\n{"bad": tru   ← partial\n{"i":2}\n');
+  const store = createNdjsonStore(f);
+  let unreadable = 0;
+  const events = await store.readEvents({
+    onSkip: () => {
+      unreadable += 1;
+    },
+  });
+  assert.deepEqual(events, [{ i: 1 }, { i: 2 }]);
+  assert.equal(unreadable, 1, 'the one truncated line is counted');
+  // total + unreadable reconciles with the on-disk non-blank line count (3).
+  assert.equal(events.length + unreadable, 3, 'total + unreadable reconciles with on-disk lines');
+});
+
+test('an unreadable line SELF-HEALS to 0 after a retention compaction rewrites the file (WARDEN-825)', async () => {
+  const f = unreadableAwareFile();
+  // 3 good records + 1 truncated line on disk (4 non-blank lines).
+  f.rewrite('{"i":1}\n{"bad": partial\n{"i":2}\n{"i":3}\n');
+  const store = createNdjsonStore(f);
+
+  // Before compaction: the truncated line reads as 1 unreadable.
+  let before = 0;
+  await store.readEvents({
+    onSkip: () => {
+      before += 1;
+    },
+  });
+  assert.equal(before, 1, 'the corrupt line is unreadable before compaction');
+
+  // A compaction that REWRITES (maxEvents drops one → retained != read) re-
+  // serializes ONLY the parsed events via serializeNdjson, dropping the bad line.
+  const res = await store.prune({ maxEvents: 2 });
+  assert.equal(res.rewrote, true, 'the compaction actually rewrote the file');
+  // The raw file no longer contains the corrupt bytes.
+  assert.equal(f.raw().includes('partial'), false, 'the unparseable line was dropped from the file');
+
+  // After compaction: the count self-heals to 0 — nothing is unreadable anymore.
+  let after = 0;
+  const events = await store.readEvents({
+    onSkip: () => {
+      after += 1;
+    },
+  });
+  assert.equal(after, 0, 'unreadable self-heals to 0 after the compaction');
+  assert.deepEqual(events, [{ i: 2 }, { i: 3 }], 'the retained good records survive');
 });
 
 test('prune serializes against a concurrent append — an appended-during-compaction event is never lost', async () => {

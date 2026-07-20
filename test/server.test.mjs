@@ -3239,6 +3239,97 @@ test('GET /summary WITHOUT a wired seenKeys dep still returns a zeroed seenKeys 
   }, 'an absent seenKeys dep yields the zeroed EMPTY_SEEN_KEYS shape');
 });
 
+// ── UNREADABLE-LINE COUNT ON /summary (WARDEN-825) ───────────────────────────
+// The read-path signal-loss count: an event can clear every write-path gate
+// (rejections / persistErrors / retention) and still VANISH if its line is
+// unreadable on disk (a partial append left by a process killed mid-write —
+// createReceiver has no SIGTERM/SIGINT handler). parseNdjson already SKIPS the
+// bad line; /summary.unreadable is the observability for it. A STATE snapshot
+// recomputed per read (NOT a cumulative tally), self-healing to 0 on the next
+// compaction. Counts ONLY — never the corrupt bytes.
+
+// A store whose source holds raw NDJSON text (with an OPTIONAL truncated line)
+// and forwards the onSkip observer the way fileSource does in production. Reads
+// parse the text; writes append to it. Still ZERO real fs.
+function rawTextStore(rawText) {
+  let text = rawText;
+  return createNdjsonStore({
+    sink: async (line) => {
+      text += `${line}\n`;
+    },
+    source: (onSkip) => parseNdjson(text, onSkip),
+  });
+}
+
+// Drive GET /summary and return the parsed body.
+async function summaryBody(handler) {
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200, 'summary read must succeed to inspect the body');
+  return JSON.parse(res.body);
+}
+
+test('GET /summary surfaces a non-zero `unreadable` count when the store has a truncated NDJSON line (WARDEN-825)', async () => {
+  // The on-disk file has 2 good records + 1 truncated line (3 non-blank lines).
+  // The good records validate enough to summarize; the truncated line is the
+  // exact partial append a process killed mid-write leaves.
+  const rawText = `${JSON.stringify(errorEvent)}\n{"bad": tru   ← partial\n${JSON.stringify(crashEvent)}\n`;
+  const store = rawTextStore(rawText);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const body = await summaryBody(handler);
+  // The one truncated line is counted; total reflects only the 2 good records.
+  assert.equal(body.unreadable, 1, 'the truncated line is counted as unreadable');
+  assert.equal(body.total, 2, 'total reflects the 2 PARSED records (the bad line drops out)');
+  // total + unreadable reconciles with the on-disk non-blank line count (3).
+  assert.equal(body.total + body.unreadable, 3, 'total + unreadable reconciles with on-disk lines');
+});
+
+test('GET /summary on a clean store reads a zeroed `unreadable: 0` (no false alarm — parity with EMPTY_* shapes)', async () => {
+  // A clean file with no corrupt lines: the field is always present (additive,
+  // backward-compatible) and reads 0.
+  const store = rawTextStore(`${JSON.stringify(errorEvent)}\n${JSON.stringify(crashEvent)}\n`);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const body = await summaryBody(handler);
+  assert.equal(body.unreadable, 0, 'a clean store reads a zeroed unreadable count');
+  assert.equal(body.total, 2);
+});
+
+test('GET /summary on an empty store reads `unreadable: 0` (the field is ALWAYS present, additive)', async () => {
+  const store = rawTextStore('');
+  const handler = createRequestHandler({ store });
+  const body = await summaryBody(handler);
+  assert.equal(body.unreadable, 0, 'an empty store carries the zeroed unreadable field');
+  assert.equal(body.total, 0);
+});
+
+test('GET /summary NEVER echoes the corrupt line bytes — `unreadable` is a count only (trust posture)', async () => {
+  // A partial line could carry a payload fragment / residual identifier, so the
+  // entire surface is the bare integer. The corrupt marker must not appear anywhere.
+  const poison = 'SECRET-FRAGMENT-DO-NOT-LEAK';
+  const rawText = `${JSON.stringify(errorEvent)}\n{"bad": ${poison}\n${JSON.stringify(crashEvent)}\n`;
+  const store = rawTextStore(rawText);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.unreadable, 1, 'the corrupt line is counted');
+  assert.equal(res.body.includes(poison), false, 'the corrupt bytes are never present in the response');
+});
+
+test('GET /summary `unreadable` is a per-read STATE snapshot — two reads of the same corrupt file report the SAME count (no inflation)', async () => {
+  // Every /summary request re-reads the file → re-skips the same line. A
+  // cumulative tally would inflate; a state snapshot reports the same count each
+  // read. (The self-heal-to-0-on-compaction is covered in test/store.test.mjs.)
+  const rawText = `${JSON.stringify(errorEvent)}\n{"bad": partial\n${JSON.stringify(crashEvent)}\n`;
+  const store = rawTextStore(rawText);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const first = await summaryBody(handler);
+  const second = await summaryBody(handler);
+  assert.equal(first.unreadable, 1);
+  assert.equal(second.unreadable, 1, 'a second read reports the same count — state, not a cumulative tally');
+});
+
 // ── INGEST BODY CAP (WARDEN-627) ─────────────────────────────────────────────
 // Retention (WARDEN-579) bounded the unbounded STORE; the body cap bounds the one
 // remaining unbounded INPUT — the POST /ingest request body, which readBody once

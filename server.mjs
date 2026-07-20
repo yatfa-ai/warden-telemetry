@@ -1469,7 +1469,36 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // fulfills the earlier WARDEN-567 note to gate the read surface when auth landed.)
     if (req.method === 'GET' && pathname === SUMMARY_PATH) {
       try {
-        const events = await store.readEvents();
+        // `unreadable` (WARDEN-825): a STATE count of the lines on disk that
+        // failed to parse during THIS read — the read-path silent-signal-loss
+        // the write-path tallies below do NOT cover. An event can clear every
+        // write-path gate (validated → rejections; persisted → persistErrors;
+        // not pruned → retention) and still VANISH from the maintainer's signal
+        // with zero diagnostic if its line became unreadable on disk (a partial
+        // append left by a process killed mid-write — `createReceiver` has no
+        // SIGTERM/SIGINT handler, so a container stop during `fileSink`'s
+        // non-atomic appendFile is the concrete cause). `parseNdjson` already
+        // SKIPS the bad line (the defense exists); this is the observability for
+        // it. The counter is installed via the OPTIONAL `onSkip` seam threaded
+        // through readEvents → source → parseNdjson, invoked once per skipped
+        // line during the single read this handler already performs.
+        //
+        // This is a STATE snapshot recomputed per read, NOT a cumulative tally
+        // like rejections/persistErrors/retention/deduped: every /summary request
+        // re-reads the file → re-skips the SAME line, so a cumulative counter
+        // would inflate on every read. The count reflects the on-disk file AS IT
+        // IS, so it SELF-HEALS to 0 the moment a retention compaction rewrites
+        // the file (`prune` → `serializeNdjson` re-serializes only the PARSED
+        // events, dropping the unparseable line). And because it reads the
+        // persistent file, it SURVIVES a restart (unlike the in-memory tallies,
+        // which `startedAt` exists to disambiguate) — the same corrupt line reads
+        // the same count across reboots until a compaction rewrites it.
+        let unreadable = 0;
+        const events = await store.readEvents({
+          onSkip: () => {
+            unreadable += 1;
+          },
+        });
         // Scope the aggregates with the SAME conjunctive filter /events uses
         // (WARDEN-727): ?type= / ?platform= / ?appVersion= / ?since= select which
         // ALREADY-redacted, ALREADY-validated events get aggregated. filterEvents is
@@ -1552,6 +1581,17 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           // an upper bound — expired entries purge lazily on access, so a high read
           // means "the set WAS that full," never a false alarm of its own.
           seenKeys: seenKeys ? seenKeys.snapshot() : EMPTY_SEEN_KEYS,
+          // `unreadable` (WARDEN-825): the STATE count of currently-unreadable
+          // lines on the read path — see the read site above for the full
+          // rationale. A bare integer ONLY (never the corrupt line's bytes: a
+          // partial line could carry a payload fragment / residual identifier),
+          // always present (additive, backward-compatible), recomputed per read
+          // off the on-disk file. `total + unreadable` reconciles with the
+          // on-disk non-blank line count, closing the silent undercount where a
+          // skipped line drops out of `total` with no entry anywhere. Receiver-
+          // local, in-memory computation, no new collection, no tier expansion,
+          // no third party — identical posture to the sibling tallies.
+          unreadable,
           timeline: summarizeTimeline(filtered, { now }),
         });
       } catch (e) {

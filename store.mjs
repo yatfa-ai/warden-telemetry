@@ -68,11 +68,22 @@ export function fileSink(path) {
  * SKIPPED rather than aborting the whole read — a future partial-line write must
  * not crash the maintainer summary.
  *
+ * `onSkip` is an OPTIONAL observer invoked with each SKIPPED line's trimmed text
+ * (default no-op). It lets a read-path caller TALLY unreadable lines — the
+ * silent-signal-loss the write-path tallies (rejections / persistErrors /
+ * retention) do not cover (an event that validates, persists, and survives
+ * retention can still VANISH if its line is unreadable on disk). Purity is
+ * preserved: `onSkip` only OBSERVES, the return is still `object[]` unchanged
+ * whether or not an observer is supplied, so the existing deepEqual tests stay
+ * green when it is omitted (it defaults to a no-op).
+ *
  * @param {string} text
+ * @param {(line: string) => void} [onSkip] — observer invoked per skipped (unparseable) line.
  * @returns {object[]}
  */
-export function parseNdjson(text) {
+export function parseNdjson(text, onSkip) {
   const events = [];
+  const skip = typeof onSkip === 'function' ? onSkip : null;
   for (const line of String(text).split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -80,7 +91,10 @@ export function parseNdjson(text) {
       events.push(JSON.parse(trimmed));
     } catch {
       // A partial-line write must not poison the whole read — skip the bad line
-      // and keep the good records on either side of it.
+      // and keep the good records on either side of it. Surface the skipped line
+      // to an optional `onSkip` observer so a read-path caller can count
+      // unreadable lines (the only signal-loss site the write-path tallies miss).
+      if (skip) skip(trimmed);
     }
   }
   return events;
@@ -94,12 +108,18 @@ export function parseNdjson(text) {
  * line is skipped, not fatal). Used only by the production server wiring; never
  * reached from tests (they inject their own source).
  *
+ * Accepts an OPTIONAL `onSkip(line)` observer (forwarded to `parseNdjson`) so the
+ * read path can tally unreadable lines — the only call site that needs it is the
+ * event-store read (`createNdjsonStore.readEvents`); omitting it keeps today's
+ * behavior. The seen-keys source (below) does not forward it: the capacity-health
+ * read path does not surface an unreadable-line count, only the event store does.
+ *
  * @param {string} path — NDJSON file path (resolved relative to cwd).
- * @returns {() => Promise<object[]>}
+ * @returns {(onSkip?: (line: string) => void) => Promise<object[]>}
  */
 export function fileSource(path) {
   const dest = resolve(path);
-  return async () => {
+  return async (onSkip) => {
     let text;
     try {
       text = await readFile(dest, 'utf8');
@@ -109,7 +129,7 @@ export function fileSource(path) {
       if (e && e.code === 'ENOENT') return [];
       throw e;
     }
-    return parseNdjson(text);
+    return parseNdjson(text, onSkip);
   };
 }
 
@@ -349,16 +369,27 @@ export function createNdjsonStore({ sink, source, rewrite } = {}) {
      * `TypeError` if the store was created without a `source` (write-only store)
      * — see the JSDoc on `createNdjsonStore`.
      *
+     * `onSkip` is an OPTIONAL observer forwarded to the `source` (which forwards
+     * it to `parseNdjson`), invoked once per SKIPPED (unparseable) line. It lets a
+     * read-path caller count unreadable lines — the silent-signal-loss the
+     * write-path tallies miss. It is a STATE read, NOT a cumulative tally: every
+     * call re-reads the file and re-skips the same line, so a caller MUST treat
+     * the count as a per-read snapshot (the count of currently-unreadable lines
+     * on disk), never increment it across reads. An injected capturing `source`
+     * that returns a pre-parsed array ignores the arg (no skips to observe) — the
+     * counter only fires for a `source` that does its own `parseNdjson(text, …)`.
+     *
+     * @param {{ onSkip?: (line: string) => void }} [opts]
      * @returns {Promise<object[]>}
      */
-    readEvents() {
+    readEvents({ onSkip } = {}) {
       if (typeof source !== 'function') {
         throw new TypeError(
           'createNdjsonStore: readEvents() requires an injected `source()` ' +
             'function (pass fileSource(path) in production, a capturing fn in tests).'
         );
       }
-      return Promise.resolve(source());
+      return Promise.resolve(source(onSkip));
     },
 
     /**
