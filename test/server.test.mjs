@@ -2768,6 +2768,7 @@ test('deduped tally: a fresh tally snapshots to the zeroed shape (parity with a 
   assert.deepEqual(tally.snapshot(), {
     total: 0,
     lastSeen: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
 });
 
@@ -2790,8 +2791,15 @@ test('deduped tally: snapshot() is a stable point-in-time copy — a later recor
   const snap = tally.snapshot();
   clock = 6000;
   tally.record();
-  // the earlier snapshot is unchanged by the later record
-  assert.deepEqual(snap, { total: 1, lastSeen: 5000 });
+  // the earlier snapshot is unchanged by the later record — its scalar aggregate
+  // AND its timeline are both frozen. (The one dedup at clock=5000 is the newest
+  // event in a 24h window ending at 5000, so it lands in the newest bucket, whose
+  // right edge is exactly 5000 — bucketEnd === lastSeen.)
+  assert.deepEqual(snap, {
+    total: 1,
+    lastSeen: 5000,
+    timeline: { buckets: [{ bucketStart: -1_795_000, bucketEnd: 5_000, count: 1 }], bucketMs: 1_800_000 },
+  });
   // a fresh snapshot reflects the new state
   assert.equal(tally.snapshot().total, 2);
   assert.equal(tally.snapshot().lastSeen, 6000);
@@ -2810,7 +2818,7 @@ test('deduped tally: BOUNDED — many records never grow unbounded (one count, o
   const snap = tally.snapshot();
   assert.equal(snap.total, 1000);
   assert.equal(snap.lastSeen, 1000, 'only the single most-recent lastSeen is retained');
-  assert.deepEqual(Object.keys(snap).sort(), ['lastSeen', 'total'], 'shape stays bounded — no per-dedup growth, no reason field');
+  assert.deepEqual(Object.keys(snap).sort(), ['lastSeen', 'timeline', 'total'], 'shape stays bounded — no per-dedup growth, no reason field');
 });
 
 test('deduped tally: record() ignores any argument — a dedup carries no diagnostic string', () => {
@@ -2822,7 +2830,7 @@ test('deduped tally: record() ignores any argument — a dedup carries no diagno
   tally.record({ anything: true });
   const snap = tally.snapshot();
   assert.equal(snap.total, 2);
-  assert.deepEqual(Object.keys(snap).sort(), ['lastSeen', 'total'], 'no reason/payload field is retained');
+  assert.deepEqual(Object.keys(snap).sort(), ['lastSeen', 'timeline', 'total'], 'no reason/payload field is retained');
 });
 
 // ── DEDUP AGGREGATE surfaced in GET /summary (WARDEN-752) ─────────────────────
@@ -2853,6 +2861,18 @@ test('a retried batch (same idempotency-key) increments /summary.deduped — tra
   const ded = await summaryDeduped(handler);
   assert.equal(ded.total, 1, 'the single deduped retry was recorded');
   assert.equal(ded.lastSeen, 4242, 'lastSeen is the injected now() of the dedup');
+  // The additive timeline (WARDEN-812) surfaces the dedup's TIMING: the single retry
+  // fired one bucket, and it sat at the top edge of the rolling window's newest
+  // bucket, so bucketEnd === lastSeen (the injected now). This is the spike-vs-
+  // baseline signal total+lastSeen alone could not convey — same shape + granularity
+  // as persistErrors.timeline / rejections.timeline (all default to the read-path
+  // DEFAULT_TIMELINE_* constants).
+  assert.ok(ded.timeline, 'timeline field present (additive — carried on every response)');
+  assert.deepEqual(Object.keys(ded.timeline).sort(), ['bucketMs', 'buckets'], 'timeline shape: buckets + bucketMs only');
+  assert.equal(ded.timeline.buckets.length, 1, 'the single deduped retry fired one bucket');
+  assert.equal(ded.timeline.buckets[0].count, 1);
+  assert.equal(ded.timeline.bucketMs, 1_800_000);
+  assert.equal(ded.timeline.buckets[0].bucketEnd, 4242, 'the dedup is at the top edge of the newest bucket (bucketEnd === lastSeen)');
 });
 
 test('a fresh accept (distinct keys, no retry) does NOT increment deduped (healthy traffic is never a dedup)', async () => {
@@ -2863,7 +2883,7 @@ test('a fresh accept (distinct keys, no retry) does NOT increment deduped (healt
   await handler(fakeReq({ headers: { ...schemaHeaders, 'idempotency-key': 'B' }, body: validBody }), fakeRes());
 
   const ded = await summaryDeduped(handler);
-  assert.deepEqual(ded, { total: 0, lastSeen: null }, 'no retry → no dedup recorded');
+  assert.deepEqual(ded, { total: 0, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } }, 'no retry → no dedup recorded');
 });
 
 test('deduped stays BOUNDED across many retries — one count + single most-recent lastSeen', async () => {
@@ -2881,7 +2901,7 @@ test('deduped stays BOUNDED across many retries — one count + single most-rece
   const ded = await summaryDeduped(handler);
   assert.equal(ded.total, 49, '49 retries were deduped (the first accept was not)');
   assert.equal(ded.lastSeen, 49_000, 'lastSeen is the injected now() of the most-recent dedup (49 advances × 1000)');
-  assert.deepEqual(Object.keys(ded).sort(), ['lastSeen', 'total'], 'shape stays bounded — no per-dedup growth');
+  assert.deepEqual(Object.keys(ded).sort(), ['lastSeen', 'timeline', 'total'], 'shape stays bounded — no per-dedup growth');
 });
 
 test('a dedup records into deduped, NOT into rejections or persistErrors (three separate signals)', async () => {
@@ -2925,12 +2945,22 @@ test('a dedup records into deduped, NOT into rejections or persistErrors (three 
     { total: 0, lastReason: null, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } },
     'persistErrors untouched — a dedup is not a persist failure'
   );
+  // The additive deduped.timeline (WARDEN-812) carries the SAME shape + granularity
+  // as persistErrors.timeline / rejections.timeline — byte-for-byte parity between
+  // the three tallies' temporal axes (all default to the read-path DEFAULT_TIMELINE_*
+  // constants). The dedup fired one bucket; the other two stay zeroed but shape-stable.
+  assert.ok(body.deduped.timeline, 'deduped.timeline present (additive — carried on every response)');
+  assert.deepEqual(Object.keys(body.deduped.timeline).sort(), ['bucketMs', 'buckets'], 'deduped.timeline shape: buckets + bucketMs only');
+  assert.equal(body.deduped.timeline.bucketMs, body.persistErrors.timeline.bucketMs, 'same granularity as persistErrors.timeline');
+  assert.equal(body.deduped.timeline.bucketMs, body.rejections.timeline.bucketMs, 'same granularity as rejections.timeline');
+  assert.equal(body.deduped.timeline.buckets.length, 1, 'the single dedup fired one timeline bucket');
+  assert.equal(body.deduped.timeline.buckets[0].count, 1);
 });
 
 test('an idle receiver (no traffic) returns zeroed deduped in GET /summary (parity with today — no false alarm)', async () => {
   const { handler } = wiringWithDedup();
   const ded = await summaryDeduped(handler);
-  assert.deepEqual(ded, { total: 0, lastSeen: null });
+  assert.deepEqual(ded, { total: 0, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } });
 });
 
 test('GET /summary WITHOUT a wired deduped tally still returns a zeroed deduped field (backward-compatible additive shape)', async () => {
@@ -2958,6 +2988,7 @@ test('GET /summary WITHOUT a wired deduped tally still returns a zeroed deduped 
   assert.deepEqual(JSON.parse(res.body).deduped, {
     total: 0,
     lastSeen: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
 });
 
@@ -2977,7 +3008,150 @@ test('a handler with NO seenKeys dep does NOT dedup, so deduped stays at zero (b
   await handler(fakeReq({ headers, body: validBody }), fakeRes()); // both persist (no dedup)
 
   const ded = await summaryDeduped(handler);
-  assert.deepEqual(ded, { total: 0, lastSeen: null }, 'no seenKeys → no dedup → tally stays zeroed');
+  assert.deepEqual(ded, { total: 0, lastSeen: null, timeline: { buckets: [], bucketMs: 1_800_000 } }, 'no seenKeys → no dedup → tally stays zeroed');
+});
+
+// ── DEDUP TIMELINE (WARDEN-812) ──────────────────────────────────────────────
+// The bounded `timeline` on the deduped tally — mirrors the read-path `timeline`
+// (summarizeTimeline, WARDEN-603), the persistErrors timeline (WARDEN-777), and the
+// rejections timeline (WARDEN-798) so a maintainer can tell an ONGOING retry storm
+// (dedups still landing in the newest bucket — clients hammering because the
+// receiver is slow / the network is flaky RIGHT NOW) from a RESOLVED blip (dedups
+// clustered in older buckets, newest bucket empty — an hour-old spike that stopped)
+// — the spike-vs-baseline question `total` + `lastSeen` provably cannot answer for
+// an episodic retry flood that often recovers. Driven directly with an injected
+// fake clock (mirroring the tally unit tests above): bucket-placement parity with
+// summarizeTimeline, the rolling-window roll-off bound, the degenerate-config
+// guard, and the ongoing-vs-resolved flagship.
+
+test('deduped tally timeline: an empty tally carries the zeroed shape — buckets: [], bucketMs = default (no false alarm)', () => {
+  // Case 1: a fresh createDedupTally({ now }) snapshot returns the zeroed timeline —
+  // shape-stable whether or not the tally is wired, mirroring EMPTY_PERSIST_ERRORS /
+  // EMPTY_REJECTIONS. bucketMs is the default granularity (NOT 0).
+  const tally = createDedupTally({ now: () => 0 });
+  assert.deepEqual(tally.snapshot().timeline, { buckets: [], bucketMs: 1_800_000 });
+});
+
+test('deduped tally timeline: a known seeded time spread — a recent retry spike vs an earlier baseline (bucket placement parity with the read-path summarizeTimeline + the persistErrors/rejections tallies)', () => {
+  // Mirrors the read-path /summary "known seeded time spread" test AND the
+  // persistErrors/rejections tally timeline tests: record dedups at known fake-clock
+  // times so the snapshot emits buckets at EXACTLY those times. window
+  // [0, 86_400_000], bucketMs 1_800_000; bucket 1 = [1.8M, 3.6M); bucket 47 =
+  // [84.6M, 86.4M); a record at EXACTLY now (86.4M) folds into the newest bucket
+  // (parity with summarizeTimeline's top-boundary fold). Covers same-bucket
+  // accumulation (count: 3) and chronological sort (oldest → newest). A dedup
+  // carries no diagnostic string, so the bucket shape stays count + window only.
+  let clock = 0;
+  const tally = createDedupTally({ now: () => clock });
+  // baseline: one dedup in bucket 1
+  clock = 1_800_000; tally.record();
+  // spike: three dedups in bucket 47 (one at exactly now → folded via the top edge)
+  clock = 84_600_000; tally.record();
+  clock = 84_600_001; tally.record();
+  clock = 86_400_000; tally.record(); // === now → newest via boundary fold
+  clock = 86_400_000; // snapshot time
+  const { timeline, total } = tally.snapshot();
+  assert.equal(timeline.buckets.length, 2, 'two distinct buckets: baseline + spike');
+  assert.deepEqual(timeline.buckets, [
+    { bucketStart: 1_800_000, bucketEnd: 3_600_000, count: 1 },   // baseline (oldest)
+    { bucketStart: 84_600_000, bucketEnd: 86_400_000, count: 3 }, // recent spike (newest) — three dedups accumulated into one bucket
+  ]);
+  assert.equal(timeline.bucketMs, 1_800_000);
+  assert.equal(total, 4, 'total is cumulative across the timeline');
+  // The bucket shape is count + window only — there is no field that could carry a
+  // reason or payload (a dedup has neither; record() takes no argument).
+  assert.deepEqual(Object.keys(timeline.buckets[0]).sort(), ['bucketEnd', 'bucketStart', 'count']);
+});
+
+test('deduped tally timeline: ROLL-OFF BOUND — buckets older than the window drop on snapshot(); bucket count never exceeds maxBuckets', () => {
+  // Record one dedup per distinct 30-min slot for 60 slots (> maxBuckets=48), each a
+  // bucketMs apart, so the 48-slot-wide rolling 24h window cannot hold them all.
+  // Advancing the fake clock pushes the earliest dedups out of the window: the
+  // snapshot must drop the rolled-off buckets, never emit more than maxBuckets, and
+  // — unlike `total` — only the TIMELINE window rolls; total stays cumulative.
+  let clock = 1_800_000;
+  const tally = createDedupTally({ now: () => clock });
+  for (let i = 0; i < 60; i++) {
+    tally.record();
+    clock += 1_800_000; // advance to the next distinct 30-min slot
+  }
+  // clock is now 1_800_000 + 60 * 1_800_000 = 109_800_000 (snapshot time)
+  const snap = tally.snapshot();
+  assert.equal(snap.total, 60, 'total is cumulative — it does NOT roll off (only the timeline window does)');
+  assert.ok(snap.timeline.buckets.length <= 48, `bucket count bounded at maxBuckets (got ${snap.timeline.buckets.length})`);
+  assert.equal(snap.timeline.bucketMs, 1_800_000);
+  // Every surviving bucket sits inside the current 24h window — the earliest dedups
+  // (the first ~12 slots) rolled off. windowStart = clock - windowMs = 23_400_000.
+  const windowStart = clock - 86_400_000;
+  for (const b of snap.timeline.buckets) {
+    assert.ok(b.bucketStart >= windowStart, `bucket ${b.bucketStart} is inside the rolling window (>= ${windowStart})`);
+  }
+  // Emitted oldest → newest (chronological sort).
+  for (let i = 1; i < snap.timeline.buckets.length; i++) {
+    assert.ok(
+      snap.timeline.buckets[i - 1].bucketStart < snap.timeline.buckets[i].bucketStart,
+      'buckets sorted oldest → newest'
+    );
+  }
+});
+
+test('deduped tally timeline: DEGENERATE config (windowMs: 0 / maxBuckets: 0) → { buckets: [], bucketMs: 0 } while the scalar tally keeps working', () => {
+  // Mirrors summarizeTimeline's + the persistErrors/rejections tallies' degenerate-
+  // config guard: a bad windowMs/maxBuckets override collapses the timeline to
+  // { buckets: [], bucketMs: 0 } — never a huge/NaN array — while the scalar tally
+  // (total/lastSeen) keeps working regardless.
+  let clock = 5_000;
+  const tally = createDedupTally({ now: () => clock, maxBuckets: 0, windowMs: 0 });
+  tally.record();
+  const snap = tally.snapshot();
+  // scalar tally unaffected
+  assert.equal(snap.total, 1);
+  assert.equal(snap.lastSeen, 5_000);
+  // timeline collapsed — never a huge/NaN array
+  assert.deepEqual(snap.timeline, { buckets: [], bucketMs: 0 });
+});
+
+test('deduped tally timeline: ONGOING retry storm vs RESOLVED blip — the newest bucket tells them apart (total + lastSeen alone cannot)', () => {
+  // The flagship success criterion (WARDEN-812): two receivers with the SAME total
+  // can be distinguished by whether dedup traffic is STILL landing (newest bucket
+  // non-empty = ONGOING — clients still retrying because the receiver is slow / the
+  // network is flaky RIGHT NOW) or has gone quiet (no bucket near now, only older
+  // buckets populated = RESOLVED — an hour-old spike that stopped). `total` + a
+  // single `lastSeen` provably cannot answer this — a sustained retry flood and a
+  // spike that clients recovered from read identical without the per-bucket
+  // distribution.
+  const snapshotTime = 100_000_000;
+
+  // ONGOING: a dedup landed moments before the snapshot — newest bucket non-empty.
+  let clock = snapshotTime;
+  const ongoing = createDedupTally({ now: () => clock });
+  clock = snapshotTime - 60_000; // 1 min ago — inside the newest bucket
+  ongoing.record();
+  clock = snapshotTime;
+  const ongSnap = ongoing.snapshot();
+  const ongBuckets = ongSnap.timeline.buckets;
+  assert.ok(ongBuckets.length >= 1, 'ONGOING: at least one bucket is populated');
+  const ongNewest = ongBuckets[ongBuckets.length - 1];
+  assert.equal(ongNewest.bucketEnd, snapshotTime, 'ONGOING: the newest bucket reaches now — retries are still landing');
+  assert.ok(ongNewest.count >= 1, 'ONGOING: the newest bucket is non-empty');
+
+  // RESOLVED: the only dedup landed near the START of the window, then the network
+  // recovered; snapshot much later — the dedup sits in an OLD bucket, no bucket near now.
+  const resolved = createDedupTally({ now: () => clock });
+  clock = snapshotTime - 80_000_000; // ~22h ago — near the window's oldest edge
+  resolved.record();
+  clock = snapshotTime; // network recovered an hour ago; retries stopped
+  const resSnap = resolved.snapshot();
+  const resBuckets = resSnap.timeline.buckets;
+  assert.ok(resBuckets.length >= 1, 'RESOLVED: the old dedup still has its bucket');
+  const resNewest = resBuckets[resBuckets.length - 1];
+  assert.ok(
+    resNewest.bucketEnd < snapshotTime,
+    'RESOLVED: the newest POPULATED bucket ends well before now — no bucket reaches the snapshot time (retries went quiet)'
+  );
+
+  // Same total, opposite verdict — the temporal distribution is the deciding signal.
+  assert.equal(ongSnap.total, resSnap.total, 'both saw one dedup — identical total, but the timeline tells them apart');
 });
 
 // ── SEEN-KEYS CAPACITY surfaced in GET /summary (WARDEN-790) ──────────────────
