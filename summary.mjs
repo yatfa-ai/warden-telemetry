@@ -4,7 +4,8 @@
 // self-hosting maintainer can act on (counts / histograms only):
 //   - `summarize(events)`        → flat aggregates (total / byType / topErrorNames
 //                                  / topSignatures / schemaVersions / appVersions
-//                                  / platforms / firstSeen / lastSeen).
+//                                  / platforms / crashReasons / stalls / firstSeen
+//                                  / lastSeen).
 //   - `summarizeTimeline(events)` → a bounded temporal distribution (event counts
 //                                  per time bucket over a rolling recent window,
 //                                  WARDEN-603) so a maintainer can distinguish a
@@ -51,6 +52,23 @@
 // so this is the only counts-only histogram keyed by a field that always reaches
 // disk — same COUNTS-only shape, same trust posture, same skip-robust bucketing as
 // `appVersions` / `platforms`.
+//
+// `crashReasons` (WARDEN-872) is the crash-CAUSE axis `byType.crash` (a bare count)
+// and `topSignatures` (capped, exitCode-split, ranked) both obscure: it buckets
+// crash counts by the non-identifying `reason` string (Electron's fixed enum —
+// `oom` / `crashed` / `killed` … — plus the main-process `'unexpected-termination'`
+// sentinel, WARDEN-687) so a maintainer can answer "of this crash spike, how much
+// is OOM?" instead of staring at an un-attributable count. `topSignatures` already
+// folds `reason` into its key (as `crash:${reason}:exit=${exitCode}`), but it is
+// (1) capped at TOP_SIGNATURES_CAP across ALL types, (2) split by exitCode so the
+// marginal "total OOM crashes" is NOT derivable, and (3) a ranked list, not a
+// complete distribution — this histogram closes that blind spot. Same COUNTS-only
+// histogram shape, same trust posture, same skip-robust bucketing as `platforms` /
+// `appVersions`: it echoes no raw event and touches no identifier (`reason` is a
+// redaction no-op, the same tier as `platform` / `appVersion`). The invariant is
+// `sum(crashReasons.values()) ≤ byType.crash`, with equality iff every crash
+// carries a present non-empty `reason` — a reasonless crash is counted by
+// `byType.crash` but NOT bucketed here (skip-robust, never a junk bucket).
 //
 // `topSignatures` (WARDEN-707) is the failure axis `topErrorNames` cannot show:
 // `topErrorNames` groups by `Error#name` ONLY, so `TypeError: 847` is unreadable
@@ -236,6 +254,7 @@ function _stallSnapshot({ count, sum, finiteCount, min, max }) {
  *   appVersions: Record<string, number>,
  *   platforms: Record<string, number>,
  *   byRuntime: Record<string, number>,
+ *   crashReasons: Record<string, number>,
  *   stalls: { count: number, min: number | null, avg: number, max: number | null,
  *             bySource: Record<string, { count: number, min: number | null, avg: number, max: number | null }> },
  *   firstSeen: number | null,
@@ -259,6 +278,10 @@ export function summarize(events) {
   // `platforms` / `appVersions`: `runtime` is mandatory on valid events, but the
   // skip-robust guard still applies to a malformed / partial-read entry.
   const byRuntime = {};
+  // Crash-CAUSE histogram (WARDEN-872): buckets crash counts by the non-identifying
+  // `reason` string, mirroring platforms/appVersions. Skip-robust — a reasonless
+  // crash is counted by byType.crash but NOT bucketed here.
+  const crashReasons = {};
   // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
   // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
   // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
@@ -285,7 +308,7 @@ export function summarize(events) {
     if (!event || typeof event !== 'object') continue;
     total += 1;
 
-    const { type, name, schemaVersion, timestamp, appVersion, platform, runtime, lagMs, source } = event;
+    const { type, name, schemaVersion, timestamp, appVersion, platform, runtime, reason, lagMs, source } = event;
 
     if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(byType, type)) {
       byType[type] += 1;
@@ -317,6 +340,15 @@ export function summarize(events) {
     // ignored, so a malformed value never crashes or produces a junk bucket.
     if (typeof runtime === 'string' && runtime.length > 0) {
       byRuntime[runtime] = (byRuntime[runtime] ?? 0) + 1;
+    }
+    // crash reason (WARDEN-872). Skip-robust exactly like platforms/appVersions:
+    // only bucket a PRESENT, non-empty string — absent / null / non-string / empty
+    // is ignored (a malformed value never crashes or produces a junk bucket). A
+    // reasonless crash is still counted by `byType.crash`; it just yields no bucket
+    // here, so `sum(crashReasons.values()) ≤ byType.crash` (equality iff every
+    // crash carries a present non-empty `reason`).
+    if (type === 'crash' && typeof reason === 'string' && reason.length > 0) {
+      crashReasons[reason] = (crashReasons[reason] ?? 0) + 1;
     }
     // Stall MAGNITUDE aggregate (WARDEN-854): the `lagMs` distribution the stall
     // COUNT (byType / topSignatures) discards. `count` is EVERY performance-stall
@@ -419,6 +451,7 @@ export function summarize(events) {
     appVersions,
     platforms,
     byRuntime,
+    crashReasons,
     stalls,
     firstSeen,
     lastSeen,
