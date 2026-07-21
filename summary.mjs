@@ -38,6 +38,20 @@
 // staring at un-attributable volume. Same COUNTS-only histogram shape, same trust
 // posture, same skip-robust bucketing as `appVersions`.
 //
+// `byRuntime` (WARDEN-869) is the PROCESS sibling of `appVersions` / `platforms`:
+// it buckets event counts by the client's non-identifying `runtime` process label
+// (one of `main` / `renderer` — the Electron/Node main process vs. a web-contents
+// renderer, a value identical across millions of users on a process kind, not an
+// identifier, not content) so a maintainer can answer "is the app being hard-killed
+// by the OS (main) or is React/Electron throwing (renderer)?" — a native segfault /
+// OOM-kill / SIGKILL detected on next launch (WARDEN-687) is tagged
+// `runtime: 'main'`, and without this axis those severe native kills are
+// indistinguishable from renderer crashes in the overview. `runtime` is MANDATORY
+// on every receiver-accepted event (unlike the OPTIONAL `appVersion` / `platform`),
+// so this is the only counts-only histogram keyed by a field that always reaches
+// disk — same COUNTS-only shape, same trust posture, same skip-robust bucketing as
+// `appVersions` / `platforms`.
+//
 // `topSignatures` (WARDEN-707) is the failure axis `topErrorNames` cannot show:
 // `topErrorNames` groups by `Error#name` ONLY, so `TypeError: 847` is unreadable
 // (one regression × 847, or 847 distinct bugs?). `topSignatures` ranks DISTINCT
@@ -221,6 +235,7 @@ function _stallSnapshot({ count, sum, finiteCount, min, max }) {
  *   schemaVersions: Record<string, number>,
  *   appVersions: Record<string, number>,
  *   platforms: Record<string, number>,
+ *   byRuntime: Record<string, number>,
  *   stalls: { count: number, min: number | null, avg: number, max: number | null,
  *             bySource: Record<string, { count: number, min: number | null, avg: number, max: number | null }> },
  *   firstSeen: number | null,
@@ -239,6 +254,11 @@ export function summarize(events) {
   const schemaVersions = {};
   const appVersions = {};
   const platforms = {};
+  // runtime process label histogram (WARDEN-869) — the PROCESS sibling of
+  // `appVersions` / `platforms`. A plain object (NOT pre-keyed) exactly like
+  // `platforms` / `appVersions`: `runtime` is mandatory on valid events, but the
+  // skip-robust guard still applies to a malformed / partial-read entry.
+  const byRuntime = {};
   // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
   // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
   // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
@@ -265,7 +285,7 @@ export function summarize(events) {
     if (!event || typeof event !== 'object') continue;
     total += 1;
 
-    const { type, name, schemaVersion, timestamp, appVersion, platform, lagMs, source } = event;
+    const { type, name, schemaVersion, timestamp, appVersion, platform, runtime, lagMs, source } = event;
 
     if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(byType, type)) {
       byType[type] += 1;
@@ -291,6 +311,12 @@ export function summarize(events) {
     // malformed value never crashes or produces a junk bucket.
     if (typeof platform === 'string' && platform.length > 0) {
       platforms[platform] = (platforms[platform] ?? 0) + 1;
+    }
+    // runtime process label (WARDEN-869). Skip-robust exactly like platforms: only
+    // bucket a PRESENT non-empty string — absent / null / non-string / empty is
+    // ignored, so a malformed value never crashes or produces a junk bucket.
+    if (typeof runtime === 'string' && runtime.length > 0) {
+      byRuntime[runtime] = (byRuntime[runtime] ?? 0) + 1;
     }
     // Stall MAGNITUDE aggregate (WARDEN-854): the `lagMs` distribution the stall
     // COUNT (byType / topSignatures) discards. `count` is EVERY performance-stall
@@ -392,6 +418,7 @@ export function summarize(events) {
     schemaVersions,
     appVersions,
     platforms,
+    byRuntime,
     stalls,
     firstSeen,
     lastSeen,

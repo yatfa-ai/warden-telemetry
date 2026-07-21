@@ -47,6 +47,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.deepEqual(s.schemaVersions, {});
   assert.deepEqual(s.appVersions, {});
   assert.deepEqual(s.platforms, {});
+  assert.deepEqual(s.byRuntime, {});
   assert.equal(s.firstSeen, null);
   assert.equal(s.lastSeen, null);
 });
@@ -354,6 +355,59 @@ test('platforms skips absent / null / non-string / empty values (skip-robust, ne
 test('platforms is empty when no events carry an OS label', () => {
   const s = summarize([{ ...validError }, { ...validCrash }]);
   assert.deepEqual(s.platforms, {});
+});
+
+// ── RUNTIME HISTOGRAM (WARDEN-869) ────────────────────────────────────────────
+// Mirrors the appVersions / platforms histograms: bucket event counts by the
+// non-identifying `runtime` PROCESS label (main / renderer) — the process-axis
+// sibling of the release (appVersions) and OS (platforms) axes. `runtime` is
+// MANDATORY on every receiver-accepted event, but a partial read / shape drift
+// can still omit it, so the same skip-robust guard applies: only a PRESENT
+// non-empty string is bucketed — absent / null / non-string / empty is skipped
+// (a malformed value must never crash or make a junk bucket). The canonical
+// fixtures already carry varied runtimes (validError / validStall = 'main',
+// validCrash = 'renderer'), so cases override / drop it as needed.
+
+test('byRuntime is a histogram keyed by the runtime process label', () => {
+  const events = [
+    { ...validError, runtime: 'main' },
+    { ...validCrash, runtime: 'renderer' },
+    { ...validStall, runtime: 'main' },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.byRuntime, { main: 2, renderer: 1 });
+});
+
+test('byRuntime accumulates counts for events sharing a runtime', () => {
+  const events = [
+    { ...validError, runtime: 'main' },
+    { ...validError, runtime: 'main' },
+    { ...validError, runtime: 'main' },
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.byRuntime, { main: 3 });
+});
+
+test('byRuntime skips absent / null / non-string / empty values (skip-robust, never a bucket)', () => {
+  // Drop `runtime` entirely for the first entry (validError carries 'main') so the
+  // truly-absent-field case is covered; the rest override it with a bad value.
+  const { runtime: _omit, ...noRuntime } = validError;
+  const events = [
+    noRuntime, // no runtime field at all (a partial read omits it)
+    { ...validError, runtime: null },
+    { ...validError, runtime: 2 },
+    { ...validError, runtime: '' },
+    { ...validError, runtime: { x: 1 } },
+    { ...validError, runtime: 'renderer' }, // the only bucketable one
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.byRuntime, { renderer: 1 });
+});
+
+test('byRuntime is empty when no events carry a runtime label', () => {
+  const { runtime: _omit, ...noRuntime } = validError;
+  const s = summarize([noRuntime, { ...validCrash, runtime: undefined }]);
+  assert.deepEqual(s.byRuntime, {});
 });
 
 // ── STALL SEVERITY — magnitude aggregate split by source (WARDEN-854) ──────────
