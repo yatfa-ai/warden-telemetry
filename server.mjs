@@ -65,7 +65,7 @@ import { dirname, join } from 'node:path';
 import { SCHEMA_VERSION, validateEvent } from './schema.ts';
 import { createNdjsonStore, fileSink, fileSource, fileRewrite, fileSeenKeysSource, fileSeenKeysSink } from './store.mjs';
 import { ingest } from './ingest.mjs';
-import { summarize, summarizeTimeline, DEFAULT_TIMELINE_MAX_BUCKETS, DEFAULT_TIMELINE_WINDOW_MS } from './summary.mjs';
+import { summarize, summarizeTimeline, summarizeStallsTimeline, DEFAULT_TIMELINE_MAX_BUCKETS, DEFAULT_TIMELINE_WINDOW_MS } from './summary.mjs';
 import { selectEvents, filterEvents, resolveLimit, resolveOffset } from './events.mjs';
 
 export const DEFAULT_PORT = 7421;
@@ -1695,6 +1695,22 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           // no third party — identical posture to the sibling tallies.
           unreadable,
           timeline: summarizeTimeline(filtered, { now }),
+          // `stallsTimeline` (WARDEN-886): the TEMPORAL twin of the `stalls`
+          // magnitude snapshot — a per-bucket `max` freeze `lagMs` (overall + split
+          // by `source`) over the SAME rolling window / granularity as `timeline`.
+          // handler-composed here (NOT inside summarize()) for the SAME reason
+          // `timeline` is: it needs the injected `now` to anchor the rolling window,
+          // and summarize()'s documented, tested contract is a PURE single-arg
+          // function of the event array (no clock). It is a top-level sibling key of
+          // `timeline` / `stalls`, always present (additive, backward-compatible),
+          // exactly like the top-level `timeline`. A pure read over the FILTERED
+          // events' stalls measured back from `now` (default Date.now), so a
+          // ?platform= / ?type= scope narrows it for free. It answers the question
+          // `stalls.max` provably cannot: a worst freeze in the NEWEST bucket is
+          // happening now (ACTIVE regression) vs one in an older bucket that has
+          // passed (RESOLVED blip). Counts + per-source maxes only; never raw events
+          // or extended-tier names.
+          stallsTimeline: summarizeStallsTimeline(filtered, { now }),
         });
       } catch (e) {
         return sendJson(res, 500, { error: `could not read summary: ${e?.message ?? e}` });

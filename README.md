@@ -146,6 +146,23 @@ curl http://localhost:7421/summary
 #       { "bucketStart": 1719998200000, "bucketEnd": 1720000000000, "count": 15 }   # recent spike — suspect a deploy
 #     ],
 #     "bucketMs": 1800000                                                          # 30-min buckets (24h window / 48 cap)
+#   },
+#   "stalls": {                                                                    # the MAGNITUDE axis the stall COUNT hides: 500 × 50ms hitches and 500 × 5s freezes read byte-identical on byType (WARDEN-854)
+#     "count": 8,                                                                  # EVERY performance-stall (=== byType['performance-stall'])
+#     "min": 50, "avg": 940, "max": 5000,                                          # real user-perceived freeze duration (ms); max is the headline (worst freeze felt)
+#     "bySource": {                                                                # split so event-loop jank reads apart from renderer hangs
+#       "event-loop":   { "count": 5, "min": 50, "avg": 140, "max": 300 },
+#       "unresponsive": { "count": 3, "min": 1200, "avg": 2633, "max": 5000 }
+#     }
+#   },
+#   "stallsTimeline": {                                                            # the TEMPORAL twin of `stalls` — the worst freeze PER BUCKET (WARDEN-886); `stalls.max` alone cannot say if the worst freeze is recent
+#     "buckets": [
+#       { "bucketStart": 1719913600000, "bucketEnd": 1719915400000, "count": 2, "max": 200,        # an OLDER bucket — worst was a 200ms hitch → RESOLVED
+#         "bySource": { "event-loop": { "count": 2, "max": 200 } } },
+#       { "bucketStart": 1719998200000, "bucketEnd": 1720000000000, "count": 3, "max": 5000,       # the NEWEST bucket — worst is a 5s freeze → ACTIVE, happening now
+#         "bySource": { "event-loop": { "count": 2, "max": 300 }, "unresponsive": { "count": 1, "max": 5000 } } }
+#     ],
+#     "bucketMs": 1800000                                                          # 30-min buckets — SAME window/granularity as `timeline` (the two share the bucket math)
 #   }
 # }
 ```
@@ -242,6 +259,32 @@ already-persisted events and emits counts, never raw events or extended-tier ide
 than the window are excluded from the distribution but are still counted in `total` / `byType` /
 `firstSeen` / `lastSeen` (those span the full retained set); a quiet store returns `buckets: []` with the
 `bucketMs` granularity still conveyed. It is purely additive — computed on read, it collects nothing new.
+
+`stalls` is the MAGNITUDE axis the stall COUNT (`byType` / `topSignatures`) cannot show: 500 × 50ms
+micro-hitches and 500 × 5s hard freezes read byte-identically on every other surface (WARDEN-854). It
+captures the `lagMs` distribution (min / avg / max — the real user-perceived freeze duration the client
+already populates) of `performance-stall` events, split by `source` so event-loop jank (`'event-loop'`)
+reads apart from renderer hangs (`'unresponsive'`); `max` is the headline — the worst freeze a user
+actually felt, not buried in the average. `count` is every `performance-stall` event (it equals
+`byType['performance-stall']`); `min`/`avg`/`max` reflect only the finite-`lagMs` subset (a non-finite or
+absent `lagMs` is skipped from the stats but still counted, so one bad record can never poison the
+aggregate). `lagMs` is a non-identifying magnitude already enumerated in the consent surface, so this is a
+pure read-side aggregate — no new collection, wire field, or schema bump.
+
+`stallsTimeline` is the TEMPORAL twin of `stalls` — the one property that snapshot provably lacks: a TIME
+axis (WARDEN-886). `stalls.max` collapses the whole retained window into one number, and `stalls.lastSeen`
+keys off the last stall *arrival* (any stall, even a 50ms hitch), not the worst freeze's time. So the
+maintainer's first question on a bad `stalls.max` — *is this still happening?* — is unanswerable on `stalls`
+alone: a 5s freeze that landed 5 minutes ago (an ACTIVE regression — users feeling it right now) and a 5s
+freeze that landed 5 hours ago (a RESOLVED blip — already gone) read byte-identical. `stallsTimeline`
+answers it with a per-bucket `max` freeze `lagMs` (the worst freeze in each bucket) over the SAME rolling
+24h window / 30-min buckets as the top-level `timeline` — the two SHARE the bucket-assignment math, so they
+can never drift on window or granularity. The worst freeze in the NEWEST bucket is happening now; the worst
+freeze in an older bucket has passed. Each bucket carries `count` (every stall in it, including non-finite
+`lagMs` — parity with `stalls.count`) and `max` (the worst finite freeze, `null` if none), split by `source`
+(`bySource`) exactly like `stalls`. It is purely additive — a pure read over already-accepted, already-redacted
+events, computed on read; no new collection, wire field, schema bump, or identifier. A stall-free store reads
+a clean `buckets: []` with the `bucketMs` granularity still conveyed.
 
 #### Scoping the aggregates — `?type=` / `?platform=` / `?appVersion=` / `?since=`
 

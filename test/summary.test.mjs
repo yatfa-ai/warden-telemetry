@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, summarizeTimeline } from '../summary.mjs';
+import { summarize, summarizeTimeline, summarizeStallsTimeline } from '../summary.mjs';
 
 // Canonical valid events (verbatim shapes ingest persists — one per base type).
 const validError = {
@@ -931,4 +931,345 @@ test('firstSeen/lastSeen: an event lacking receivedAt still reads via the timest
   ]);
   assert.equal(s.firstSeen, 10);
   assert.equal(s.lastSeen, 90);
+});
+
+// ── STALLS TIMELINE — bounded stall-SEVERITY distribution (WARDEN-886) ─────────
+// `summarizeStallsTimeline` is the TEMPORAL twin of the `stalls` magnitude snapshot
+// (WARDEN-854): a per-bucket `max` freeze `lagMs` (overall + split by `source`)
+// over the SAME rolling window / granularity as `summarizeTimeline` (the two SHARE
+// the pure bucket-assignment helper, so they can never drift). It exists because
+// `stalls.max` collapses the whole window into one number with no time axis: a 5s
+// freeze minutes ago (ACTIVE) and a 5s freeze hours ago (RESOLVED) read byte-
+// identically on `stalls`. The timeline places the worst freeze in TIME. Mirrors
+// the timeline-test pattern: fake `now`, small `windowMs`/`maxBuckets` for exact
+// bucket arithmetic (window [0,100], 10 buckets of width 10 here). `validStall`
+// carries lagMs:750 + source:'event-loop'.
+
+test('stallsTimeline: empty input → zeroed shape (no false alarm on a quiet store)', () => {
+  const t = summarizeStallsTimeline([], { now: () => 10_000_000 });
+  assert.deepEqual(t.buckets, []);
+  assert.ok(t.bucketMs > 0, 'bucketMs conveys the granularity even when empty');
+});
+
+test('stallsTimeline: non-array input is treated as empty (defensive — never throws)', () => {
+  const opts = { now: () => 0 };
+  assert.deepEqual(summarizeStallsTimeline(undefined, opts), summarizeStallsTimeline([], opts));
+  assert.deepEqual(summarizeStallsTimeline(null, opts), summarizeStallsTimeline([], opts));
+  assert.deepEqual(summarizeStallsTimeline('nope', opts), summarizeStallsTimeline([], opts));
+});
+
+test('stallsTimeline: stalls within the window land in the correct bucket with count + max + bySource', () => {
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: 95, lagMs: 5000, source: 'unresponsive' },
+      { ...validStall, timestamp: 5, lagMs: 50, source: 'event-loop' },
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    { bucketStart: 0, bucketEnd: 10, count: 1, max: 50, bySource: { 'event-loop': { count: 1, max: 50 } } },
+    { bucketStart: 90, bucketEnd: 100, count: 1, max: 5000, bySource: { unresponsive: { count: 1, max: 5000 } } },
+  ]);
+  assert.equal(t.bucketMs, 10);
+});
+
+test('stallsTimeline: multiple stalls in the same bucket accumulate count + track the worst max', () => {
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: 1, lagMs: 50, source: 'event-loop' },
+      { ...validStall, timestamp: 2, lagMs: 5000, source: 'event-loop' },
+      { ...validStall, timestamp: 9, lagMs: 200, source: 'unresponsive' },
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    {
+      bucketStart: 0, bucketEnd: 10, count: 3, max: 5000,
+      bySource: {
+        'event-loop': { count: 2, max: 5000 },
+        unresponsive: { count: 1, max: 200 },
+      },
+    },
+  ]);
+});
+
+test('stallsTimeline: a non-finite lagMs (NaN / Infinity) is skipped from max but STILL counted', () => {
+  // The load-bearing WARDEN-854 guard, inherited by the timeline: validateBaseEvent
+  // only typeof-checks lagMs (schema.ts), so NaN / Infinity can reach here. An
+  // unguarded per-bucket Math.max would poison the bucket from one bad record.
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: 1, lagMs: NaN, source: 'event-loop' },
+      { ...validStall, timestamp: 2, lagMs: Infinity, source: 'event-loop' },
+      { ...validStall, timestamp: 3, lagMs: 500, source: 'event-loop' },
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    {
+      bucketStart: 0, bucketEnd: 10, count: 3, max: 500,
+      bySource: { 'event-loop': { count: 3, max: 500 } },
+    },
+  ]);
+});
+
+test('stallsTimeline: an absent lagMs is skipped from max but STILL counted', () => {
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: 1, lagMs: undefined, source: 'event-loop' },
+      { ...validStall, timestamp: 2, lagMs: 500, source: 'event-loop' },
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    { bucketStart: 0, bucketEnd: 10, count: 2, max: 500, bySource: { 'event-loop': { count: 2, max: 500 } } },
+  ]);
+});
+
+test('stallsTimeline: max is null when NO finite lagMs reached the bucket (but the stalls are still counted)', () => {
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: 1, lagMs: NaN, source: 'event-loop' },
+      { ...validStall, timestamp: 2, lagMs: undefined, source: 'unresponsive' },
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    {
+      bucketStart: 0, bucketEnd: 10, count: 2, max: null,
+      bySource: {
+        'event-loop': { count: 1, max: null },
+        unresponsive: { count: 1, max: null },
+      },
+    },
+  ]);
+});
+
+test('stallsTimeline: a sourceless stall is counted + feeds the overall max but yields no bySource entry', () => {
+  // A stall with no `source` is malformed; it is counted and its magnitude feeds the
+  // bucket's overall `max`, but it yields no per-source bucket (mirrors signatureOf,
+  // which returns null for a sourceless stall).
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: 1, lagMs: 500, source: 'event-loop' },
+      { type: 'performance-stall', timestamp: 2, lagMs: 9000 }, // no source
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    {
+      bucketStart: 0, bucketEnd: 10, count: 2, max: 9000,
+      bySource: { 'event-loop': { count: 1, max: 500 } },
+    },
+  ]);
+});
+
+test('stallsTimeline: non-stall events (errors / crashes) never fire a bucket (reads only performance-stall)', () => {
+  // A bucket that WOULD fire on the COUNT timeline (errors land here) fires NOTHING
+  // on the stall timeline — non-stalls are dropped before bucketing, so a bucket
+  // appears ONLY when a stall lands in it (no false "0 stalls here" noise).
+  const t = summarizeStallsTimeline([validError, validCrash], {
+    now: () => 100,
+    windowMs: 100,
+    maxBuckets: 10,
+  });
+  assert.deepEqual(t.buckets, []);
+  assert.ok(t.bucketMs > 0, 'bucketMs conveys the granularity even when no stall fired');
+});
+
+test('stallsTimeline: buckets are sorted chronologically (oldest → newest)', () => {
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: 95 },
+      { ...validStall, timestamp: 5 },
+      { ...validStall, timestamp: 50 },
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(
+    t.buckets.map((b) => b.bucketStart),
+    [0, 50, 90]
+  );
+});
+
+test('stallsTimeline: a stall timestamped exactly `now` lands in the newest bucket (top-boundary fold)', () => {
+  const t = summarizeStallsTimeline([{ ...validStall, timestamp: 100 }], {
+    now: () => 100,
+    windowMs: 100,
+    maxBuckets: 10,
+  });
+  assert.deepEqual(t.buckets, [
+    { bucketStart: 90, bucketEnd: 100, count: 1, max: 750, bySource: { 'event-loop': { count: 1, max: 750 } } },
+  ]);
+});
+
+test('stallsTimeline: stalls older than the rolling window are EXCLUDED from the timeline', () => {
+  // window [100, 200]; a stall at 50 (before windowStart) is excluded — it is still
+  // counted by summarize()'s stalls snapshot (the full retained set), just not in the
+  // recent per-bucket distribution.
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: 50, lagMs: 5000 },
+      { ...validStall, timestamp: 150, lagMs: 100 },
+    ],
+    { now: () => 200, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    { bucketStart: 150, bucketEnd: 160, count: 1, max: 100, bySource: { 'event-loop': { count: 1, max: 100 } } },
+  ]);
+});
+
+test('stallsTimeline: receivedAt is PREFERRED over timestamp (clock-skew robust, parity with timeline)', () => {
+  // A fast-clock client whose `timestamp` is far in the future still lands in-window
+  // via the receiver's receivedAt — the spike-vs-baseline read is skew-robust (the
+  // WARDEN-692 cutover the COUNT timeline already has).
+  const t = summarizeStallsTimeline(
+    [{ ...validStall, timestamp: 200 + 300_000, receivedAt: 150, lagMs: 5000, source: 'unresponsive' }],
+    { now: () => 200, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    { bucketStart: 150, bucketEnd: 160, count: 1, max: 5000, bySource: { unresponsive: { count: 1, max: 5000 } } },
+  ]);
+});
+
+test('stallsTimeline: the window ROLLS with `now` — the same stall ages out as now advances', () => {
+  const events = [{ ...validStall, timestamp: 50 }];
+  assert.equal(
+    summarizeStallsTimeline(events, { now: () => 100, windowMs: 100, maxBuckets: 10 }).buckets.length,
+    1
+  );
+  assert.deepEqual(
+    summarizeStallsTimeline(events, { now: () => 1_000_000, windowMs: 100, maxBuckets: 10 }).buckets,
+    []
+  );
+});
+
+test('stallsTimeline: bucket count is capped at maxBuckets however many stalls span the window', () => {
+  const events = [];
+  for (let i = 0; i < 200; i++) events.push({ ...validStall, timestamp: i });
+  const t = summarizeStallsTimeline(events, { now: () => 200, windowMs: 200, maxBuckets: 20 });
+  assert.ok(t.buckets.length <= 20, 'never more than maxBuckets buckets');
+  assert.equal(t.buckets.length, 20, 'every grid slot is hit → exactly maxBuckets');
+  assert.equal(t.buckets.reduce((sum, b) => sum + b.count, 0), 200, 'no stall lost');
+});
+
+test('stallsTimeline: non-finite / malformed timestamps are ignored (skip-robust, never fatal)', () => {
+  const t = summarizeStallsTimeline(
+    [
+      { ...validStall, timestamp: Infinity },
+      { ...validStall, timestamp: NaN },
+      { ...validStall, timestamp: 'nope' },
+      { ...validStall, timestamp: 50 },
+      null,
+      42,
+      'str',
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  assert.deepEqual(t.buckets, [
+    { bucketStart: 50, bucketEnd: 60, count: 1, max: 750, bySource: { 'event-loop': { count: 1, max: 750 } } },
+  ]);
+});
+
+test('stallsTimeline: never echoes raw events or extended-tier identifiers (lagMs / source / time only)', () => {
+  const t = summarizeStallsTimeline(
+    [
+      {
+        ...validStall,
+        timestamp: 50,
+        lagMs: 5000,
+        source: 'unresponsive',
+        message: 'super secret stack detail',
+        chatName: 'Refactor auth',
+        sessionName: 'claude-7b3a2f1',
+      },
+    ],
+    { now: () => 100, windowMs: 100, maxBuckets: 10 }
+  );
+  const json = JSON.stringify(t);
+  assert.equal(json.includes('Refactor auth'), false, 'no chatName in timeline');
+  assert.equal(json.includes('claude-7b3a2f1'), false, 'no sessionName in timeline');
+  assert.equal(json.includes('super secret stack detail'), false, 'no message in timeline');
+  // the non-identifying magnitude + source ARE aggregated
+  assert.equal(json.includes('5000'), true, 'lagMs magnitude is in the bucket max');
+  assert.equal(json.includes('unresponsive'), true, 'source is a bucket key');
+});
+
+test('stallsTimeline: a degenerate config (non-positive window / maxBuckets) collapses to a zeroed shape', () => {
+  const events = [{ ...validStall, timestamp: 5 }];
+  assert.deepEqual(
+    summarizeStallsTimeline(events, { now: () => 100, windowMs: 0, maxBuckets: 10 }),
+    { buckets: [], bucketMs: 0 }
+  );
+  assert.deepEqual(
+    summarizeStallsTimeline(events, { now: () => 100, windowMs: 100, maxBuckets: 0 }),
+    { buckets: [], bucketMs: 0 }
+  );
+});
+
+test('stallsTimeline: bucket boundaries are byte-identical to summarizeTimeline for the same events (never drift)', () => {
+  // The shared _assignTimelineBuckets helper guarantees the COUNT timeline and the
+  // stall timeline can NEVER drift on window, granularity, or bucket boundary.
+  const events = [
+    { ...validStall, timestamp: 5 },
+    { ...validStall, timestamp: 50 },
+    { ...validStall, timestamp: 95 },
+  ];
+  const opts = { now: () => 100, windowMs: 100, maxBuckets: 10 };
+  const count = summarizeTimeline(events, opts);
+  const stall = summarizeStallsTimeline(events, opts);
+  assert.deepEqual(
+    stall.buckets.map((b) => ({ bucketStart: b.bucketStart, bucketEnd: b.bucketEnd })),
+    count.buckets.map((b) => ({ bucketStart: b.bucketStart, bucketEnd: b.bucketEnd })),
+    'byte-identical bucket boundaries (never drift)'
+  );
+  assert.equal(stall.bucketMs, count.bucketMs);
+  // the per-bucket stall COUNT on the severity timeline matches the COUNT timeline
+  assert.deepEqual(
+    stall.buckets.map((b) => b.count),
+    count.buckets.map((b) => b.count)
+  );
+});
+
+// THE HEADLINE — the spike-vs-baseline property the `stalls` SNAPSHOT provably lacks.
+test('stallsTimeline: the HEADLINE — two stores with byte-identical stalls.max but different temporal placement read differently', () => {
+  // `stalls.max` collapses the whole window into one number, so a 5s freeze minutes
+  // ago (ACTIVE — users feeling it now) and a 5s freeze hours ago (RESOLVED — already
+  // gone) read byte-identical on the snapshot. The timeline places the worst freeze
+  // in TIME, so the maintainer's "is this still happening?" becomes answerable.
+  // window [0, 100], 10 buckets of width 10.
+  const opts = { now: () => 100, windowMs: 100, maxBuckets: 10 };
+  // Store A: the 5000ms freeze is in the NEWEST bucket (bucket 9, [90,100)) — ACTIVE.
+  const storeA = [{ ...validStall, timestamp: 95, lagMs: 5000, source: 'unresponsive' }];
+  // Store B: the 5000ms freeze is in an OLDER bucket (bucket 0, [0,10)) — RESOLVED.
+  const storeB = [{ ...validStall, timestamp: 5, lagMs: 5000, source: 'unresponsive' }];
+
+  // Both read byte-identically on the `stalls` SNAPSHOT — it cannot tell them apart.
+  assert.equal(summarize(storeA).stalls.max, 5000);
+  assert.equal(summarize(storeB).stalls.max, 5000);
+  assert.equal(
+    summarize(storeA).stalls.max,
+    summarize(storeB).stalls.max,
+    'the snapshot collapses both into the same max — it cannot answer "is this recent?"'
+  );
+
+  // ...but the TIMELINE places the worst freeze in DIFFERENT buckets.
+  const tlA = summarizeStallsTimeline(storeA, opts);
+  const tlB = summarizeStallsTimeline(storeB, opts);
+  assert.deepEqual(tlA.buckets, [
+    {
+      bucketStart: 90, bucketEnd: 100, count: 1, max: 5000,
+      bySource: { unresponsive: { count: 1, max: 5000 } },
+    },
+  ], 'ACTIVE regression — the worst freeze is in the NEWEST bucket');
+  assert.deepEqual(tlB.buckets, [
+    {
+      bucketStart: 0, bucketEnd: 10, count: 1, max: 5000,
+      bySource: { unresponsive: { count: 1, max: 5000 } },
+    },
+  ], 'RESOLVED blip — the same worst freeze is in an OLDER bucket');
+  assert.notEqual(
+    tlA.buckets[0].bucketStart, tlB.buckets[0].bucketStart,
+    'the active regression and the resolved blip now read APART in time'
+  );
 });
