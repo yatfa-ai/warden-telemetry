@@ -428,15 +428,21 @@ export function createRetentionTrigger(
 // dropping slots that have rolled off. Bounded at maxBuckets by construction:
 // every surviving slot maps to a relative idx clamped to [0, maxBuckets-1].
 //
-// `bump(ts)` takes the externally-read timestamp (it does NOT call now() itself),
-// so a tally's single now() read serves both its scalar `lastSeen` and the slot —
-// preserving the WARDEN-798 "one clock read per record, never two" invariant.
+// `bump(ts, count = 1)` takes the externally-read timestamp (it does NOT call
+// now() itself), so a tally's single now() read serves both its scalar
+// `lastSeen` and the slot — preserving the WARDEN-798 "one clock read per
+// record, never two" invariant. The optional `count` weight defaults to 1 (one
+// hit per call — the rejections / persistErrors / deduped tallies), and the
+// retention tally (WARDEN-838) passes its `dropped` event count so a 5000-event
+// compaction registers as 5000 in its bucket ("how much signal was lost WHEN"),
+// not as 1. The weight is the ONLY retention-specific seam — every other tally
+// calls `bump(ts)` and is unchanged.
 /**
  * Build the shared bounded rolling-window timeline (WARDEN-834). Composed by the
  * three tallies so the bucket math exists in exactly ONE place.
  *
  * @param {{now?: () => number, maxBuckets?: number, windowMs?: number}} [opts]
- * @returns {{bump: (ts: number) => void, snapshot: () => {buckets: Array<{bucketStart: number, bucketEnd: number, count: number}>, bucketMs: number}}}
+ * @returns {{bump: (ts: number, count?: number) => void, snapshot: () => {buckets: Array<{bucketStart: number, bucketEnd: number, count: number}>, bucketMs: number}}}
  */
 export function createBoundedRollingTimeline({
   now = Date.now,
@@ -455,12 +461,19 @@ export function createBoundedRollingTimeline({
 
   return {
     /** Record one hit at absolute epoch-ms `ts`. Computes the absolute slot
-     *  (floor(ts / bucketMs)) and increments its count. No-op under a degenerate
-     *  config (the snapshot collapses to { buckets: [], bucketMs: 0 } anyway). */
-    bump(ts) {
+     *  (floor(ts / bucketMs)) and increments its count. `count` (default 1) is the
+     *  weight to add — the rejections / persistErrors / deduped tallies record one
+     *  hit per call; the retention tally (WARDEN-838) passes its `dropped` event
+     *  count so the bucket reflects how many events a compaction evicted, not how
+     *  many prune OPERATIONS ran. A non-positive/non-finite weight falls back to 1
+     *  (the historical behavior), so a misuse can never silently add 0 or NaN.
+     *  No-op under a degenerate config (the snapshot collapses to
+     *  { buckets: [], bucketMs: 0 } anyway). */
+    bump(ts, count = 1) {
       if (!validConfig) return;
+      const n = Number.isFinite(count) && count > 0 ? count : 1;
       const slot = Math.floor(ts / bucketMs);
-      counts.set(slot, (counts.get(slot) ?? 0) + 1);
+      counts.set(slot, (counts.get(slot) ?? 0) + n);
     },
     /** A stable point-in-time copy of the timeline (a later bump does not mutate a
      *  previously-returned snapshot). Re-relativizes the absolute per-bucket counts
@@ -834,26 +847,38 @@ export function createPersistErrorTally({
 //
 // Bounded means: the configured bounds + a retained count + a running total of
 // pruned events + a SINGLE most-recent prune sample {before, after, pruned,
-// rewrote, ts}. It does NOT keep one record per prune, so a sustained compaction
-// storm can't grow it. Like the sibling tallies, it "persists nothing" — it is
-// in-memory and receiver-local (a misconfiguration signal need not survive a
-// restart), and ADDITIVE ONLY: it records what retention already does, relaxes
-// no check, mirrors no invariant, routes nothing, touches no redaction. The
-// recorded `last` carries only counts + a timestamp — never raw event bytes or
-// extended-tier identifiers (the trust model is preserved, same as the sibling
-// tallies).
+// rewrote, ts} + a bounded rolling-window `timeline` of PRUNED-event counts per
+// bucket (WARDEN-838, the last event-flow tally to carry one). It does NOT keep
+// one record per prune, so a sustained compaction storm can't grow it. Like the
+// sibling tallies, it "persists nothing" — it is in-memory and receiver-local (a
+// misconfiguration signal need not survive a restart), and ADDITIVE ONLY: it
+// records what retention already does, relaxes no check, mirrors no invariant,
+// routes nothing, touches no redaction. The recorded `last` and the timeline
+// buckets carry only counts + timestamps — never raw event bytes or extended-tier
+// identifiers (the trust model is preserved, same as the sibling tallies).
 
 // The zeroed shape returned when no tally is wired OR no prune has run yet.
 // `configured` is {maxEvents:0, maxAgeMs:0} here (the "unset" shape an absent dep
 // yields); a WIRED tally carries the active bounds instead. A fresh wired tally
 // whose prune has not fired yet also reads zeroed EXCEPT `configured` reflects
 // the real bounds — so an idle receiver never false-alarms (parity with
-// EMPTY_REJECTIONS / EMPTY_PERSIST_ERRORS), but a maintainer still sees the cap.
+// EMPTY_REJECTIONS / EMPTY_PERSIST_ERRORS / EMPTY_DEDUPED), but a maintainer still
+// sees the cap. The zeroed `timeline` (WARDEN-838) carries the SAME stable shape a
+// wired tally's empty snapshot does — `buckets: []` + the default `bucketMs`
+// (24h / 48) — so the field is shape-stable whether or not the tally is wired
+// (parity with the three sibling tallies' EMPTY_* timelines). `bucketMs` conveys
+// granularity (it is the default, NOT 0: only a degenerate config override
+// collapses it to 0, mirroring summarizeTimeline's empty-but-valid vs degenerate
+// distinction).
 const EMPTY_RETENTION = Object.freeze({
   configured: { maxEvents: 0, maxAgeMs: 0 },
   retainedCount: 0,
   totalPruned: 0,
   last: null,
+  timeline: Object.freeze({
+    buckets: [],
+    bucketMs: DEFAULT_TIMELINE_WINDOW_MS / DEFAULT_TIMELINE_MAX_BUCKETS,
+  }),
 });
 
 /**
@@ -866,17 +891,61 @@ const EMPTY_RETENTION = Object.freeze({
  * retained count is measured against (the trigger is created with the same
  * bounds, so the tally and the trigger agree on the configured window).
  *
- * @param {{ now?: () => number, maxEvents?: number, maxAgeMs?: number }} [opts]
+ * WARDEN-838 extends the snapshot with a bounded `timeline` — a per-bucket COUNT
+ * of PRUNED EVENTS over the SAME rolling window/granularity as the read-path
+ * `timeline` (summarizeTimeline, WARDEN-603) and the three sibling tallies'
+ * timelines (rejections WARDEN-798 / persistErrors WARDEN-777 / deduped
+ * WARDEN-812), so a maintainer reading `retention.timeline` can tell ONGOING
+ * eviction churn (the store is at cap and /summary's window is actively
+ * shrinking — prunes still landing in the newest bucket → action: raise
+ * STORE_MAX_EVENTS) from a RESOLVED one-time compaction an hour ago (prunes
+ * clustered in older buckets, newest bucket empty → benign history, do nothing)
+ * — the spike-vs-baseline question `totalPruned` + a single `last.ts` provably
+ * cannot answer for an episodic eviction flood that often recovers. This is the
+ * last event-flow tally to carry a timeline; it composes the SAME shared helper
+ * (createBoundedRollingTimeline, WARDEN-834) the other three do.
+ *
+ * The bucket count is the prune's `dropped` (pruned) count — NOT +1 per prune —
+ * so the timeline answers "how much signal was lost WHEN": a 5000-event
+ * compaction registers as 5000 in its bucket. This is the one seam where
+ * retention diverges from the +1-per-record siblings; it uses the helper's
+ * `bump(ts, count)` weight.
+ *
+ * `maxBuckets` / `windowMs` default to the read-path `DEFAULT_TIMELINE_*`
+ * constants (imported from summary.mjs) so the four timelines never drift in
+ * granularity. Production constructs the tally with only `{ maxEvents, maxAgeMs }`
+ * (the siblings are constructed no-arg), so the timeline window is always the
+ * factory default.
+ *
+ * @param {{ now?: () => number, maxEvents?: number, maxAgeMs?: number, maxBuckets?: number, windowMs?: number }} [opts]
  * @returns {{
  *   record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void,
- *   snapshot(): { configured: { maxEvents: number, maxAgeMs: number }, retainedCount: number, totalPruned: number, last: { before: number, after: number, pruned: number, rewrote: boolean, ts: number } | null }
+ *   snapshot(): {
+ *     configured: { maxEvents: number, maxAgeMs: number },
+ *     retainedCount: number,
+ *     totalPruned: number,
+ *     last: { before: number, after: number, pruned: number, rewrote: boolean, ts: number } | null,
+ *     timeline: { buckets: { bucketStart: number, bucketEnd: number, count: number }[], bucketMs: number },
+ *   }
  * }}
  */
-export function createRetentionTally({ now = Date.now, maxEvents = 0, maxAgeMs = 0 } = {}) {
+export function createRetentionTally({
+  now = Date.now,
+  maxEvents = 0,
+  maxAgeMs = 0,
+  maxBuckets = DEFAULT_TIMELINE_MAX_BUCKETS,
+  windowMs = DEFAULT_TIMELINE_WINDOW_MS,
+} = {}) {
   const configured = { maxEvents, maxAgeMs };
   let totalPruned = 0;
   let retainedCount = 0;
   let last = null;
+
+  // The bounded rolling-window timeline (WARDEN-834): the stateful twin of the
+  // pure summarizeTimeline, shared by all four tallies via a single helper. See
+  // createBoundedRollingTimeline for the degenerate-config guard, the absolute-
+  // slot + re-relativize math, the rolloff GC, and the top-boundary fold.
+  const timeline = createBoundedRollingTimeline({ now, maxBuckets, windowMs });
 
   return {
     /** Record one COMPLETED prune. Called ONLY on a SUCCESSFUL prune (the
@@ -897,22 +966,32 @@ export function createRetentionTally({ now = Date.now, maxEvents = 0, maxAgeMs =
       const dropped = Number.isFinite(pruned) ? pruned : 0;
       totalPruned += dropped;
       retainedCount = Number.isFinite(rc) ? rc : retainedCount;
-      last = {
-        before,
-        after,
-        pruned: dropped,
-        rewrote: Boolean(rewrote),
-        ts: now(),
-      };
+      // A SINGLE now() read (WARDEN-798 / WARDEN-838) serves both last.ts and
+      // the timeline slot — one clock read per prune, never two. The helper's
+      // bump() takes that externally-read timestamp (+ the dropped count as its
+      // weight) rather than reading now() itself.
+      const ts = now();
+      last = { before, after, pruned: dropped, rewrote: Boolean(rewrote), ts };
+      // The timeline answers "how much signal was lost WHEN": a prune contributes
+      // its `dropped` event count to the bucket it landed in (a 5000-event
+      // compaction registers as 5000, not 1 — the weight that distinguishes this
+      // tally from the +1-per-record siblings). A no-op prune (dropped:0) bumps
+      // NOTHING — parity with `totalPruned += dropped` (which also adds 0) — so
+      // an idle-but-healthy retention (a no-op sweep on a quiet store) does not
+      // paint a spurious eviction bucket.
+      if (dropped > 0) timeline.bump(ts, dropped);
     },
     /** A stable point-in-time copy of the aggregate (a later record does not
-     *  mutate a previously-returned snapshot). */
+     *  mutate a previously-returned snapshot). The `timeline` is delegated to
+     *  createBoundedRollingTimeline, which re-relativizes the absolute per-bucket
+     *  counts against the current rolling window and drops rolled-off buckets. */
     snapshot() {
       return {
         configured: { ...configured },
         retainedCount,
         totalPruned,
         last: last ? { ...last } : null,
+        timeline: timeline.snapshot(),
       };
     },
   };

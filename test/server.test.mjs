@@ -2504,6 +2504,7 @@ test('retention tally: a fresh tally snapshots to the zeroed shape, carrying the
     retainedCount: 0,
     totalPruned: 0,
     last: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
 });
 
@@ -2562,6 +2563,7 @@ test('retention tally: snapshot() is a stable point-in-time copy — a later rec
     retainedCount: 2,
     totalPruned: 2,
     last: { before: 4, after: 2, pruned: 2, rewrote: true, ts: 7000 },
+    timeline: { buckets: [{ bucketStart: -1_793_000, bucketEnd: 7_000, count: 2 }], bucketMs: 1_800_000 },
   });
   // a fresh snapshot reflects the new state
   assert.equal(tally.snapshot().totalPruned, 3);
@@ -2583,6 +2585,7 @@ test('retention tally: BOUNDED — many records never grow unbounded (one most-r
     rewrote: true,
     ts: 0,
   }, 'only the single most-recent sample is retained — not 1000 entries');
+  assert.deepEqual(Object.keys(snap).sort(), ['configured', 'last', 'retainedCount', 'timeline', 'totalPruned'], 'shape stays bounded — timeline included, no per-prune growth');
 });
 
 test('retention tally: record() on a bare/empty call is a defensive no-op that does not throw or record a spurious sample', () => {
@@ -2593,6 +2596,169 @@ test('retention tally: record() on a bare/empty call is a defensive no-op that d
   assert.equal(snap.totalPruned, 0, 'a bare record added nothing');
   assert.equal(snap.retainedCount, 0);
   assert.equal(snap.last, null, 'no prune was recorded');
+  assert.deepEqual(snap.timeline, { buckets: [], bucketMs: 1_800_000 }, 'a bare record painted no spurious eviction bucket');
+});
+
+// ── RETENTION TALLY timeline (WARDEN-838) ────────────────────────────────────
+// The bounded rolling-window timeline mirrors the three sibling tallies'
+// timelines (rejections WARDEN-798 / persistErrors WARDEN-777 / deduped
+// WARDEN-812), all composed from the shared createBoundedRollingTimeline helper
+// (WARDEN-834). ONE divergence: a prune contributes its DROPPED event count to
+// the bucket (a 5000-event compaction registers as 5000), not +1 per prune — so
+// the timeline answers "how much signal was lost WHEN", distinguishing ONGOING
+// eviction churn from a RESOLVED one-time compaction. Driven directly with a
+// fake clock (no real Date); the bucket math is verified byte-exact below.
+
+test('retention tally timeline: an empty tally carries the zeroed shape — buckets: [], bucketMs = default (no false alarm)', () => {
+  // A fresh createRetentionTally({ now }) snapshot returns the zeroed timeline —
+  // shape-stable whether or not the tally is wired, mirroring the EMPTY_* shapes
+  // of the three sibling tallies. bucketMs is the default granularity (NOT 0).
+  const tally = createRetentionTally({ now: () => 0 });
+  assert.deepEqual(tally.snapshot().timeline, { buckets: [], bucketMs: 1_800_000 });
+});
+
+test('retention tally timeline: a known seeded time spread — a recent eviction spike vs an earlier baseline, weighted by DROPPED count (parity with the sibling timelines + summarizeTimeline)', () => {
+  // Mirrors the deduped/persistErrors/rejections tally timeline tests: record
+  // prunes at known fake-clock times so the snapshot emits buckets at EXACTLY
+  // those times. window [0, 86_400_000], bucketMs 1_800_000; bucket 1 =
+  // [1.8M, 3.6M); bucket 47 = [84.6M, 86.4M); a record at EXACTLY now (86.4M)
+  // folds into the newest bucket (top-boundary fold). Covers same-bucket
+  // accumulation and chronological sort. KEY DIFFERENCE from the +1 siblings:
+  // three prunes in the newest bucket accumulate to count:10 (5 + 3 + 2), NOT 3
+  // — each prune contributes its DROPPED count. A 5000-event compaction would
+  // register as 5000.
+  let clock = 0;
+  const tally = createRetentionTally({ now: () => clock });
+  // baseline: one eviction (dropped 1) in bucket 1
+  clock = 1_800_000; tally.record({ before: 4, after: 3, pruned: 1, rewrote: true, retainedCount: 3 });
+  // spike: three compactions in bucket 47, accumulating by DROPPED count
+  clock = 84_600_000; tally.record({ before: 8, after: 3, pruned: 5, rewrote: true, retainedCount: 3 });
+  clock = 84_600_001; tally.record({ before: 6, after: 3, pruned: 3, rewrote: true, retainedCount: 3 });
+  clock = 86_400_000; tally.record({ before: 5, after: 3, pruned: 2, rewrote: true, retainedCount: 3 }); // === now → newest via boundary fold
+  clock = 86_400_000; // snapshot time
+  const { timeline, totalPruned } = tally.snapshot();
+  assert.equal(timeline.buckets.length, 2, 'two distinct buckets: baseline + spike');
+  assert.deepEqual(timeline.buckets, [
+    { bucketStart: 1_800_000, bucketEnd: 3_600_000, count: 1 },    // baseline (oldest)
+    { bucketStart: 84_600_000, bucketEnd: 86_400_000, count: 10 }, // recent spike — 5 + 3 + 2, weighted by DROPPED count (NOT +1 per prune)
+  ]);
+  assert.equal(timeline.bucketMs, 1_800_000);
+  assert.equal(totalPruned, 11, 'totalPruned is cumulative across the timeline');
+  // The bucket shape is count + window only — there is no field that could carry
+  // a raw event byte or an extended-tier identifier (the trust model is preserved).
+  assert.deepEqual(Object.keys(timeline.buckets[0]).sort(), ['bucketEnd', 'bucketStart', 'count']);
+});
+
+test('retention tally timeline: ROLL-OFF BOUND — buckets older than the window drop on snapshot(); bucket count never exceeds maxBuckets', () => {
+  // Record one dropped-1 prune per distinct 30-min slot for 60 slots
+  // (> maxBuckets=48), each a bucketMs apart, so the 48-slot-wide rolling 24h
+  // window cannot hold them all. Advancing the fake clock pushes the earliest
+  // evictions out of the window: the snapshot must drop the rolled-off buckets,
+  // never emit more than maxBuckets, and — unlike `totalPruned` — only the
+  // TIMELINE window rolls; totalPruned stays cumulative.
+  let clock = 1_800_000;
+  const tally = createRetentionTally({ now: () => clock });
+  for (let i = 0; i < 60; i++) {
+    tally.record({ before: 11, after: 10, pruned: 1, rewrote: true, retainedCount: 10 });
+    clock += 1_800_000; // advance to the next distinct 30-min slot
+  }
+  // clock is now 1_800_000 + 60 * 1_800_000 = 109_800_000 (snapshot time)
+  const snap = tally.snapshot();
+  assert.equal(snap.totalPruned, 60, 'totalPruned is cumulative — it does NOT roll off (only the timeline window does)');
+  assert.ok(snap.timeline.buckets.length <= 48, `bucket count bounded at maxBuckets (got ${snap.timeline.buckets.length})`);
+  assert.equal(snap.timeline.bucketMs, 1_800_000);
+  // Every surviving bucket sits inside the current 24h window — the earliest
+  // evictions (the first ~12 slots) rolled off. windowStart = clock - windowMs.
+  const windowStart = clock - 86_400_000;
+  for (const b of snap.timeline.buckets) {
+    assert.ok(b.bucketStart >= windowStart, `bucket ${b.bucketStart} is inside the rolling window (>= ${windowStart})`);
+  }
+  // Emitted oldest → newest (chronological sort).
+  for (let i = 1; i < snap.timeline.buckets.length; i++) {
+    assert.ok(
+      snap.timeline.buckets[i - 1].bucketStart < snap.timeline.buckets[i].bucketStart,
+      'buckets sorted oldest → newest'
+    );
+  }
+});
+
+test('retention tally timeline: DEGENERATE config (windowMs: 0 / maxBuckets: 0) → { buckets: [], bucketMs: 0 } while the scalar tally keeps working', () => {
+  // Mirrors summarizeTimeline's + the sibling tallies' degenerate-config guard:
+  // a bad windowMs/maxBuckets override collapses the timeline to
+  // { buckets: [], bucketMs: 0 } — never a huge/NaN array — while the scalar
+  // tally (totalPruned / last) keeps working regardless.
+  let clock = 5_000;
+  const tally = createRetentionTally({ now: () => clock, maxBuckets: 0, windowMs: 0 });
+  tally.record({ before: 5, after: 3, pruned: 2, rewrote: true, retainedCount: 3 });
+  const snap = tally.snapshot();
+  // scalar tally unaffected
+  assert.equal(snap.totalPruned, 2);
+  assert.deepEqual(snap.last, { before: 5, after: 3, pruned: 2, rewrote: true, ts: 5_000 });
+  // timeline collapsed — never a huge/NaN array
+  assert.deepEqual(snap.timeline, { buckets: [], bucketMs: 0 });
+});
+
+test('retention tally timeline: a no-op prune (pruned:0) refreshes `last` but bumps NO bucket (parity with totalPruned, which also adds 0)', () => {
+  // Chosen semantics: the timeline counts only what was actually DROPPED, so a
+  // no-op sweep on a quiet store (retention ran, evicted nothing) paints no
+  // spurious eviction bucket — exactly as it adds 0 to totalPruned. `last` still
+  // refreshes so a maintainer sees retention last RAN (the WARDEN-743 discipline,
+  // now timeline-aware).
+  let clock = 9_000;
+  const tally = createRetentionTally({ now: () => clock });
+  clock = 9_000; tally.record({ before: 5, after: 3, pruned: 2, rewrote: true, retainedCount: 3 }); // a real eviction
+  clock = 9_001; tally.record({ before: 3, after: 3, pruned: 0, rewrote: false, retainedCount: 3 }); // a no-op sweep
+  const snap = tally.snapshot();
+  assert.equal(snap.totalPruned, 2, 'the no-op prune added 0 — totalPruned is unchanged');
+  assert.deepEqual(snap.last, { before: 3, after: 3, pruned: 0, rewrote: false, ts: 9_001 }, 'last refreshed to the no-op sample');
+  // The real eviction fired one bucket (count: 2); the no-op added NO second
+  // bucket and did not inflate the first.
+  assert.equal(snap.timeline.buckets.length, 1, 'the no-op prune painted no bucket');
+  assert.equal(snap.timeline.buckets[0].count, 2, 'the bucket still reflects only the real eviction');
+});
+
+test('retention tally timeline: ONGOING eviction churn vs RESOLVED compaction — the newest bucket tells them apart (totalPruned + last.ts alone cannot)', () => {
+  // The flagship success criterion (WARDEN-838): two receivers with the SAME
+  // totalPruned can be distinguished by whether eviction churn is STILL landing
+  // (newest bucket non-empty = ONGOING — the store is at cap and /summary's
+  // window is actively shrinking → raise STORE_MAX_EVENTS) or has gone quiet
+  // (no bucket near now, only older buckets populated = RESOLVED — a one-time
+  // compaction an hour ago, benign history → do nothing). `totalPruned` + a
+  // single `last.ts` provably cannot answer this — a sustained eviction flood
+  // and a spike that recovered read identical without the per-bucket distribution.
+  const snapshotTime = 100_000_000;
+
+  // ONGOING: an eviction landed moments before the snapshot — newest bucket non-empty.
+  let clock = snapshotTime;
+  const ongoing = createRetentionTally({ now: () => clock });
+  clock = snapshotTime - 60_000; // 1 min ago — inside the newest bucket
+  ongoing.record({ before: 5, after: 3, pruned: 4, rewrote: true, retainedCount: 3 });
+  clock = snapshotTime;
+  const ongSnap = ongoing.snapshot();
+  const ongBuckets = ongSnap.timeline.buckets;
+  assert.ok(ongBuckets.length >= 1, 'ONGOING: at least one bucket is populated');
+  const ongNewest = ongBuckets[ongBuckets.length - 1];
+  assert.equal(ongNewest.bucketEnd, snapshotTime, 'ONGOING: the newest bucket reaches now — evictions are still landing');
+  assert.ok(ongNewest.count >= 1, 'ONGOING: the newest bucket is non-empty');
+
+  // RESOLVED: the only eviction landed near the START of the window, then the
+  // store drained below the cap; snapshot much later — the eviction sits in an
+  // OLD bucket, no bucket near now.
+  const resolved = createRetentionTally({ now: () => clock });
+  clock = snapshotTime - 80_000_000; // ~22h ago — near the window's oldest edge
+  resolved.record({ before: 5, after: 3, pruned: 4, rewrote: true, retainedCount: 3 });
+  clock = snapshotTime; // the store drained an hour ago; evictions stopped
+  const resSnap = resolved.snapshot();
+  const resBuckets = resSnap.timeline.buckets;
+  assert.ok(resBuckets.length >= 1, 'RESOLVED: the old eviction still has its bucket');
+  const resNewest = resBuckets[resBuckets.length - 1];
+  assert.ok(
+    resNewest.bucketEnd < snapshotTime,
+    'RESOLVED: the newest POPULATED bucket ends well before now — no bucket reaches the snapshot time (evictions went quiet)'
+  );
+
+  // Same totalPruned, opposite verdict — the temporal distribution is the deciding signal.
+  assert.equal(ongSnap.totalPruned, resSnap.totalPruned, 'both pruned 4 — identical totalPruned, but the timeline tells them apart');
 });
 
 // ── RETENTION TALLY wired through createRetentionTrigger (.then discipline) ───
@@ -2692,6 +2858,7 @@ test('GET /summary carries a `retention` field; a wired-but-idle tally reads zer
     retainedCount: 0,
     totalPruned: 0,
     last: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   }, 'no prune ran → zeroed sample, but the configured bounds are still visible');
 });
 
@@ -2707,6 +2874,7 @@ test('GET /summary WITHOUT a wired retentionHealth tally returns the zeroed EMPT
     retainedCount: 0,
     totalPruned: 0,
     last: null,
+    timeline: { buckets: [], bucketMs: 1_800_000 },
   });
 });
 
@@ -2804,6 +2972,65 @@ test('GET /summary?platform=win32 leaves retention UNSCOPED (receiver operationa
   assert.equal(body.retention.totalPruned, 1, 'retention survives the platform filter (unscoped)');
   assert.equal(body.retention.retainedCount, 2);
   assert.equal(body.retention.last.pruned, 1);
+});
+
+test('GET /summary.retention.timeline reaches the maintainer — shape + byte-for-byte granularity parity with the three sibling timelines, weighted by the dropped count', async () => {
+  // Mirrors the deduped.timeline end-to-end parity block: wire ALL FOUR tallies
+  // sharing a fake clock, drive ONE real end-to-end prune (ingest past the cap),
+  // and assert body.retention.timeline is present, carries the ['bucketMs',
+  // 'buckets'] shape ONLY, shares bucketMs with the three sibling timelines, and
+  // its single bucket's count is the DROPPED event count (not 1).
+  const f = inMemoryFile();
+  const store = createNdjsonStore(f);
+  const clock = fakeClock();
+  clock.setNow(86_400_000); // a known snapshot time → the eviction lands in the newest bucket
+  const retentionHealth = createRetentionTally({ now: clock.now, maxEvents: 3 });
+  const retention = createRetentionTrigger(store, {
+    maxEvents: 3,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    retention: retentionHealth,
+  });
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent },
+    retention,
+    retentionHealth,
+    rejections: createRejectionTally({ now: clock.now }),
+    persistErrors: createPersistErrorTally({ now: clock.now }),
+    deduped: createDedupTally({ now: clock.now }),
+  });
+
+  // Ingest 8 one-event batches; maxEvents=3 → ONE debounced prune compacts 8 → 3
+  // (dropped 5). The coalesced debounce fires a single prune.
+  for (let i = 0; i < 8; i++) {
+    await handler(fakeReq({ headers: schemaHeaders, body: validBody }), fakeRes());
+  }
+  clock.flushAll(); // fire the off-path, debounced prune
+  await new Promise((r) => setTimeout(r, 0)); // let the async compaction + .then settle
+
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+
+  // The additive retention.timeline (WARDEN-838) carries the SAME shape + granularity
+  // as persistErrors.timeline / rejections.timeline / deduped.timeline — byte-for-
+  // byte parity between the four tallies' temporal axes (all default to the read-path
+  // DEFAULT_TIMELINE_* constants). retention is the last event-flow tally to carry one.
+  assert.ok(body.retention.timeline, 'retention.timeline present (additive — carried on every response)');
+  assert.deepEqual(Object.keys(body.retention.timeline).sort(), ['bucketMs', 'buckets'], 'retention.timeline shape: buckets + bucketMs only');
+  assert.equal(body.retention.timeline.bucketMs, body.persistErrors.timeline.bucketMs, 'same granularity as persistErrors.timeline');
+  assert.equal(body.retention.timeline.bucketMs, body.rejections.timeline.bucketMs, 'same granularity as rejections.timeline');
+  assert.equal(body.retention.timeline.bucketMs, body.deduped.timeline.bucketMs, 'same granularity as deduped.timeline');
+  assert.equal(body.retention.timeline.bucketMs, 1_800_000);
+  // The single coalesced prune fired one bucket; its count is the DROPPED event
+  // count (5), not 1 — the weighting that distinguishes retention from the
+  // +1-per-record sibling tallies.
+  assert.equal(body.retention.timeline.buckets.length, 1, 'the single prune fired one timeline bucket');
+  assert.equal(body.retention.timeline.buckets[0].count, 5, 'the bucket count is the dropped event count (8 → 3 = 5), not +1');
+  assert.equal(body.retention.totalPruned, 5, 'totalPruned agrees with the timeline (cumulative)');
 });
 
 // ── DEDUP TALLY (WARDEN-752) ─────────────────────────────────────────────────
