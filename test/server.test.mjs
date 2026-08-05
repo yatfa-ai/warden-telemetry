@@ -723,6 +723,32 @@ test('GET /summary?platform=win32 scopes the stalls magnitude aggregate to win32
   });
 });
 
+test('GET /summary?platform=win32 scopes the crashReasons histogram to win32 crashes only', async () => {
+  // The new `crashReasons` field (WARDEN-872) flows through the `...summarize
+  // (filtered)` spread, so the SAME pre-summarize filter (WARDEN-727) scopes it for
+  // free: a maintainer who spots a win32 crash spike can scope
+  // /summary?platform=win32 and read that platform's crash CAUSE (oom vs killed)
+  // with no new filter. Seed a darwin oom + a win32 killed + a win32 oom; scoping
+  // to win32 must drop the darwin oom entirely.
+  const store = readableStore([
+    { ...crashEvent, platform: 'darwin', reason: 'oom', timestamp: 1_800_000 },
+    { ...crashEvent, platform: 'win32', reason: 'killed', timestamp: 1_800_000 },
+    { ...crashEvent, platform: 'win32', reason: 'oom', timestamp: 1_800_000 },
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.matched, 2, 'only the two win32 crashes survive the filter');
+  // crashReasons reflects ONLY the win32 crashes: the darwin oom is gone.
+  assert.deepEqual(body.crashReasons, { killed: 1, oom: 1 });
+  // the histogram sum never exceeds the scoped crash count (here equality — every
+  // surviving crash carries a reason).
+  const sum = Object.values(body.crashReasons).reduce((a, b) => a + b, 0);
+  assert.ok(sum <= body.byType.crash, 'histogram sum never exceeds the crash count');
+});
+
 test('GET /summary?platform=win32 scopes the TIMELINE to win32 arrivals only', async () => {
   // Seed a win32 spike (3 in the newest bucket) + a darwin baseline (1 in an earlier
   // bucket). Scoping to win32 must drop the darwin baseline from the distribution.

@@ -48,6 +48,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.deepEqual(s.appVersions, {});
   assert.deepEqual(s.platforms, {});
   assert.deepEqual(s.byRuntime, {});
+  assert.deepEqual(s.crashReasons, {});
   assert.equal(s.firstSeen, null);
   assert.equal(s.lastSeen, null);
 });
@@ -408,6 +409,103 @@ test('byRuntime is empty when no events carry a runtime label', () => {
   const { runtime: _omit, ...noRuntime } = validError;
   const s = summarize([noRuntime, { ...validCrash, runtime: undefined }]);
   assert.deepEqual(s.byRuntime, {});
+});
+// ── CRASH REASON HISTOGRAM (WARDEN-872) ───────────────────────────────────────
+// `crashReasons` is the crash-CAUSE axis `byType.crash` (a bare count) and
+// `topSignatures` (capped at 10 across ALL types, split by exitCode, ranked)
+// both obscure: it buckets crash counts by the non-identifying `reason` string
+// (Electron's fixed enum — oom / crashed / killed — plus the main-process
+// 'unexpected-termination' sentinel, WARDEN-687). Mirrors the appVersions /
+// platforms discipline: COUNTS-only, skip-robust on an absent / null / non-string
+// / empty reason, a clean empty {} shape, and it never echoes raw events or
+// identifiers (`reason` is a redaction no-op, the same tier as `platform`).
+
+test('crashReasons is a histogram keyed by the crash reason', () => {
+  // validCrash carries reason:'oom'; a second validCrash → oom:2; a reason:'killed'
+  // crash → killed:1. Non-crash events contribute nothing.
+  const events = [
+    validCrash,
+    { ...validCrash },
+    { type: 'crash', reason: 'killed' },
+    validError,
+    validStall,
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.crashReasons, { oom: 2, killed: 1 });
+});
+
+test('crashReasons is keyed by reason ALONE — exitCode does NOT split the bucket', () => {
+  // topSignatures splits a crash into reason+exitCode (`crash:oom:exit=133` vs
+  // `crash:oom:exit=1`), so the marginal "total OOM crashes" is NOT derivable from
+  // it. crashReasons rolls that up — the blind spot this histogram closes.
+  const events = [
+    { ...validCrash, reason: 'oom', exitCode: 133 },
+    { ...validCrash, reason: 'oom', exitCode: 1 },
+    { ...validCrash, reason: 'oom' }, // no exitCode
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.crashReasons, { oom: 3 });
+});
+
+test('crashReasons skips absent / null / non-string / empty reason (skip-robust, never a bucket)', () => {
+  // A reasonless crash is still counted by byType.crash but NOT bucketed here.
+  const events = [
+    { type: 'crash' }, // no reason
+    { ...validCrash, reason: null },
+    { ...validCrash, reason: 2 },
+    { ...validCrash, reason: '' },
+    { ...validCrash, reason: { x: 1 } },
+    { ...validCrash, reason: 'oom' }, // the only bucketable one
+  ];
+  const s = summarize(events);
+  assert.deepEqual(s.crashReasons, { oom: 1 });
+});
+
+test('crashReasons values sum to ≤ byType.crash (equality iff every crash has a reason)', () => {
+  // The invariant the proposal's "sum === byType.crash" DONE criterion is really
+  // expressing: a reasonless crash is counted by byType.crash but NOT bucketed, so
+  // the histogram sum can only ever be ≤ — never >. Asserting a strict === across a
+  // reasonless-crash fixture would fail (the skip-robust gap the proposer flagged).
+  const events = [
+    { type: 'crash' }, // reasonless → counted by byType.crash, NOT bucketed
+    { ...validCrash, reason: 'oom' },
+    { ...validCrash, reason: 'killed' },
+  ];
+  const s = summarize(events);
+  assert.equal(s.byType.crash, 3);
+  const sum = Object.values(s.crashReasons).reduce((a, b) => a + b, 0);
+  assert.ok(sum <= s.byType.crash, 'histogram sum never exceeds the crash count');
+  assert.equal(sum, 2, 'the reasonless crash is the gap (3 counted, 2 bucketed)');
+  // Equality holds ONLY when every crash carries a present non-empty reason:
+  const allReasoned = summarize([
+    { ...validCrash, reason: 'oom' },
+    { ...validCrash, reason: 'killed' },
+  ]);
+  const sumAll = Object.values(allReasoned.crashReasons).reduce((a, b) => a + b, 0);
+  assert.equal(sumAll, allReasoned.byType.crash, 'equality when every crash has a reason');
+});
+
+test('crashReasons is empty when no events are crashes (no false alarm)', () => {
+  const s = summarize([validError, validStall]);
+  assert.deepEqual(s.crashReasons, {});
+});
+
+test('crashReasons reflects only a platform/appVersion-filtered slice', () => {
+  // summarize() is a PURE function of the event array it is handed — the /summary
+  // handler filters the array BEFORE calling summarize() (server.mjs:
+  // summarize(filtered)), so the histogram honors ?platform / ?appVersion / ?since
+  // / ?type for free. Here we emulate that filter by handing summarize() only the
+  // filtered slice directly (the primary testable seam; the wiring is asserted in
+  // server.test.mjs's filter-scoping tests).
+  const events = [
+    { ...validCrash, reason: 'oom', platform: 'darwin', appVersion: '0.1.19' },
+    { ...validCrash, reason: 'oom', platform: 'darwin', appVersion: '0.1.19' },
+    { ...validCrash, reason: 'killed', platform: 'win32', appVersion: '0.1.20' },
+  ];
+  // emulate ?platform=darwin: only the two darwin oom crashes survive the slice
+  const filtered = events.filter((e) => e.platform === 'darwin');
+  const s = summarize(filtered);
+  assert.deepEqual(s.crashReasons, { oom: 2 });
 });
 
 // ── STALL SEVERITY — magnitude aggregate split by source (WARDEN-854) ──────────
