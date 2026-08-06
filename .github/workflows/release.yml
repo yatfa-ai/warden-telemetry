@@ -1,8 +1,15 @@
 # Release warden-telemetry: fast-forward `prod` to `main`, then dispatch the
-# build-and-deploy workflow on prod. Triggered manually from the Actions UI
-# ("Run workflow"). Mirrors yatfa-router's release.yml minus the VERSION bump
-# (warden-telemetry has no VERSION file / version contract yet — add a
-# bump-version.sh later if you want one).
+# build-and-deploy workflow on prod. Mirrors yatfa-router's release.yml minus
+# the VERSION bump (warden-telemetry has no VERSION file / version contract
+# yet — add a bump-version.sh later if you want one).
+#
+# Two triggers:
+#   - workflow_dispatch — manual "Run workflow" from the Actions UI.
+#   - schedule          — daily cron. The `gate` step below no-ops the whole
+#                         job when prod is already at main (no new commits), so
+#                         a quiet day rebuilds nothing. Runs from the default
+#                         branch (main), so it only goes live once this file is
+#                         on main.
 #
 # The push to prod below is made with GITHUB_TOKEN, which GitHub suppresses from
 # spawning push-triggered workflows — so build-image.yml's `push: prod` trigger
@@ -12,6 +19,8 @@ name: Release (Advance prod & Deploy)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'   # daily ~05:23 Europe/Berlin; off the :00 herd
 
 permissions:
   contents: write
@@ -33,7 +42,22 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
+      - name: Skip if prod already at main (no new commits)
+        id: gate
+        # fetch-depth: 0 above fetched every branch tip, so origin/prod is
+        # resolvable here. When prod already matches main, the two deploy steps
+        # below are skipped — a quiet day rebuilds and re-pins nothing.
+        run: |
+          if [ "$(git rev-parse origin/main)" = "$(git rev-parse origin/prod)" ]; then
+            echo "ahead=false" >> "$GITHUB_OUTPUT"
+            echo "prod already at main ($(git rev-parse --short origin/main)) — nothing to release"
+          else
+            echo "ahead=true" >> "$GITHUB_OUTPUT"
+            echo "main ahead of prod: $(git rev-parse --short origin/prod) -> $(git rev-parse --short origin/main)"
+          fi
+
       - name: Fast-forward prod to main
+        if: steps.gate.outputs.ahead == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -41,6 +65,7 @@ jobs:
           git push origin main:prod
 
       - name: Trigger build-and-deploy on prod
+        if: steps.gate.outputs.ahead == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run build-image.yml --ref prod
