@@ -10,6 +10,16 @@
 //                                  per time bucket over a rolling recent window,
 //                                  WARDEN-603) so a maintainer can distinguish a
 //                                  recent volume spike from a long-running baseline.
+//   - `summarizeStallsTimeline(events)` → the temporal twin of `stalls` (WARDEN-886):
+//                                  a bounded per-bucket `max` lagMs (overall + split
+//                                  by `source`) over the SAME rolling window as
+//                                  `summarizeTimeline`, so a maintainer can tell an
+//                                  ACTIVE freeze regression (the worst freeze in the
+//                                  newest bucket — happening NOW) from a RESOLVED
+//                                  blip (the same worst freeze hours ago — already
+//                                  gone), which the magnitude snapshot `stalls.max`
+//                                  provably cannot: it collapses the whole retained
+//                                  window into one number with no time axis.
 //
 // ── TRUST MODEL (do not erode) ────────────────────────────────────────────────
 // These return AGGREGATES of events that ALREADY landed — every one was schema-
@@ -102,6 +112,27 @@
 // since `typeof NaN === 'number'`) is SKIPPED from `min`/`avg`/`max` but the event
 // is STILL counted, so one bad record can never poison the whole aggregate to
 // NaN/Infinity (the failure `summarize()` documents it defends against).
+//
+// `summarizeStallsTimeline` (WARDEN-886) is the TEMPORAL twin of that `stalls`
+// snapshot — the last magnitude surface without a time axis. `stalls.max` collapses
+// the whole retained window into ONE number; `stalls.lastSeen` keys off the last
+// stall ARRIVAL (any stall, even a 50ms hitch), not the worst freeze's time. So a
+// 5s freeze that landed 5 minutes ago (an ACTIVE regression — users feeling it now)
+// and a 5s freeze that landed 5 hours ago (a RESOLVED blip — already gone) read
+// byte-identical on `stalls`. `summarizeStallsTimeline` answers the maintainer's
+// first question on a bad `stalls.max` — "is this still happening?" — with a
+// per-bucket `max` lagMs (the worst freeze in each bucket) over the SAME rolling
+// window / granularity as `summarizeTimeline` (the two SHARE the pure bucket-
+// assignment helper, so they can never drift). Each bucket carries `count` (ALL
+// stalls in the bucket, incl. non-finite `lagMs` — parity with `stalls.count`) and
+// `max` (the worst FINITE `lagMs` in the bucket, `null` if none finite — THE
+// headline), split by `source` (`bySource`, mirroring `stalls.bySource`). The
+// WARDEN-854 `Number.isFinite(lagMs)` guard is load-bearing here too: a non-finite
+// / absent `lagMs` is skipped from the bucket's `max` but the stall is still
+// COUNTED. Identical trust posture to `stalls` + `summarizeTimeline` — a pure read
+// over already-accepted, already-redacted events; NO new collection, wire field,
+// schema bump, or identifier. A stall-free store reads a clean zeroed
+// `{ buckets: [], bucketMs }` (no false alarm), always present and additive.
 
 import { BASE_EVENT_TYPES } from './schema.ts';
 
@@ -459,6 +490,70 @@ export function summarize(events) {
 }
 
 /**
+ * Resolve the rolling-window grid and assign each event to a bucket index over it.
+ * PURE — the shared bucket-assignment machinery consumed by BOTH `summarizeTimeline`
+ * (a COUNT over ALL events) and `summarizeStallsTimeline` (per-bucket stall
+ * SEVERITY), so the two can NEVER drift on window, granularity, or bucket
+ * boundary: the effective-time resolution, the window math, and the index clamp +
+ * top-boundary fold live HERE, computed once (WARDEN-886).
+ *
+ * Effective time PREFERS the receiver's `receivedAt` (when IT saw the batch,
+ * WARDEN-692) and falls back to the client's `timestamp` — so a skewed client clock
+ * can no longer push an event out of the "did this just spike?" window. An event
+ * whose effective time is non-finite or outside `[windowStart, currentTime]` is
+ * excluded from the distribution (still counted by `summarize()`'s totals, which
+ * span the full retained set). A non-object entry is skipped, never fatal.
+ *
+ * Returns `null` on degenerate config (a non-positive / non-finite `windowMs` or
+ * `maxBuckets`) so the caller collapses to its zeroed shape — a malformed knob can
+ * never yield a huge / NaN array.
+ *
+ * @param {unknown} events
+ * @param {{ now: () => number, maxBuckets: number, windowMs: number }} opts
+ * @returns {{ windowStart: number, bucketMs: number, slots: Map<number, object[]> } | null}
+ *   `slots` maps a bucket index → the in-window events that landed in it.
+ * @private
+ */
+function _assignTimelineBuckets(events, { now, maxBuckets, windowMs }) {
+  // Degenerate config → null. The defaults are always valid; this only fires on an
+  // explicit bad override, and a malformed knob can never yield a huge/NaN array —
+  // it collapses to empty (mirrors summarize()'s defensive totality).
+  if (!Number.isFinite(windowMs) || windowMs <= 0 || !Number.isFinite(maxBuckets) || maxBuckets < 1) {
+    return null;
+  }
+
+  const list = Array.isArray(events) ? events : [];
+  const currentTime = now();
+  const bucketMs = windowMs / maxBuckets;
+  const windowStart = currentTime - windowMs;
+
+  // Accumulate the events per bucket index over events whose FINITE effective time
+  // falls in the rolling window [windowStart, currentTime]. Returning the EVENTS
+  // (not a pre-counted number) lets each consumer derive its own per-bucket shape
+  // (COUNT for summarizeTimeline, max + bySource for the stall timeline) off the
+  // SAME assignment. The bucket count is structurally capped at `maxBuckets`:
+  // every in-window event maps to one of at most `maxBuckets` grid slots.
+  const slots = new Map();
+  for (const event of list) {
+    // Skip-robust: a non-object entry must not crash the distribution.
+    if (!event || typeof event !== 'object') continue;
+    const when = event.receivedAt ?? event.timestamp;
+    if (typeof when !== 'number' || !Number.isFinite(when)) continue;
+    if (when < windowStart || when > currentTime) continue;
+    let idx = Math.floor((when - windowStart) / bucketMs);
+    // The `when === currentTime` edge lands exactly on the top boundary; fold it
+    // into the newest bucket rather than dropping it or overflowing.
+    if (idx >= maxBuckets) idx = maxBuckets - 1;
+    if (idx < 0) idx = 0;
+    const slot = slots.get(idx);
+    if (slot) slot.push(event);
+    else slots.set(idx, [event]);
+  }
+
+  return { windowStart, bucketMs, slots };
+}
+
+/**
  * Summarize a batch of persisted telemetry events into a BOUNDED temporal
  * distribution — event counts per time bucket over a rolling recent window —
  * so a maintainer reading `/summary` can distinguish a recent volume spike
@@ -499,43 +594,12 @@ export function summarizeTimeline(
     windowMs = DEFAULT_TIMELINE_WINDOW_MS,
   } = {}
 ) {
-  const list = Array.isArray(events) ? events : [];
-
-  // Degenerate config → zeroed shape. The defaults are always valid; this only
-  // fires on an explicit bad override, and a malformed knob can never yield a
-  // huge/NaN array — it collapses to empty (mirrors summarize()'s defensive totality).
-  if (!Number.isFinite(windowMs) || windowMs <= 0 || !Number.isFinite(maxBuckets) || maxBuckets < 1) {
-    return { buckets: [], bucketMs: 0 };
-  }
-
-  const currentTime = now();
-  const bucketMs = windowMs / maxBuckets;
-  const windowStart = currentTime - windowMs;
-
-  // Accumulate a COUNT per bucket index over events whose FINITE effective time
-  // falls in the rolling window [windowStart, currentTime]. The effective time
-  // PREFERS the receiver's `receivedAt` (when IT saw the batch, WARDEN-692) and
-  // falls back to the client's `timestamp` — so NEW events are bucketed by the
-  // receiver's clock (robust to skewed client clocks: a fast-clock client whose
-  // `timestamp` is minutes in the future no longer vanishes from the "did this just
-  // spike?" window) and OLD persisted events (pre-annotation, no receivedAt) still
-  // read correctly via the fallback. An event older than the window is excluded
-  // from the distribution — it is still counted by `summarize()`'s `total` /
-  // `byType` / `firstSeen` / `lastSeen`, which span the full retained set.
-  const counts = new Map();
-  for (const event of list) {
-    // Skip-robust: a non-object entry must not crash the distribution.
-    if (!event || typeof event !== 'object') continue;
-    const when = event.receivedAt ?? event.timestamp;
-    if (typeof when !== 'number' || !Number.isFinite(when)) continue;
-    if (when < windowStart || when > currentTime) continue;
-    let idx = Math.floor((when - windowStart) / bucketMs);
-    // The `when === currentTime` edge lands exactly on the top boundary;
-    // fold it into the newest bucket rather than dropping it or overflowing.
-    if (idx >= maxBuckets) idx = maxBuckets - 1;
-    if (idx < 0) idx = 0;
-    counts.set(idx, (counts.get(idx) ?? 0) + 1);
-  }
+  // Share the pure bucket-assignment math with `summarizeStallsTimeline` so the two
+  // can never drift on window, granularity, or bucket boundary (WARDEN-886). A null
+  // grid = degenerate config → zeroed shape.
+  const grid = _assignTimelineBuckets(events, { now, maxBuckets, windowMs });
+  if (!grid) return { buckets: [], bucketMs: 0 };
+  const { windowStart, bucketMs, slots } = grid;
 
   // Emit the non-empty buckets chronologically (oldest → newest). Each is
   // self-locating in time (`bucketStart` / `bucketEnd` epoch-ms) + a count. The
@@ -543,11 +607,146 @@ export function summarizeTimeline(
   // maps to one of at most `maxBuckets` grid slots, so a 10k-event store yields
   // ≤ maxBuckets buckets, never one-per-event. `bucketMs` is always present so
   // the shape is stable (and the granularity legible) even when no bucket fired.
-  const buckets = [...counts.entries()]
+  const buckets = [...slots.entries()]
     .sort((a, b) => a[0] - b[0])
-    .map(([idx, count]) => {
+    .map(([idx, evs]) => {
       const bucketStart = windowStart + idx * bucketMs;
-      return { bucketStart, bucketEnd: bucketStart + bucketMs, count };
+      return { bucketStart, bucketEnd: bucketStart + bucketMs, count: evs.length };
+    });
+
+  return { buckets, bucketMs };
+}
+
+/**
+ * Summarize a batch of persisted telemetry events into a BOUNDED **stall-severity**
+ * temporal distribution — the worst (`max`) freeze `lagMs` per time bucket over a
+ * rolling recent window, overall and split by `source` (WARDEN-886). This is the
+ * TEMPORAL twin of the `stalls` magnitude snapshot: `stalls.max` collapses the
+ * whole retained window into one number, so a 5s freeze that landed minutes ago
+ * (an ACTIVE regression) reads byte-identical to one that landed hours ago (a
+ * RESOLVED blip). The per-bucket `max` answers the maintainer's first question on
+ * a bad `stalls.max` — "is this still happening?" — by placing the worst freeze in
+ * TIME: the worst freeze in the NEWEST bucket is happening now, the worst freeze
+ * in an older bucket has passed.
+ *
+ * Sibling of `summarizeTimeline`: a PURE function of an event array + an injected
+ * `now` (no fs, no network, no deps), and it SHARES `_assignTimelineBuckets` with
+ * `summarizeTimeline` so the two use the SAME rolling window / granularity / bucket
+ * boundaries and can never drift. It is computed on-the-fly from the
+ * `receivedAt`/`timestamp` + `lagMs`/`source` on ALREADY-persisted, ALREADY-redacted
+ * `performance-stall` events; it introduces no new collection, no schema change, and
+ * no new identifier.
+ *
+ * Per-bucket shape (timeline-scoped mirror of `_stallSnapshot` / `stalls`):
+ *   - `count`  — EVERY stall in the bucket (incl. non-finite `lagMs` — parity with
+ *                `stalls.count`, so the finite-skip guard is visible and the surface
+ *                pairs with the COUNT `timeline`).
+ *   - `max`    — the worst FINITE `lagMs` in the bucket, `null` if none finite
+ *                (THE headline — the worst freeze a user felt in that bucket).
+ *   - `bySource` — `{ [source]: { count, max } }`, mirroring `stalls.bySource` so a
+ *                maintainer can tell event-loop jank from renderer hangs per bucket.
+ *
+ * Pure and total: a non-array (or empty) input, a stall-free store, or a store with
+ * no stalls in the window yields a zeroed shape (`buckets: []`) so a quiet receiver
+ * reads cleanly — no false alarm, parity with `summarizeTimeline`'s empty shape.
+ * Malformed entries (null / primitives / non-objects) and non-finite / absent /
+ * out-of-window timestamps are SKIPPED, not fatal.
+ *
+ * The WARDEN-854 `Number.isFinite(lagMs)` guard is load-bearing here: `validateBaseEvent`
+ * only `typeof`-checks `lagMs` (schema.ts), so NaN / Infinity can reach here — an
+ * unguarded per-bucket `Math.max` would poison the bucket. A non-finite / absent
+ * `lagMs` is SKIPPED from the bucket's `max` but the stall is STILL counted (mirror
+ * of `summarize()`'s 333-356 stall guard). A sourceless stall is counted + feeds the
+ * overall `max` but yields no `bySource` entry (mirror of `signatureOf`'s stall rule).
+ *
+ * TRUST MODEL: identical to `stalls` + `summarizeTimeline` — `lagMs` is a
+ * non-identifying magnitude (an epoch-ms-free integer ≥ 0) and `source` is a fixed
+ * enum, both already enumerated in the consent / verifiability surface. This reads
+ * ONLY `receivedAt` / `timestamp` / `lagMs` / `source` and emits per-bucket counts +
+ * maxes; it never echoes raw events or extended-tier names (`chatName` /
+ * `sessionName`), so there is no path by which an identifier could reach a bucket.
+ *
+ * @param {object[]} [events]
+ * @param {{ now?: () => number, maxBuckets?: number, windowMs?: number }} [opts]
+ * @returns {{
+ *   buckets: {
+ *     bucketStart: number, bucketEnd: number, count: number, max: number | null,
+ *     bySource: Record<string, { count: number, max: number | null }>,
+ *   }[],
+ *   bucketMs: number,
+ * }}
+ */
+export function summarizeStallsTimeline(
+  events,
+  {
+    now = Date.now,
+    maxBuckets = DEFAULT_TIMELINE_MAX_BUCKETS,
+    windowMs = DEFAULT_TIMELINE_WINDOW_MS,
+  } = {}
+) {
+  // Pre-filter to `performance-stall` events — the severity timeline reads ONLY the
+  // stall `lagMs` / `source` (parity with the `stalls` snapshot). Non-stall events
+  // (errors / crashes sharing the filtered array) are dropped BEFORE bucketing, so a
+  // bucket fires ONLY when a stall lands in it (no false "0 stalls here" bucket).
+  const list = Array.isArray(events) ? events : [];
+  const stalls = [];
+  for (const event of list) {
+    if (event && typeof event === 'object' && event.type === 'performance-stall') {
+      stalls.push(event);
+    }
+  }
+
+  // Share the pure bucket-assignment math with `summarizeTimeline` so the two can
+  // never drift on window, granularity, or bucket boundary (WARDEN-886). A null grid
+  // = degenerate config → zeroed shape.
+  const grid = _assignTimelineBuckets(stalls, { now, maxBuckets, windowMs });
+  if (!grid) return { buckets: [], bucketMs: 0 };
+  const { windowStart, bucketMs, slots } = grid;
+
+  // Emit the non-empty buckets chronologically (oldest → newest). Each is
+  // self-locating in time (`bucketStart` / `bucketEnd`) + the stall-severity rollup
+  // (count / max / bySource) over the stalls in it. Structurally capped at
+  // `maxBuckets` grid slots; `bucketMs` is always present so the shape is stable.
+  const buckets = [...slots.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([idx, evs]) => {
+      const bucketStart = windowStart + idx * bucketMs;
+      // Accumulate the stall-severity rollup over the bucket. `count` is EVERY stall
+      // (it pairs with the COUNT `timeline` and makes the finite-skip guard visible);
+      // `max` reflects ONLY the finite-`lagMs` subset. Split by `source` (a PRESENT
+      // non-empty string, matching `signatureOf`'s stall rule) so event-loop jank is
+      // distinguishable from renderer hangs; a sourceless stall is counted + feeds the
+      // overall `max` but yields no `bySource` entry. The Number.isFinite guard is
+      // load-bearing: an unguarded Math.max would poison the bucket from one NaN /
+      // Infinity record (validateBaseEvent does NOT reject them — schema.ts).
+      let count = 0;
+      let max = null;
+      const bySource = new Map();
+      for (const e of evs) {
+        count += 1;
+        const lagMs = e.lagMs;
+        const finiteLag = typeof lagMs === 'number' && Number.isFinite(lagMs);
+        if (finiteLag && (max === null || lagMs > max)) max = lagMs;
+        const source = e.source;
+        if (typeof source === 'string' && source.length > 0) {
+          let acc = bySource.get(source);
+          if (!acc) {
+            acc = { count: 0, max: null };
+            bySource.set(source, acc);
+          }
+          acc.count += 1;
+          if (finiteLag && (acc.max === null || lagMs > acc.max)) acc.max = lagMs;
+        }
+      }
+      return {
+        bucketStart,
+        bucketEnd: bucketStart + bucketMs,
+        count,
+        max,
+        bySource: Object.fromEntries(
+          [...bySource.entries()].map(([source, acc]) => [source, { count: acc.count, max: acc.max }])
+        ),
+      };
     });
 
   return { buckets, bucketMs };

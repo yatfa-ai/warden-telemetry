@@ -749,6 +749,88 @@ test('GET /summary?platform=win32 scopes the crashReasons histogram to win32 cra
   assert.ok(sum <= body.byType.crash, 'histogram sum never exceeds the crash count');
 });
 
+test('GET /summary on an empty store carries a ZEROED stallsTimeline (additive — always present, no false alarm)', async () => {
+  // stallsTimeline is a top-level sibling of `timeline`, handler-composed (NOT inside
+  // summarize()) because it needs the injected `now` to anchor the rolling window.
+  // It is ALWAYS present (additive, backward-compatible) and zeroed on a quiet store.
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.ok(body.stallsTimeline, 'stallsTimeline field is present (additive — on every response)');
+  assert.deepEqual(body.stallsTimeline.buckets, [], 'no buckets on an empty store');
+  assert.equal(
+    body.stallsTimeline.bucketMs, 1_800_000,
+    'same granularity as the top-level timeline (24h window / 48 buckets)'
+  );
+});
+
+test('GET /summary stallsTimeline places the worst freeze in time — an ACTIVE regression (newest bucket) apart from a RESOLVED blip (older bucket)', async () => {
+  // THE HEADLINE through the handler: stalls.max collapses both 5s freezes into one
+  // number (the snapshot cannot answer "is this recent?"); stallsTimeline shows the
+  // NEWEST-bucket one is happening now vs the older one that has passed. now =
+  // 86_400_000 → bucket 47 = [84_600_000, 86_400_000]; bucket 0 = [0, 1_800_000].
+  const store = readableStore([
+    { ...stallEvent, timestamp: 0, lagMs: 5000, source: 'unresponsive' },          // bucket 0 (RESOLVED blip)
+    { ...stallEvent, timestamp: 84_600_000, lagMs: 5000, source: 'unresponsive' },  // bucket 47 (ACTIVE regression)
+    { ...stallEvent, timestamp: 84_600_000, lagMs: 50, source: 'event-loop' },      // bucket 47 (a micro-hitch in the same bucket)
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  // the snapshot collapses both 5s freezes into the same max — it cannot place them
+  assert.equal(body.stalls.max, 5000);
+  // the timeline places them in TIME: two buckets, the newest one max 5000 (ACTIVE),
+  // the older one max 5000 (RESOLVED); the 50ms hitch rides in the newest bucket's
+  // count + bySource but never buries the 5s freeze in the max.
+  assert.deepEqual(body.stallsTimeline.buckets, [
+    {
+      bucketStart: 0, bucketEnd: 1_800_000, count: 1, max: 5000,
+      bySource: { unresponsive: { count: 1, max: 5000 } },
+    },
+    {
+      bucketStart: 84_600_000, bucketEnd: 86_400_000, count: 2, max: 5000,
+      bySource: {
+        unresponsive: { count: 1, max: 5000 },
+        'event-loop': { count: 1, max: 50 },
+      },
+    },
+  ]);
+});
+
+test('GET /summary?platform=win32 scopes the stallsTimeline to win32 freezes only', async () => {
+  // stallsTimeline is handler-composed off `filtered` (just like `timeline`), so the
+  // SAME pre-summarize filter scopes it for free: a maintainer who spots a win32
+  // freeze spike can scope /summary?platform=win32 and read that platform's freeze
+  // TIMELINE. Seed a darwin 9000ms freeze in an older bucket (the WORST overall) +
+  // a win32 5000ms freeze in the newest; scoping to win32 must drop the darwin freeze
+  // entirely (the 9000ms worst is GONE from the scoped timeline + snapshot).
+  const newestStart = 84_600_000; // bucket 47
+  const store = readableStore([
+    { ...stallEvent, platform: 'darwin', timestamp: 0, lagMs: 9000, source: 'unresponsive' },          // bucket 0 (darwin — dropped)
+    { ...stallEvent, platform: 'win32', timestamp: newestStart, lagMs: 5000, source: 'unresponsive' }, // bucket 47 (win32 — ACTIVE)
+  ]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.matched, 1, 'only the win32 stall survives the filter');
+  // the darwin 9000ms freeze (the worst overall) is GONE from the scoped timeline
+  assert.deepEqual(body.stallsTimeline.buckets, [
+    {
+      bucketStart: 84_600_000, bucketEnd: 86_400_000, count: 1, max: 5000,
+      bySource: { unresponsive: { count: 1, max: 5000 } },
+    },
+  ]);
+  // and the scoped stalls snapshot agrees (the 9000ms darwin freeze is gone there too)
+  assert.equal(body.stalls.max, 5000);
+});
+
 test('GET /summary?platform=win32 scopes the TIMELINE to win32 arrivals only', async () => {
   // Seed a win32 spike (3 in the newest bucket) + a darwin baseline (1 in an earlier
   // bucket). Scoping to win32 must drop the darwin baseline from the distribution.
