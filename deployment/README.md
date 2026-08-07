@@ -41,10 +41,10 @@ export GH_TOKEN="$(gh auth token)"      # Kaniko clones the private repo with th
 ./deployment/kaniko/build.sh
 
 # 4. One-time DNS (in Cloudflare) for the public hostname:
-#    telemetry.yatfa.ai → 159.195.194.69  (proxied / orange cloud)
+#    warden-telemetry.yatfa.com → 159.195.194.69  (proxied / orange cloud)
 ```
 
-After step 4 resolves, the receiver is live at `https://telemetry.yatfa.ai`.
+After step 4 resolves, the receiver is live at `https://warden-telemetry.yatfa.com`.
 
 ## Subsequent deploys
 
@@ -56,7 +56,7 @@ prod & Deploy)" workflow — see `release/README.md` for the one-time GHA setup
 
 Each warden desktop client (Settings → Telemetry) is configured with:
 
-- `endpointUrl`: `https://telemetry.yatfa.ai/ingest`
+- `endpointUrl`: `https://warden-telemetry.yatfa.com/ingest`
 - `token`: the `AUTH_TOKEN` value (in `deployment/manifests/secret.yaml`, or read
   via `kubectl -n default get secret warden-telemetry-secret -o jsonpath='{.data.AUTH_TOKEN}' | base64 -d`)
 

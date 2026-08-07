@@ -30,5 +30,5 @@ echo "rendered $OUT"
 echo "  AUTH_TOKEN: ${#AUTH_TOKEN} chars (preserved if already set)"
 echo
 echo "Configure each warden client (Settings → Telemetry) with:"
-echo "  endpointUrl: https://telemetry.yatfa.ai/ingest"
+echo "  endpointUrl: https://warden-telemetry.yatfa.com/ingest"
 echo "  token:       <the AUTH_TOKEN value in $OUT>"

@@ -12,7 +12,7 @@ yatfa-router convention.
 |---|---|
 | `deployment.yaml` | `Deployment/warden-telemetry` (1 replica, node:24-alpine non-root, /data PVC) |
 | `service.yaml` | `Service/warden-telemetry` (ClusterIP 80→7421) |
-| `ingress.yaml` | `Ingress/warden-telemetry-ingress` (host `telemetry.yatfa.ai`) |
+| `ingress.yaml` | `Ingress/warden-telemetry-ingress` (host `warden-telemetry.yatfa.com`) |
 | `configmap.yaml` | `ConfigMap/warden-telemetry-config` (PORT/STORE/retention) |
 | `secret.yaml.template` | `Secret/warden-telemetry-secret` template (render with `render-secret.sh`) |
 | `render-secret.sh` | Renders `secret.yaml` from the template (preserves existing AUTH_TOKEN) |
@@ -41,7 +41,7 @@ Then build the image in-cluster and pin the Deployment to it:
 These manifests are the **live yatfa config** (working example). For a separate
 deployment, edit:
 
-- `ingress.yaml` → host `telemetry.yatfa.ai` (your domain; add the matching DNS
+- `ingress.yaml` → host `warden-telemetry.yatfa.com` (your domain; add the matching DNS
   record + edge TLS at your CDN)
 - `deployment.yaml` → `imagePullSecrets` (`yatfa-registry-pull` → your registry
   pull secret), image registry host
