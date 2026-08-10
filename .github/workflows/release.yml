@@ -12,10 +12,10 @@
 #                         branch (main), so it only goes live once this file is
 #                         on main.
 #
-# The push to prod below is made with GITHUB_TOKEN, which GitHub suppresses from
-# spawning push-triggered workflows — so build-image.yml's `push: prod` trigger
-# would NOT fire. We dispatch it explicitly to guarantee the new prod tip
-# actually deploys.
+# Deployment is not driven from here. Advancing `prod` is the whole signal, and
+# the deploy side polls that branch — so a push made with GITHUB_TOKEN (which
+# GitHub suppresses from spawning push-triggered workflows) is fine: nothing
+# here depends on an event firing.
 name: Release (Advance prod & Deploy)
 
 on:
@@ -84,8 +84,6 @@ jobs:
           git checkout main
           git push origin main:prod
 
-      - name: Trigger build-and-deploy on prod
-        if: steps.gate.outputs.ahead == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run build-image.yml --ref prod
+      # No deploy step: advancing `prod` IS the release signal. The deploy side
+      # watches that branch and takes it from there, so this repo needs no
+      # deployment credentials.

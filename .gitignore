@@ -3,8 +3,3 @@ node_modules/
 # persisted telemetry.
 *.ndjson
 
-# Rendered k8s secrets (contain AUTH_TOKEN). Templates (.template) ARE committed;
-# the rendered secret.yaml is generated locally by render-secret.sh and never
-# committed.
-secret.yaml
-deployment/manifests/secret.yaml

@@ -6,9 +6,9 @@
 # type stripping (unflagged since Node 23.6; node:24 has it on by default), so
 # no build/transpile step is needed either.
 #
-# Build (in-cluster via Kaniko — see deployment/kaniko/):
+# Build: container image; deploy manifests are maintained outside this repo.
 #   registry.default.svc.cluster.local:5000/warden-telemetry:<tag>
-# Run env (see deployment/manifests/configmap.yaml + secret):
+# Run env (supplied by the deployment):
 #   PORT=7421  STORE=/data/telemetry.ndjson  AUTH_TOKEN=<shared-secret>
 FROM node:24-alpine
 
