@@ -22,7 +22,7 @@
 #   __REL_REPO_URL__   e.g. github.com/yatfa-ai/warden-telemetry.git
 #
 # Authentication — NO PAT. The release Job clones warden-telemetry as the GitHub
-# App `tinker-ai-app` (installed on yatfa-ai/warden-telemetry with contents:read).
+# App `yatfa-com` (installed on yatfa-ai/warden-telemetry with contents:read).
 # It reuses the SAME App creds as yatfa-web / yatfa-router — nothing
 # warden-telemetry-specific to create:
 #   - Secret/yatfa-github-app   → PEM, mounted at /etc/github-app/privkey.pem
@@ -114,7 +114,7 @@ spec:
 
               STEP="GitHub App token mint"
               # --- Mint a GitHub App installation token (no PAT) ---
-              # Authenticate as `tinker-ai-app` (installed on the repo). Sign an
+              # Authenticate as `yatfa-com` (installed on the repo). Sign an
               # RS256 JWT with the mounted PEM (iss = GH_APP_ID), discover the
               # installation id for THIS repo, exchange for a 1h token. $GH_TOKEN
               # is consumed by the clone and substituted as __GIT_PASSWORD__ in

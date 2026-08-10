@@ -1,13 +1,14 @@
-# Release warden-telemetry: fast-forward `prod` to `main`, then dispatch the
-# build-and-deploy workflow on prod. Mirrors yatfa-router's release.yml minus
-# the VERSION bump (warden-telemetry has no VERSION file / version contract
-# yet — add a bump-version.sh later if you want one).
+# Release warden-telemetry: bump the patch version, fast-forward `prod` to
+# `main`, then dispatch the build-and-deploy workflow on prod. Mirrors
+# yatfa-router's release.yml; the version lives in package.json (Node project),
+# bumped by scripts/bump-version.sh — the same shape warden uses.
 #
 # Two triggers:
 #   - workflow_dispatch — manual "Run workflow" from the Actions UI.
 #   - schedule          — daily cron. The `gate` step below no-ops the whole
 #                         job when prod is already at main (no new commits), so
-#                         a quiet day rebuilds nothing. Runs from the default
+#                         a quiet day rebuilds nothing AND bumps nothing — the
+#                         version counts releases, not days. Runs from the default
 #                         branch (main), so it only goes live once this file is
 #                         on main.
 #
@@ -37,6 +38,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
+      - name: Setup Node
+        # scripts/bump-version.sh reads and rewrites package.json with node.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       - name: Configure Git
         run: |
           git config --global user.name "github-actions[bot]"
@@ -55,6 +62,19 @@ jobs:
             echo "ahead=true" >> "$GITHUB_OUTPUT"
             echo "main ahead of prod: $(git rev-parse --short origin/prod) -> $(git rev-parse --short origin/main)"
           fi
+
+      - name: Bump patch version (commit + tag + push to main)
+        id: bump
+        if: steps.gate.outputs.ahead == 'true'
+        # Runs on the scheduled path too, so the version tracks releases without
+        # anyone remembering to bump — same as yatfa. The gate above means a
+        # quiet day bumps nothing: no new commits, no release, no version churn.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git checkout main
+          chmod +x scripts/bump-version.sh
+          ./scripts/bump-version.sh
 
       - name: Fast-forward prod to main
         if: steps.gate.outputs.ahead == 'true'

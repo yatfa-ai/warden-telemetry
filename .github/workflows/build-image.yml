@@ -16,7 +16,7 @@
 #
 # Required cluster objects (already present, shared with yatfa — nothing
 # warden-telemetry-specific to create):
-#   Secret/yatfa-github-app    — GitHub App PEM (tinker-ai-app), mounted by the
+#   Secret/yatfa-github-app    — GitHub App PEM (yatfa-com), mounted by the
 #                                in-cluster release Job to mint a 1h installation
 #                                token and clone the repo. REQUIRES the App to be
 #                                installed on yatfa-ai/warden-telemetry with contents:read.

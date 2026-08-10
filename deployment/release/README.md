@@ -20,7 +20,7 @@ architecture as yatfa / yatfa-router.
 the `GITHUB_TOKEN` dies — but the kaniko clone runs minutes later inside the
 cluster. So we need credentials that survive the dispatching workflow.
 
-Those credentials are the GitHub App `tinker-ai-app`, **not** a PAT. The release
+Those credentials are the GitHub App `yatfa-com`, **not** a PAT. The release
 Job signs a JWT with the App's PEM and exchanges it for a 1h installation token
 at runtime. No PAT to create, rotate, or store — and the App credentials it
 needs are already shared with yatfa-web / yatfa-router:
@@ -36,7 +36,7 @@ yatfa-ai/warden-telemetry` — no silent stale-deploy.
 
 ## One-time setup
 
-1. **Install `tinker-ai-app` on `yatfa-ai/warden-telemetry`** with `contents: read`
+1. **Install `yatfa-com` on `yatfa-ai/warden-telemetry`** with `contents: read`
    (org-wide on `yatfa-ai` is fine — it's likely already installed org-wide).
 2. **Create the `prod` branch** pointing at `main` (the release flow builds `prod`):
    ```bash
@@ -79,7 +79,7 @@ kubectl logs -f "$RELEASE"
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `!! GitHub App not installed on yatfa-ai/warden-telemetry` / `could not read Username` during clone | App not installed on the repo, PEM stale, or `GH_APP_ID` wrong | Install `tinker-ai-app` on `yatfa-ai/warden-telemetry` (`contents: read`) |
+| `!! GitHub App not installed on yatfa-ai/warden-telemetry` / `could not read Username` during clone | App not installed on the repo, PEM stale, or `GH_APP_ID` wrong | Install `yatfa-com` on `yatfa-ai/warden-telemetry` (`contents: read`) |
 | Job stuck `Pending` | RBAC missing | Re-apply `yatfa/deployment/kaniko/rbac.yaml` (the `github-actions` SA is shared) |
 | Kaniko `413 Request Entity Too Large` | Pushing via the public hostname (Cloudflare cap) | Shouldn't happen — kaniko pushes via `registry.default.svc.cluster.local:5000` |
 | Same SHA enqueued twice | Push event + workflow_dispatch race | `build-image.yml` dedupes by job name — second enqueue is a no-op |
