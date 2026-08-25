@@ -1,6 +1,6 @@
 {
   "name": "warden-telemetry",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Self-hostable telemetry receiver for Yatfa Warden — accepts, schema-validates, and durably persists optional, off-by-default telemetry events. The receiver half of Warden's telemetry system.",
   "private": true,
   "type": "module",
