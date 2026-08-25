@@ -43,15 +43,17 @@
 // same pid and DO see each other's `process.env` writes, while a test in a
 // second file reports a different pid and sees the var as `undefined`.
 //
-// DELIBERATELY NOT ASSERTED: a whitespace-only value (`" "`, `"\t"`) currently
-// yields 0 and thereby DISABLES the cap, because `Number(' ') === 0` and the
-// guard tests `raw === ''` rather than emptiness-after-trim. That diverges from
-// the stated "a typo can never silently unbound the store" contract — it is a
-// defect, tracked separately as a FIX. Asserting today's behaviour here would
-// cement the defect as the contract, so these tests cover only the six
-// documented cases. (`"0x10"` → 16 and `"1e2"` → 100 are likewise left
-// unasserted: Number() accepts hex/exponent, which is benign and arguably
-// correct, but is not part of the documented contract.)
+// PREVIOUSLY NOT ASSERTED, NOW FIXED AND PINNED (WARDEN-1184): a whitespace-only
+// value (`" "`, `"\t"`, `"\r\n\t "`) used to yield 0 and thereby DISABLE the cap,
+// because `Number(' ') === 0` and the guard tested `raw === ''` rather than
+// emptiness-after-trim. That diverged from the stated "a typo can never silently
+// unbound the store" contract, so it was filed as a defect and left unasserted
+// here rather than cemented as the contract. The guard now tests `raw.trim() === ''`,
+// and the whitespace family is asserted below — on STORE_MAX_EVENTS and
+// INGEST_MAX_BODY_BYTES, the two vars where the assertion can actually FAIL.
+// (`"0x10"` → 16 and `"1e2"` → 100 remain left unasserted: Number() accepts
+// hex/exponent, which is benign and arguably correct, but is not part of the
+// documented contract.)
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -216,6 +218,36 @@ test('STORE_MAX_EVENTS="500" (valid override) → 500 — a legitimate override 
   assert.equal(configured.maxEvents, 500);
 });
 
+test('STORE_MAX_EVENTS whitespace-only (" ", "\\t", "\\n", "  ", "\\r\\n\\t ") → the DEFAULT, NOT 0 (WARDEN-1184)', async () => {
+  // The fix this file previously deferred. `Number(' ') === 0` and 0 is the
+  // documented opt-out, so while the guard tested `raw === ''` every one of these
+  // fell through BOTH guards and silently disabled the count cap — the exact
+  // failure the "a typo can never silently unbound the store" contract forbids.
+  // A whitespace-only value is precisely a typo: a trailing space after `=` in a
+  // .env, or `STORE_MAX_EVENTS: " "` in a compose file. "\r\n\t " covers the
+  // realistic CRLF-bearing env-file line.
+  //
+  // This row DETECTS the fix (it is not merely documentation): with
+  // `raw.trim() === ''` reverted to `raw === ''`, every case below reads 0 and
+  // this test fails. Contrast the STORE_MAX_AGE_HOURS section, where the
+  // fallback and the opt-out coincide at 0 and the same assertion is unfalsifiable.
+  for (const raw of [' ', '\t', '\n', '  ', '\r\n\t ']) {
+    const configured = await configuredUnderEnv({ STORE_MAX_EVENTS: raw });
+    assert.equal(configured.maxEvents, DEFAULT_MAX_EVENTS, `raw=${JSON.stringify(raw)} → the bounded default`);
+    assert.notEqual(configured.maxEvents, 0, `raw=${JSON.stringify(raw)} did NOT disable the count cap`);
+  }
+});
+
+test('STORE_MAX_EVENTS=" 5 " (valid value, incidental whitespace) → 5 — the trim guard moved ONLY the whitespace-ONLY family', async () => {
+  // The no-op guarantee, and the counterweight to the test above: trimming for the
+  // EMPTINESS CHECK must not reject an otherwise-valid override that happens to
+  // carry surrounding whitespace. Number() already trims, so " 5 " parsed to 5
+  // before the fix and parses to 5 after it — this pins that the fix widened the
+  // fallback branch by exactly the whitespace-only family and nothing more.
+  const configured = await configuredUnderEnv({ STORE_MAX_EVENTS: ' 5 ' });
+  assert.equal(configured.maxEvents, 5, 'a real value with padding is still honoured verbatim');
+});
+
 // ── STORE_MAX_AGE_HOURS: the age window (hours → ms) ─────────────────────────
 // NOTE, stated honestly: DEFAULT_MAX_AGE_HOURS is 0 (age expiry is OFF by
 // default; the count cap carries the bound). So for this var the fallback and
@@ -350,6 +382,20 @@ test('INGEST_MAX_BODY_BYTES="abc" → STILL 413 — a malformed cap falls back t
   // skipped entirely, and the cap silently vanishes.
   const res = await oversizedPost({ INGEST_MAX_BODY_BYTES: 'abc' });
   assert.equal(res.statusCode, 413, 'malformed → default cap, never NaN');
+});
+
+test('INGEST_MAX_BODY_BYTES whitespace-only → STILL 413 — a stray space must not unbind the body cap (WARDEN-1184)', async () => {
+  // The body-cap twin of the STORE_MAX_EVENTS whitespace row, and the more
+  // serious of the two consequences: the size pre-check is `if (maxBodyBytes > 0)`,
+  // so while whitespace-only parsed to 0 a single stray space in this var turned
+  // the pre-check OFF and every oversized body was read into memory in full — a
+  // live unbounded read on an open-by-default listener, not merely disk growth.
+  // Asserted behaviourally (this cap is not carried in /summary) at a SECOND,
+  // independent call site of the same guard.
+  for (const raw of [' ', '\t', '\n', '  ', '\r\n\t ']) {
+    const res = await oversizedPost({ INGEST_MAX_BODY_BYTES: raw });
+    assert.equal(res.statusCode, 413, `raw=${JSON.stringify(raw)} → default cap, NOT the unbounded 0`);
+  }
 });
 
 test('INGEST_MAX_BODY_BYTES="64" (valid override) → 413 for a body over the OVERRIDDEN cap, proving the override is live', async () => {
