@@ -153,9 +153,19 @@ export const SEEN_KEYS_PERSIST_DEBOUNCE_MS = 1000;
 // an explicit "0" disables that policy (the opt-out); a malformed/negative value
 // falls back to the (bounded) default so a typo can never silently unbound the
 // store — the default stays bounded under any misconfiguration.
+//
+// The emptiness guard tests raw.trim(), not `raw === ''`, and that trim is
+// load-bearing: `Number(' ') === 0`, and 0 is this function's documented
+// OPT-OUT. So a whitespace-only value — a trailing space after `=` in a .env,
+// or a CRLF-bearing line — would otherwise fall through both guards and read as
+// "disable this cap", silently unbounding the store on an open-by-default
+// listener. Whitespace-only belongs with ''/'abc'/'-5' in the bounded-default
+// branch. This does NOT affect a valid override carrying incidental whitespace
+// (`' 5 '` → 5): Number() trims already, so only the whitespace-ONLY family
+// moves. An explicit '0' is untouched and still disables the policy.
 function envRetentionInt(name, fallback) {
   const raw = process.env[name];
-  if (raw == null || raw === '') return fallback;
+  if (raw == null || raw.trim() === '') return fallback;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return fallback;
   return n;
