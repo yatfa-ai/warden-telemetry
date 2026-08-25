@@ -35,8 +35,13 @@
 //      GET /summary serves as `retention.configured`.
 //
 // Every test SAVES AND RESTORES the env var it sets in a `finally`, so ordering
-// can never leak between tests (or into the rest of the suite, which runs in
-// this same process).
+// can never leak between the tests in this file. The hazard being defended
+// against is strictly INTRA-file: Node's test runner isolates one process per
+// test FILE by default (this repo sets no --test-isolation override), so
+// cross-file env leakage is not possible. Probed with the repo's exact command
+// (`node --experimental-strip-types --test`): two tests in one file report the
+// same pid and DO see each other's `process.env` writes, while a test in a
+// second file reports a different pid and sees the var as `undefined`.
 //
 // DELIBERATELY NOT ASSERTED: a whitespace-only value (`" "`, `"\t"`) currently
 // yields 0 and thereby DISABLES the cap, because `Number(' ') === 0` and the
@@ -373,11 +378,12 @@ test('INGEST_MAX_BODY_BYTES="64" (valid override) → 413 for a body over the OV
   });
 });
 
-test('the env vars are RESTORED after each test — no ordering leak into the rest of the suite', async () => {
+test('the env vars are RESTORED after each test — no ordering leak between the tests in this file', async () => {
   // withEnv restores in a `finally`, including restoring "was never set" by
   // DELETING rather than assigning '' (assigning '' would be a different
-  // documented case). This suite shares one process with every other test file,
-  // so a leaked STORE_MAX_EVENTS would silently reconfigure unrelated tests.
+  // documented case). The 16 tests in this file share ONE process, so a leaked
+  // STORE_MAX_EVENTS would silently reconfigure the tests below it. (It could
+  // not reach another test file: Node's runner isolates one process per file.)
   const names = ['STORE_MAX_EVENTS', 'STORE_MAX_AGE_HOURS', 'INGEST_MAX_BODY_BYTES'];
   const before = names.map((n) => Object.prototype.hasOwnProperty.call(process.env, n));
   await withEnv({ STORE_MAX_EVENTS: '123', STORE_MAX_AGE_HOURS: '9', INGEST_MAX_BODY_BYTES: '64' }, async () => {
