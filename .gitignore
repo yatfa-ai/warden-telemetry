@@ -3,3 +3,6 @@ node_modules/
 # persisted telemetry.
 *.ndjson
 
+
+# The SpecGuard reporter local sink (no key configured).
+/log/
