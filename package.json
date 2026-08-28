@@ -11,5 +11,8 @@
     "start": "node server.mjs",
     "test": "node --experimental-strip-types --test"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "specguard-ts": "github:yatfa-ai/specguard-ts"
+  }
 }
