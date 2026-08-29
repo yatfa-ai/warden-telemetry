@@ -42,7 +42,7 @@
 // aggregates it echoes no raw event and touches no identifier.
 //
 // `platforms` (WARDEN-684) is the OS sibling of `appVersions`: it buckets event
-// counts by the client's non-identifying `platform` OS label (one of
+// counts by the client's non-identifying `platform` OS label (in practice
 // `darwin` / `win32` / `linux` from process.platform — a value identical for
 // millions of users on an OS, not an identifier, not content) so a maintainer can
 // answer "is this crash/error spike Mac / Windows / Linux-specific?" instead of
@@ -51,7 +51,7 @@
 //
 // `byRuntime` (WARDEN-869) is the PROCESS sibling of `appVersions` / `platforms`:
 // it buckets event counts by the client's non-identifying `runtime` process label
-// (one of `main` / `renderer` — the Electron/Node main process vs. a web-contents
+// (in practice `main` / `renderer` — the Electron/Node main process vs. a web-contents
 // renderer, a value identical across millions of users on a process kind, not an
 // identifier, not content) so a maintainer can answer "is the app being hard-killed
 // by the OS (main) or is React/Electron throwing (renderer)?" — a native segfault /
@@ -65,9 +65,11 @@
 //
 // `crashReasons` (WARDEN-872) is the crash-CAUSE axis `byType.crash` (a bare count)
 // and `topSignatures` (capped, exitCode-split, ranked) both obscure: it buckets
-// crash counts by the non-identifying `reason` string (Electron's fixed enum —
-// `oom` / `crashed` / `killed` … — plus the main-process `'unexpected-termination'`
-// sentinel, WARDEN-687) so a maintainer can answer "of this crash spike, how much
+// crash counts by the client's `reason` string (in practice Electron's small
+// enum — `oom` / `crashed` / `killed` … — plus the main-process
+// `'unexpected-termination'` sentinel, WARDEN-687; NOTE the validator only
+// type-checks `reason`, it is NOT a fixed enumeration — hence the WARDEN-1246
+// bound on this histogram) so a maintainer can answer "of this crash spike, how much
 // is OOM?" instead of staring at an un-attributable count. `topSignatures` already
 // folds `reason` into its key (as `crash:${reason}:exit=${exitCode}`), but it is
 // (1) capped at TOP_SIGNATURES_CAP across ALL types, (2) split by exitCode so the
@@ -143,6 +145,79 @@ const TOP_ERROR_NAMES_CAP = 10;
 // failures stays readable on the summary surface (mirrors TOP_ERROR_NAMES_CAP).
 const TOP_SIGNATURES_CAP = 10;
 
+// ── CLIENT-KEYED HISTOGRAM BOUNDS (WARDEN-1246) ───────────────────────────────
+// The client-keyed histograms (`appVersions` / `platforms` / `byRuntime` /
+// `crashReasons`) bucket FREE client-supplied strings — the validator only
+// type-checks these fields, so a single accepted event can carry a multi-KB
+// `reason` / `platform` / `appVersion` / `runtime`, and a hostile or buggy
+// client can emit unlimited distinct values. Without a bound, one oversized or
+// high-cardinality value is retained and then reproduced in full inside EVERY
+// subsequent /summary response — a permanent response-amplification hole.
+// Two bounds close it:
+//   1. KEY LENGTH — a longer client value is TRUNCATED to CLIENT_KEY_MAX_LENGTH
+//      chars before bucketing (two distinct long values sharing a prefix
+//      collide into one bucket: acceptable, and honest — the response is bounded).
+//   2. CARDINALITY — the first CLIENT_HISTOGRAM_CAP distinct keys get their own
+//      bucket; every FURTHER distinct key folds into ONE counted `__overflow__`
+//      bucket, reusing the exact top-N + overflow shape createRejectionTally
+//      established on the ingest side (WARDEN-829) so the two surfaces stay
+//      consistent. Overflow is REPRESENTED, never dropped.
+export const CLIENT_KEY_MAX_LENGTH = 128;
+export const CLIENT_HISTOGRAM_CAP = 10; // mirrors TOP_ERROR_NAMES_CAP / TOP_SIGNATURES_CAP
+
+// Sentinel for the single overflow bucket (same literal as server.mjs's
+// createRejectionTally, WARDEN-829 — one shared shape across both surfaces). A
+// client value that literally equals `__overflow__` is indistinguishable from
+// the aggregate (benign: same bound, same count semantics).
+const OVERFLOW_KEY = '__overflow__';
+
+/**
+ * Bound a client-supplied histogram key: truncate to CLIENT_KEY_MAX_LENGTH so
+ * one oversized value can never inflate every summary response. Pure.
+ *
+ * @param {string} key
+ * @returns {string}
+ * @private
+ */
+function _boundClientKey(key) {
+  return key.length > CLIENT_KEY_MAX_LENGTH ? key.slice(0, CLIENT_KEY_MAX_LENGTH) : key;
+}
+
+/**
+ * Create a bounded COUNTS-only histogram accumulator for a client-keyed axis
+ * (WARDEN-1246): key-length truncation (via _boundClientKey) + top-N +
+ * `__overflow__` cardinality cap, the same shape as createRejectionTally's
+ * `byDeclaredVersion` (server.mjs, WARDEN-829). `snapshot()` returns a plain
+ * `{ [key]: count }` object holding ≤ CLIENT_HISTOGRAM_CAP + 1 keys no matter
+ * what any client sent. hasOwnProperty (not `in`) keeps attacker keys like
+ * "toString" / "constructor" bucketing as ordinary own keys.
+ *
+ * @returns {{ record(value: string): void, snapshot(): Record<string, number> }}
+ * @private
+ */
+function _createBoundedClientHistogram() {
+  const counts = {};
+  let distinct = 0;
+  return {
+    record(value) {
+      const key = _boundClientKey(value);
+      if (Object.prototype.hasOwnProperty.call(counts, key)) {
+        counts[key] += 1; // an already-tracked distinct key bumps its own bucket
+      } else if (distinct < CLIENT_HISTOGRAM_CAP) {
+        counts[key] = 1; // new distinct key under the cap → its own bucket
+        distinct += 1;
+      } else {
+        // Cap reached → fold this and every further NEW distinct key into the
+        // single overflow bucket: bounded cardinality, no count loss.
+        counts[OVERFLOW_KEY] = (counts[OVERFLOW_KEY] ?? 0) + 1;
+      }
+    },
+    snapshot() {
+      return { ...counts };
+    },
+  };
+}
+
 // ── TEMPORAL DISTRIBUTION config (WARDEN-603) ────────────────────────────────
 // The rolling recent window a maintainer reads to spot a RECENT volume spike
 // (a regression / deploy event) apart from long-running baseline. Events older
@@ -172,8 +247,10 @@ export const DEFAULT_TIMELINE_MAX_BUCKETS = 48;
  * (`chatName` / `sessionName`). It reads at most: error `name` + the FIRST stack
  * frame's `function`/`file`/`line` (frames[0] — the top of the stack, closest to
  * where it threw; there is no "in-app" marker in `StackFrame`); crash `reason`
- * (Electron's fixed enum — `oom`/`crashed`/`killed`… — not identifying) +
- * optional `exitCode`; stall `source` (`'event-loop' | 'unresponsive'`).
+ * (in practice Electron's small enum — `oom`/`crashed`/`killed`… — not
+ * identifying; the validator only type-checks it, not a fixed enumeration) +
+ * optional `exitCode`; stall `source` (in practice `'event-loop'` /
+ * `'unresponsive'`; the validator only type-checks it).
  *
  * An error with empty `frames`, or whose `frames[0]` lacks ALL of
  * `function`/`file`/`line`, degrades to the bare `name` — exactly today's
@@ -302,17 +379,24 @@ export function summarize(events) {
 
   const errorNameCounts = {};
   const schemaVersions = {};
-  const appVersions = {};
-  const platforms = {};
+  // Client-keyed histograms (WARDEN-1246): appVersions / platforms / byRuntime /
+  // crashReasons are all keyed by FREE client-supplied strings, so they go
+  // through the bounded accumulator (key-length truncation + top-N + overflow)
+  // — no single accepted event can permanently inflate every summary response.
+  const appVersions = _createBoundedClientHistogram();
+  const platforms = _createBoundedClientHistogram();
   // runtime process label histogram (WARDEN-869) — the PROCESS sibling of
-  // `appVersions` / `platforms`. A plain object (NOT pre-keyed) exactly like
-  // `platforms` / `appVersions`: `runtime` is mandatory on valid events, but the
-  // skip-robust guard still applies to a malformed / partial-read entry.
-  const byRuntime = {};
-  // Crash-CAUSE histogram (WARDEN-872): buckets crash counts by the non-identifying
-  // `reason` string, mirroring platforms/appVersions. Skip-robust — a reasonless
-  // crash is counted by byType.crash but NOT bucketed here.
-  const crashReasons = {};
+  // `appVersions` / `platforms`. `runtime` is mandatory on valid events, but the
+  // validator only type-checks it (NOT a fixed enumeration), so it is bounded
+  // exactly like its siblings; the skip-robust guard still applies to a
+  // malformed / partial-read entry.
+  const byRuntime = _createBoundedClientHistogram();
+  // Crash-CAUSE histogram (WARDEN-872): buckets crash counts by the client's
+  // `reason` string, mirroring platforms/appVersions — and bounded by them
+  // (WARDEN-1246), since `reason` is free client text (type-checked only), NOT
+  // a fixed enum. Skip-robust — a reasonless crash is counted by byType.crash
+  // but NOT bucketed here.
+  const crashReasons = _createBoundedClientHistogram();
   // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
   // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
   // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
@@ -357,20 +441,20 @@ export function summarize(events) {
     // ignored (a v2 source that cannot read the version emits no field), so a
     // malformed value never crashes or produces a junk bucket.
     if (typeof appVersion === 'string' && appVersion.length > 0) {
-      appVersions[appVersion] = (appVersions[appVersion] ?? 0) + 1;
+      appVersions.record(appVersion);
     }
     // platform OS label (WARDEN-684). Skip-robust exactly like appVersions: only
     // bucket a PRESENT, non-empty string — absent / null / non-string / empty is
     // ignored (a v3 source that cannot read process.platform emits no field), so a
     // malformed value never crashes or produces a junk bucket.
     if (typeof platform === 'string' && platform.length > 0) {
-      platforms[platform] = (platforms[platform] ?? 0) + 1;
+      platforms.record(platform);
     }
     // runtime process label (WARDEN-869). Skip-robust exactly like platforms: only
     // bucket a PRESENT non-empty string — absent / null / non-string / empty is
     // ignored, so a malformed value never crashes or produces a junk bucket.
     if (typeof runtime === 'string' && runtime.length > 0) {
-      byRuntime[runtime] = (byRuntime[runtime] ?? 0) + 1;
+      byRuntime.record(runtime);
     }
     // crash reason (WARDEN-872). Skip-robust exactly like platforms/appVersions:
     // only bucket a PRESENT, non-empty string — absent / null / non-string / empty
@@ -379,7 +463,7 @@ export function summarize(events) {
     // here, so `sum(crashReasons.values()) ≤ byType.crash` (equality iff every
     // crash carries a present non-empty `reason`).
     if (type === 'crash' && typeof reason === 'string' && reason.length > 0) {
-      crashReasons[reason] = (crashReasons[reason] ?? 0) + 1;
+      crashReasons.record(reason);
     }
     // Stall MAGNITUDE aggregate (WARDEN-854): the `lagMs` distribution the stall
     // COUNT (byType / topSignatures) discards. `count` is EVERY performance-stall
@@ -402,11 +486,23 @@ export function summarize(events) {
         if (stallMin === null || lagMs < stallMin) stallMin = lagMs;
         if (stallMax === null || lagMs > stallMax) stallMax = lagMs;
       }
+      // `source` is client-supplied free text (type-checked only, NOT a fixed
+      // enum), so its key is length-bounded and its cardinality capped
+      // top-N + `__overflow__` exactly like the client-keyed histograms
+      // (WARDEN-1246) — an overflow stall-source folds into a SHARED
+      // `__overflow__` accumulator of the same shape (merged counts / stats,
+      // never dropped).
       if (typeof source === 'string' && source.length > 0) {
-        let acc = stallBySource.get(source);
-        if (!acc) {
+        const srcKey = _boundClientKey(source);
+        let acc;
+        if (stallBySource.has(srcKey)) {
+          acc = stallBySource.get(srcKey);
+        } else if (stallBySource.size < CLIENT_HISTOGRAM_CAP) {
           acc = { count: 0, sum: 0, finiteCount: 0, min: null, max: null };
-          stallBySource.set(source, acc);
+          stallBySource.set(srcKey, acc);
+        } else {
+          acc = stallBySource.get(OVERFLOW_KEY) ?? { count: 0, sum: 0, finiteCount: 0, min: null, max: null };
+          stallBySource.set(OVERFLOW_KEY, acc);
         }
         acc.count += 1;
         if (finiteLag) {
@@ -448,7 +544,11 @@ export function summarize(events) {
   const topErrorNames = Object.entries(errorNameCounts)
     .map(([errorName, count]) => ({ name: errorName, count }))
     .sort((a, b) => b.count - a.count || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-    .slice(0, TOP_ERROR_NAMES_CAP);
+    .slice(0, TOP_ERROR_NAMES_CAP)
+    // Key-length bound (WARDEN-1246): the list is capped in COUNT but its keys
+    // are client-supplied free text, so truncate each at read time — ten
+    // multi-KB names would still inflate the response.
+    .map(({ name, count }) => ({ name: _boundClientKey(name), count }));
 
   // Rank DISTINCT failures by count desc, then signature asc for a deterministic
   // order on ties — mirrors topErrorNames so the aggregate is stable and trivially
@@ -461,7 +561,10 @@ export function summarize(events) {
         (a.signature < b.signature ? -1 : a.signature > b.signature ? 1 : 0)
     )
     .slice(0, TOP_SIGNATURES_CAP)
-    .map(({ signature, type, count }) => ({ signature, type, count }));
+    // Key-length bound (WARDEN-1246): a signature folds the crash `reason` (free
+    // client text, type-checked only) into its key, so truncate at read time —
+    // the list is capped in COUNT, not in key length, otherwise.
+    .map(({ signature, type, count }) => ({ signature: _boundClientKey(signature), type, count }));
 
   // Stall-severity rollup (WARDEN-854): the overall magnitude snapshot plus the
   // per-source breakdown (insertion order — a maintainer reads the sources in the
@@ -479,10 +582,10 @@ export function summarize(events) {
     topErrorNames,
     topSignatures,
     schemaVersions,
-    appVersions,
-    platforms,
-    byRuntime,
-    crashReasons,
+    appVersions: appVersions.snapshot(),
+    platforms: platforms.snapshot(),
+    byRuntime: byRuntime.snapshot(),
+    crashReasons: crashReasons.snapshot(),
     stalls,
     firstSeen,
     lastSeen,
@@ -729,10 +832,19 @@ export function summarizeStallsTimeline(
         if (finiteLag && (max === null || lagMs > max)) max = lagMs;
         const source = e.source;
         if (typeof source === 'string' && source.length > 0) {
-          let acc = bySource.get(source);
-          if (!acc) {
+          // Key-length + cardinality bound (WARDEN-1246): `source` is free client
+          // text; a new source past the cap folds into ONE shared `__overflow__`
+          // accumulator of the same shape (merged, never dropped).
+          const srcKey = _boundClientKey(source);
+          let acc;
+          if (bySource.has(srcKey)) {
+            acc = bySource.get(srcKey);
+          } else if (bySource.size < CLIENT_HISTOGRAM_CAP) {
             acc = { count: 0, max: null };
-            bySource.set(source, acc);
+            bySource.set(srcKey, acc);
+          } else {
+            acc = bySource.get(OVERFLOW_KEY) ?? { count: 0, max: null };
+            bySource.set(OVERFLOW_KEY, acc);
           }
           acc.count += 1;
           if (finiteLag && (acc.max === null || lagMs > acc.max)) acc.max = lagMs;

@@ -1273,3 +1273,103 @@ test('stallsTimeline: the HEADLINE — two stores with byte-identical stalls.max
     'the active regression and the resolved blip now read APART in time'
   );
 });
+
+// ── CLIENT-KEYED HISTOGRAM BOUNDS (WARDEN-1246) ───────────────────────────────
+// No single accepted event may permanently inflate every /summary response:
+// the client-keyed breakdowns are bounded in BOTH key length and distinct-key
+// cardinality, with overflow REPRESENTED via the `__overflow__` sentinel (the
+// same shape as createRejectionTally's byDeclaredVersion, WARDEN-829).
+
+import { CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP } from '../summary.mjs';
+
+test('an oversized client key is truncated in every client-keyed histogram', () => {
+  const huge = 'x'.repeat(CLIENT_KEY_MAX_LENGTH * 40); // far over the cap
+  const s = summarize([
+    { type: 'crash', timestamp: 1, reason: huge },
+    { type: 'error', timestamp: 2, name: 'TypeError', platform: huge, appVersion: huge, runtime: huge },
+  ]);
+  // Each histogram holds ONE key of exactly CLIENT_KEY_MAX_LENGTH chars — the
+  // response stays proportionate no matter what the client sent.
+  for (const [hist, label] of [
+    [s.crashReasons, 'crashReasons'],
+    [s.platforms, 'platforms'],
+    [s.appVersions, 'appVersions'],
+    [s.byRuntime, 'byRuntime'],
+  ]) {
+    const keys = Object.keys(hist);
+    assert.equal(keys.length, 1, `${label} holds one key`);
+    assert.equal(keys[0].length, CLIENT_KEY_MAX_LENGTH, `${label} key is truncated`);
+    assert.equal(hist[keys[0]], 1, `${label} count preserved`);
+  }
+});
+
+test('distinct-key cardinality is capped with a counted __overflow__ bucket', () => {
+  // CAP distinct values each with its own count, then two MORE past the cap.
+  const crashes = [];
+  for (let i = 0; i < CLIENT_HISTOGRAM_CAP + 2; i++) {
+    crashes.push({ ...validCrash, reason: `distinct-reason-${i}` });
+  }
+  const s = summarize(crashes);
+  const keys = Object.keys(s.crashReasons);
+  assert.equal(keys.length, CLIENT_HISTOGRAM_CAP + 1, 'capped keys + ONE overflow bucket');
+  assert.equal(keys.filter((k) => k === '__overflow__').length, 1, 'the overflow sentinel is present');
+  assert.equal(s.crashReasons['__overflow__'], 2, 'overflow is COUNTED, not dropped');
+  assert.equal(
+    Object.values(s.crashReasons).reduce((a, b) => a + b, 0),
+    crashes.length,
+    'no count loss: every crash is bucketed'
+  );
+  assert.ok(s.crashReasons['distinct-reason-0'] === 1, 'an under-cap key keeps its own bucket');
+});
+
+test('ordinary small-cardinality traffic produces the same breakdowns as before', () => {
+  const s = summarize([
+    { ...validCrash, reason: 'oom' },
+    { ...validCrash, reason: 'oom' },
+    { ...validCrash, reason: 'killed' },
+    { ...validError, platform: 'darwin', appVersion: '1.2.3', runtime: 'main' },
+  ]);
+  assert.deepEqual(s.crashReasons, { oom: 2, killed: 1 });
+  assert.deepEqual(s.platforms, { darwin: 1 });
+  assert.deepEqual(s.appVersions, { '1.2.3': 1 });
+  assert.deepEqual(s.byRuntime, { main: 1, renderer: 3 });
+});
+
+test('topErrorNames and topSignatures keys are length-bounded at read time', () => {
+  const s = summarize([
+    { ...validError, name: 'E'.repeat(CLIENT_KEY_MAX_LENGTH * 30) },
+    { ...validCrash, reason: 'r'.repeat(CLIENT_KEY_MAX_LENGTH * 30) },
+  ]);
+  assert.ok(s.topErrorNames.length === 1);
+  assert.equal(s.topErrorNames[0].name.length, CLIENT_KEY_MAX_LENGTH);
+  const crashSig = s.topSignatures.find((t) => t.type === 'crash');
+  assert.ok(crashSig, 'the crash signature is ranked');
+  assert.ok(crashSig.signature.length <= 'crash:'.length + CLIENT_KEY_MAX_LENGTH + ':exit=133'.length);
+  assert.equal(crashSig.signature.length, CLIENT_KEY_MAX_LENGTH, 'the signature is truncated to the bound');
+});
+
+test('stalls.bySource folds overflow sources into one shared __overflow__ accumulator', () => {
+  const stalls = [];
+  for (let i = 0; i < CLIENT_HISTOGRAM_CAP + 2; i++) {
+    stalls.push({ ...validStall, source: `src-${i}`, lagMs: 100 + i });
+  }
+  const s = summarize(stalls);
+  assert.equal(s.stalls.count, stalls.length, 'every stall is still counted overall');
+  const sources = Object.keys(s.stalls.bySource);
+  assert.equal(sources.length, CLIENT_HISTOGRAM_CAP + 1, 'capped sources + ONE overflow bucket');
+  assert.equal(s.stalls.bySource['__overflow__'].count, 2, 'overflow sources MERGED, not dropped');
+});
+
+test('summarizeStallsTimeline bySource is bounded too (same class of client key)', () => {
+  const now = 1000;
+  const stalls = [];
+  for (let i = 0; i < CLIENT_HISTOGRAM_CAP + 3; i++) {
+    stalls.push({ ...validStall, timestamp: now - 1, source: `src-${'a'.repeat(100)}-${i}` });
+  }
+  const tl = summarizeStallsTimeline(stalls, { now: () => now, windowMs: 100, maxBuckets: 2 });
+  assert.equal(tl.buckets.length, 1);
+  const sources = Object.keys(tl.buckets[0].bySource);
+  assert.equal(sources.length, CLIENT_HISTOGRAM_CAP + 1, 'capped + overflow');
+  assert.ok(sources.every((k) => k.length <= CLIENT_KEY_MAX_LENGTH), 'every source key is length-bounded');
+  assert.equal(tl.buckets[0].bySource['__overflow__'].count, 3, 'overflow counted');
+});
