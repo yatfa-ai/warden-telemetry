@@ -9,9 +9,20 @@
 // pinned values below are consciously updated to match. That forces a schema bump
 // to be a coordinated, visible change across both repos (not a silent mis-store).
 // A hand-rolled parallel validator could not give this guarantee.
+//
+// BYTE-IDENTITY (WARDEN-1248): the pinned assertions below prove the vendored file
+// still matches the contract on everything that was ever enumerated — and are
+// structurally blind to everything that was not. When canonical retired
+// ConsentTier / resolveConsentTier, the vendored copy kept them and NO pin could
+// see the stale extras; only a byte-for-byte comparison with canonical can. The
+// test at the bottom of this file performs exactly that comparison whenever a
+// canonical checkout is reachable.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import {
   SCHEMA_VERSION,
   BASE_EVENT_TYPES,
@@ -81,11 +92,11 @@ test('vendored validateEvent accepts every canonical client fixture (no drift)',
   assert.equal(validateEvent(stallFixture), true, 'stall fixture validates');
 });
 
-test('vendored validateEvent accepts extended-tier fixtures (chat/session names)', () => {
+test('vendored validateEvent accepts identifier-bearing fixtures (chat/session names)', () => {
   assert.equal(
     validateEvent({ ...errorFixture, chatName: 'Refactor auth', sessionName: 'claude-7b3a2f1' }),
     true,
-    'extended-tier names are well-typed'
+    'the optional identifier fields (the `names` category) are well-typed'
   );
 });
 
@@ -150,5 +161,49 @@ test('the vendored validator is the REAL one — it still rejects out-of-schema 
     validateEvent({ ...crashFixture, reason: 7 }),
     false,
     'a crash with a non-string reason is still rejected'
+  );
+});
+
+// ── BYTE-IDENTITY with the canonical client copy (WARDEN-1248) ────────────────
+//
+// The enumerated pins above can only ever catch drift on the axes someone thought
+// to pin. The WARDEN-1248 drift proved the blind spot: canonical (in the warden
+// repo) retired ConsentTier + resolveConsentTier and reworked its consent
+// comments, while this vendored copy kept the retired exports and the stale
+// two-tier prose — and every pin above stayed green, because none of them could
+// see an EXTRA export or stale comments. The one check that catches every
+// divergence — stale extras, stale comments, a partial re-vendor — is comparing
+// the bytes.
+//
+// This repo is standalone on its own CI (only warden-telemetry is checked out),
+// so the canonical file is located, in priority order, at:
+//   1. $WARDEN_CANONICAL_SCHEMA   — explicit override (absolute path)
+//   2. <sibling checkout>/warden/web/src/lib/telemetry/schema.ts — the
+//      side-by-side layout of a dev machine or workbench, where the cross-repo
+//      work actually happens and where this guard earns its keep
+// With neither present (standalone CI), the test SKIPS — visibly, in the
+// runner's `skipped` count — it never silently passes.
+const CANONICAL_SCHEMA_CANDIDATES = [
+  process.env.WARDEN_CANONICAL_SCHEMA,
+  fileURLToPath(new URL('../../warden/web/src/lib/telemetry/schema.ts', import.meta.url)),
+].filter(Boolean);
+const CANONICAL_SCHEMA_PATH = CANONICAL_SCHEMA_CANDIDATES.find((p) => existsSync(p));
+
+test('vendored schema.ts is byte-identical to the canonical client copy', {
+  skip: CANONICAL_SCHEMA_PATH
+    ? false
+    : `canonical warden schema not found (tried: ${CANONICAL_SCHEMA_CANDIDATES.join(', ')}) — ` +
+      'set WARDEN_CANONICAL_SCHEMA or place a warden checkout beside warden-telemetry to enable this guard',
+}, () => {
+  const vendored = readFileSync(new URL('../schema.ts', import.meta.url));
+  const canonical = readFileSync(CANONICAL_SCHEMA_PATH);
+  const shortSha = (buf) => createHash('sha256').update(buf).digest('hex').slice(0, 16);
+  assert.ok(
+    vendored.equals(canonical),
+    `vendored schema.ts has DRIFTED from canonical (${CANONICAL_SCHEMA_PATH}): ` +
+      `vendored sha256:${shortSha(vendored)} vs canonical sha256:${shortSha(canonical)}. ` +
+      'Re-vendor with `cp ../warden/web/src/lib/telemetry/schema.ts schema.ts` from the ' +
+      'warden-telemetry root (never hand-edit the vendored copy), then update the PINNED ' +
+      'constants above in the same change if the contract values moved.'
   );
 });

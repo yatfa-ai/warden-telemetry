@@ -72,7 +72,12 @@ can disagree with the client's is exactly the drift this design guards against.
 
 A drift guard (`test/drift.test.mjs`) asserts the vendored constants match the pinned client contract and
 that `validateEvent` still accepts the canonical client fixtures — so a schema change can't land here
-silently; a bump must consciously update both the vendored file and the pinned assertions.
+silently; a bump must consciously update both the vendored file and the pinned assertions. When a canonical
+checkout is reachable — a `warden` checkout beside this one, or `$WARDEN_CANONICAL_SCHEMA` pointing at it —
+the guard additionally asserts the vendored file is **byte-identical** to
+`warden/web/src/lib/telemetry/schema.ts` (WARDEN-1248): the pinned constants can only see the axes someone
+thought to pin, and a stale extra export or a partial re-vendor is invisible to all of them. With no
+canonical checkout present (standalone CI) that assertion skips visibly — it never silently passes.
 
 ## Running the receiver
 
