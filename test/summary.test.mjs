@@ -64,18 +64,18 @@ test('non-array input is treated as empty (defensive — never throws)', () => {
 test('counts total + per-type across a mixed batch', () => {
   const s = summarize([validError, validCrash, validStall]);
   assert.equal(s.total, 3);
-  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 1 });
+  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 1, 'operational-metrics': 0 });
 });
 
 test('byType shape is stable — every base-type key is present even at 0', () => {
   const s = summarize([validError, validError]);
-  assert.deepEqual(s.byType, { error: 2, crash: 0, 'performance-stall': 0 });
+  assert.deepEqual(s.byType, { error: 2, crash: 0, 'performance-stall': 0, 'operational-metrics': 0 });
 });
 
 test('repeats accumulate per type', () => {
   const s = summarize([validCrash, validCrash, validStall]);
   assert.equal(s.total, 3);
-  assert.deepEqual(s.byType, { error: 0, crash: 2, 'performance-stall': 1 });
+  assert.deepEqual(s.byType, { error: 0, crash: 2, 'performance-stall': 1, 'operational-metrics': 0 });
 });
 
 // ── TOP ERROR NAMES ───────────────────────────────────────────────────────────
@@ -688,7 +688,7 @@ test('the summary never echoes raw events or extended-tier identifiers (aggregat
 test('malformed entries (null / primitives / non-objects) are skipped, not fatal', () => {
   const s = summarize([null, 'not-an-object', 42, undefined, validError, validCrash]);
   assert.equal(s.total, 2);
-  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 0 });
+  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0 });
   assert.equal(s.topErrorNames.length, 1);
 });
 

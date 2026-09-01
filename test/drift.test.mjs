@@ -35,8 +35,8 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 4,
-  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall'],
+  SCHEMA_VERSION: 5,
+  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics'],
   RUNTIME: { MAIN: 'main', RENDERER: 'renderer' },
 };
 
