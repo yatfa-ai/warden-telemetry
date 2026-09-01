@@ -34,7 +34,7 @@ const validStall = {
   source: 'event-loop',
 };
 
-const ZEROED_BY_TYPE = { error: 0, crash: 0, 'performance-stall': 0 };
+const ZEROED_BY_TYPE = { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0 };
 
 // ── EMPTY / ZEROED ────────────────────────────────────────────────────────────
 

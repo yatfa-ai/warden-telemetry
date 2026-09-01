@@ -77,6 +77,26 @@ const validStall = {
 };
 
 const bodyOf = (events) => JSON.stringify({ schemaVersion: SCHEMA_VERSION, events });
+// WARDEN-1258 — the aggregate usage event. Valid shape per the v5 schema:
+// folded counts / ok-fail / min-avg-max / boundary-keyed histograms, with
+// kebab-case operation literals (a path or hostname riding the aggregate key
+// is out-of-schema by construction).
+const validMetrics = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'operational-metrics',
+  runtime: 'main',
+  timestamp: 4,
+  windowStartedAt: 1,
+  windowEndedAt: 4,
+  boundaries: [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+  operations: [
+    { operation: 'file-exists-local', count: 2, okCount: 1, failCount: 1, min: 0.5, avg: 1, max: 1.5, buckets: [2, 0, 0, 0, 0, 0, 0, 0, 0] },
+    { operation: 'file-exists-remote', count: 1, okCount: 1, failCount: 0, min: 300, avg: 300, max: 300, buckets: [0, 0, 1, 0, 0, 0, 0, 0, 0] },
+    { operation: 'file-exists-cache-hit', count: 3, okCount: 3, failCount: 0, min: 0, avg: 0, max: 0, buckets: [3, 0, 0, 0, 0, 0, 0, 0, 0] },
+  ],
+  rejected: 0,
+};
+
 const schemaHeaders = { 'x-telemetry-schema': String(SCHEMA_VERSION) };
 
 // ── SUCCESS CRITERION 1: accept a schemaVersion-matched batch + durably persist ─
@@ -96,6 +116,24 @@ test('accepts a schemaVersion-matched batch of valid events → 2xx and durably 
   assert.deepEqual(store.appended[0], { ...validError, receivedAt: RECEIVED_AT });
   assert.deepEqual(store.appended[1], { ...validCrash, receivedAt: RECEIVED_AT });
   assert.deepEqual(store.appended[2], { ...validStall, receivedAt: RECEIVED_AT });
+});
+
+test('accepts an operational-metrics event (WARDEN-1258 aggregate usage window)', async () => {
+  const store = memoryStore();
+  const res = await ingest({ headers: schemaHeaders, body: bodyOf([validMetrics]) }, deps(store));
+  assert.equal(res.ok, true);
+  assert.equal(res.body.accepted, 1);
+  assert.deepEqual(store.appended[0], { ...validMetrics, receivedAt: RECEIVED_AT });
+});
+
+test('hard-rejects an operational-metrics event whose operation key carries a path (hard exclusion is structural)', async () => {
+  const store = memoryStore();
+  const hostile = structuredClone(validMetrics);
+  hostile.operations[0].operation = '/etc/passwd';
+  const res = await ingest({ headers: schemaHeaders, body: bodyOf([hostile]) }, deps(store));
+  assert.equal(res.ok, false);
+  assert.ok(res.status === 422 || res.status === 400, 'non-retryable 4xx');
+  assert.equal(store.appended.length, 0, 'nothing persisted');
 });
 
 test('persists each event as a separate record (one per accepted event)', async () => {

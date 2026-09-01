@@ -267,7 +267,7 @@ test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an 
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
   assert.equal(body.total, 0);
-  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0 });
   assert.deepEqual(body.topErrorNames, []);
   assert.deepEqual(body.schemaVersions, {});
   assert.equal(body.firstSeen, null);
@@ -961,7 +961,7 @@ test('GET /summary?platform=win32 on a store with NO win32 events → matched 0,
   const body = JSON.parse(res.body);
   assert.equal(body.total, 2, 'total still the full persisted count');
   assert.equal(body.matched, 0, 'nothing matched the win32 filter');
-  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0 });
   assert.deepEqual(body.topErrorNames, []);
   assert.deepEqual(body.platforms, {});
   assert.deepEqual(body.timeline.buckets, []);
