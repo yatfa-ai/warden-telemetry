@@ -97,6 +97,29 @@ const validMetrics = {
   rejected: 0,
 };
 
+// WARDEN-1278 — the SERVER child's folded stall window, the first event the
+// receiver ever accepts with `runtime: 'server'`. Valid shape per the v6 schema:
+// counts / durations / a boundary-keyed lag histogram / closed-set kebab-case
+// culprit keys (a route path, an agent name or a hostname riding the attribution
+// key is out-of-schema by construction).
+const validServerStall = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'server-stall',
+  runtime: 'server',
+  timestamp: 5,
+  windowStartedAt: 1,
+  windowEndedAt: 5,
+  count: 2,
+  totalMs: 7400,
+  maxMs: 6000,
+  boundaries: [1000, 2000, 5000, 10000, 30000],
+  buckets: [0, 1, 0, 1, 0, 0],
+  culprits: [
+    { culprit: 'get-api-claude-sessions', count: 2, totalOverlapMs: 7300 },
+    { culprit: 'fs-read-file-sync', count: 1, totalOverlapMs: 5800 },
+  ],
+};
+
 const schemaHeaders = { 'x-telemetry-schema': String(SCHEMA_VERSION) };
 
 // ── SUCCESS CRITERION 1: accept a schemaVersion-matched batch + durably persist ─
@@ -134,6 +157,47 @@ test('hard-rejects an operational-metrics event whose operation key carries a pa
   assert.equal(res.ok, false);
   assert.ok(res.status === 422 || res.status === 400, 'non-retryable 4xx');
   assert.equal(store.appended.length, 0, 'nothing persisted');
+});
+
+test('accepts a server-stall event — the first `server` runtime on the wire (WARDEN-1278)', async () => {
+  // Before v6 the wire had no `server` runtime at all, so an event from warden's
+  // forked backend child was invalid BY CONSTRUCTION and the heaviest worker in
+  // the app could report nothing under any consent. This is that gap closed.
+  const store = memoryStore();
+  const res = await ingest({ headers: schemaHeaders, body: bodyOf([validServerStall]) }, deps(store));
+  assert.equal(res.ok, true);
+  assert.equal(res.body.accepted, 1);
+  assert.deepEqual(store.appended[0], { ...validServerStall, receivedAt: RECEIVED_AT });
+});
+
+test('hard-rejects a server-stall whose CULPRIT key carries user data (hard exclusion is structural)', async () => {
+  // The producer maps every span label onto a closed set before it can become an
+  // aggregate key; the receiver's validator is the INDEPENDENT second layer, and
+  // it is the one that holds even against a client we did not write.
+  for (const hostileKey of ['/api/sessions/abc', 'myproject.internal', 'alice@example.com', 'Refactor auth']) {
+    const store = memoryStore();
+    const hostile = structuredClone(validServerStall);
+    hostile.culprits[0].culprit = hostileKey;
+    const res = await ingest({ headers: schemaHeaders, body: bodyOf([hostile]) }, deps(store));
+    assert.equal(res.ok, false, `${hostileKey} rejected`);
+    assert.ok(res.status === 422 || res.status === 400, 'non-retryable 4xx');
+    assert.equal(store.appended.length, 0, 'nothing persisted');
+  }
+});
+
+test('hard-rejects a server-stall claiming a runtime other than `server`', async () => {
+  // The type is PINNED to the runtime it reports on. Accepting `main` here would
+  // let a client mislabel which process froze — the exact lie the v6 runtime was
+  // added to end.
+  for (const runtime of ['main', 'renderer', 'worker']) {
+    const store = memoryStore();
+    const res = await ingest(
+      { headers: schemaHeaders, body: bodyOf([{ ...validServerStall, runtime }]) },
+      deps(store),
+    );
+    assert.equal(res.ok, false, `runtime ${runtime} rejected`);
+    assert.equal(store.appended.length, 0);
+  }
 });
 
 test('persists each event as a separate record (one per accepted event)', async () => {

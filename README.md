@@ -174,7 +174,7 @@ curl http://localhost:7421/summary
 
 The response carries **counts and histograms only** — it never echoes raw events or extended-tier
 identifiers (chat/session names). `total` is the record count; `byType` is always the full
-`{ error, crash, performance-stall }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
+`{ error, crash, performance-stall, operational-metrics, server-stall }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
 error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen`/`lastSeen` bound the
 observed time window (`null` on an empty store); `startedAt` is the epoch-ms at which **this receiver
 (re)booted**. A fresh receiver with no traffic returns `total: 0` with zeroed counters.
@@ -314,7 +314,8 @@ curl 'http://localhost:7421/summary?platform=win32'
 curl 'http://localhost:7421/summary?appVersion=0.1.18&platform=darwin&type=crash'
 ```
 
-- **`?type=`** — filter to one base type (`error` | `crash` | `performance-stall`). Exact match.
+- **`?type=`** — filter to one base type (`error` | `crash` | `performance-stall` | `operational-metrics` |
+  `server-stall`). Exact match.
 - **`?platform=`** — filter to one OS label (`darwin` | `win32` | `linux`). Exact match; an event whose
   source omitted the field is excluded (a maintainer asking "show me win32" does not want un-attributed
   events).
@@ -388,8 +389,8 @@ The response is **bounded and filterable**:
   order. The hard cap means a near-full store (up to the 10000-event retention cap) can never yield a
   multi-megabyte response; a request for `limit=50000` returns at most `200`. A missing/non-numeric/
   non-positive `limit` falls back to the default.
-- **`?type=`** — filter to one base type (`error` | `crash` | `performance-stall`). Exact match; a value that
-  matches nothing returns an empty `events` array.
+- **`?type=`** — filter to one base type (`error` | `crash` | `performance-stall` | `operational-metrics` |
+  `server-stall`). Exact match; a value that matches nothing returns an empty `events` array.
 - **`?platform=`** — filter to one OS label (`darwin` | `win32` | `linux`). Exact match; an event whose source
   omitted the field is excluded (a maintainer asking "show me win32" does not want un-attributed events).
 - **`?appVersion=`** — filter to one release label (e.g. `0.1.19`). Exact match.
