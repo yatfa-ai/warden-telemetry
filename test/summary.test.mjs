@@ -34,7 +34,7 @@ const validStall = {
   source: 'event-loop',
 };
 
-const ZEROED_BY_TYPE = { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0 };
+const ZEROED_BY_TYPE = { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 };
 
 // ── EMPTY / ZEROED ────────────────────────────────────────────────────────────
 
@@ -64,18 +64,60 @@ test('non-array input is treated as empty (defensive — never throws)', () => {
 test('counts total + per-type across a mixed batch', () => {
   const s = summarize([validError, validCrash, validStall]);
   assert.equal(s.total, 3);
-  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 1, 'operational-metrics': 0 });
+  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 1, 'operational-metrics': 0, 'server-stall': 0 });
 });
 
 test('byType shape is stable — every base-type key is present even at 0', () => {
   const s = summarize([validError, validError]);
-  assert.deepEqual(s.byType, { error: 2, crash: 0, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(s.byType, { error: 2, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
 });
 
 test('repeats accumulate per type', () => {
   const s = summarize([validCrash, validCrash, validStall]);
   assert.equal(s.total, 3);
-  assert.deepEqual(s.byType, { error: 0, crash: 2, 'performance-stall': 1, 'operational-metrics': 0 });
+  assert.deepEqual(s.byType, { error: 0, crash: 2, 'performance-stall': 1, 'operational-metrics': 0, 'server-stall': 0 });
+});
+
+// WARDEN-1278 — the SERVER child's folded stall window is a first-class base
+// type on the count axis. The ticket deliberately scoped the MAGNITUDE axis
+// (`stalls`) to the per-stall `performance-stall` type only: a server-stall
+// carries a folded window, not a single lagMs, so feeding it into a min/avg/max
+// built from per-event durations would produce a number that means neither.
+const validServerStall = {
+  schemaVersion: validError.schemaVersion,
+  type: 'server-stall',
+  runtime: 'server',
+  timestamp: 7,
+  windowStartedAt: 1,
+  windowEndedAt: 7,
+  count: 2,
+  totalMs: 7400,
+  maxMs: 6000,
+  boundaries: [1000, 2000, 5000, 10000, 30000],
+  buckets: [0, 1, 0, 1, 0, 0],
+  culprits: [{ culprit: 'get-api-claude-sessions', count: 2, totalOverlapMs: 7300 }],
+};
+
+test('byType counts server-stall — the backend child is visible in the aggregate (WARDEN-1278)', () => {
+  const s = summarize([validError, validServerStall, validServerStall]);
+  assert.equal(s.total, 3);
+  assert.deepEqual(s.byType, {
+    error: 1, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 2,
+  });
+});
+
+test('a server-stall does NOT enter the per-stall MAGNITUDE axis', () => {
+  // The two axes answer different questions and must not be conflated: `stalls`
+  // is min/avg/max over PER-EVENT lagMs, and a server-stall has no lagMs — it
+  // has a whole folded window. Counting it here would silently mix a window's
+  // aggregate into an event-level percentile.
+  const s = summarize([validServerStall, { ...validStall, lagMs: 400 }]);
+  assert.equal(s.stalls.count, 1, 'only the per-stall event is in the magnitude axis');
+  assert.equal(
+    s.stalls.count, s.byType['performance-stall'],
+    'the count-match invariant is unaffected by the new type',
+  );
+  assert.equal(s.byType['server-stall'], 1, 'and the server-stall is still counted on the count axis');
 });
 
 // ── TOP ERROR NAMES ───────────────────────────────────────────────────────────
@@ -688,7 +730,7 @@ test('the summary never echoes raw events or extended-tier identifiers (aggregat
 test('malformed entries (null / primitives / non-objects) are skipped, not fatal', () => {
   const s = summarize([null, 'not-an-object', 42, undefined, validError, validCrash]);
   assert.equal(s.total, 2);
-  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   assert.equal(s.topErrorNames.length, 1);
 });
 

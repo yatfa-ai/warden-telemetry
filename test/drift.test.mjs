@@ -35,9 +35,12 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 5,
-  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics'],
-  RUNTIME: { MAIN: 'main', RENDERER: 'renderer' },
+  SCHEMA_VERSION: 6,
+  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall'],
+  // v6 (WARDEN-1278) added SERVER — warden's backend is a FORKED CHILD of the
+  // Electron main process, a third real OS process the wire could not name, so
+  // nothing it observed could ever be reported under any consent.
+  RUNTIME: { MAIN: 'main', RENDERER: 'renderer', SERVER: 'server' },
 };
 
 test('vendored SCHEMA_VERSION matches the pinned client contract', () => {
@@ -50,9 +53,11 @@ test('vendored BASE_EVENT_TYPES is exactly the pinned set and frozen', () => {
   assert.equal(Object.isFrozen(BASE_EVENT_TYPES), true, 'BASE_EVENT_TYPES must be frozen');
 });
 
-test('vendored RUNTIME is exactly the pinned { main, renderer } and frozen', () => {
+test('vendored RUNTIME is exactly the pinned { main, renderer, server } and frozen', () => {
   assert.equal(RUNTIME.MAIN, PINNED.RUNTIME.MAIN);
   assert.equal(RUNTIME.RENDERER, PINNED.RUNTIME.RENDERER);
+  assert.equal(RUNTIME.SERVER, PINNED.RUNTIME.SERVER);
+  assert.deepEqual({ ...RUNTIME }, PINNED.RUNTIME, 'no runtime beyond the pinned three');
   assert.equal(Object.isFrozen(RUNTIME), true, 'RUNTIME must be frozen');
 });
 

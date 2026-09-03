@@ -244,7 +244,7 @@ test('GET /summary returns the aggregate over a pre-populated store → 200 + JS
   assert.equal(res.headers['content-type'], 'application/json');
   const body = JSON.parse(res.body);
   assert.equal(body.total, 2);
-  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
   // The new failure-signature aggregate (WARDEN-707) flows through the
   // `...summarize(events)` spread at the /summary handler. errorEvent has empty
@@ -267,7 +267,7 @@ test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an 
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
   assert.equal(body.total, 0);
-  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   assert.deepEqual(body.topErrorNames, []);
   assert.deepEqual(body.schemaVersions, {});
   assert.equal(body.firstSeen, null);
@@ -686,7 +686,7 @@ test('GET /summary?platform=win32 scopes byType / topErrorNames / topSignatures 
   assert.equal(body.matched, 2, 'matched is the win32 subset');
   assert.ok(body.matched <= body.total, 'matched never exceeds total');
   // byType reflects ONLY the win32 events: one error + one crash.
-  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   // topErrorNames is win32-only: RangeError (darwin) is gone.
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
   // topSignatures is win32-only: the darwin RangeError signature is gone.
@@ -884,7 +884,7 @@ test('GET /summary?type=crash scopes the aggregates to a single base type', asyn
   const body = JSON.parse(res.body);
   assert.equal(body.total, 3);
   assert.equal(body.matched, 2);
-  assert.deepEqual(body.byType, { error: 0, crash: 2, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 2, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   assert.deepEqual(body.topErrorNames, [], 'no error names — errors were filtered out');
 });
 
@@ -921,7 +921,7 @@ test('GET /summary?appVersion=0.1.18&platform=darwin&type=crash intersects all f
   const body = JSON.parse(res.body);
   assert.equal(body.total, 4, 'total is the full set');
   assert.equal(body.matched, 1, 'only the one darwin/0.1.18/crash event survives');
-  assert.deepEqual(body.byType, { error: 0, crash: 1, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   assert.deepEqual(body.topSignatures, [{ signature: 'crash:mac-oom', type: 'crash', count: 1 }]);
   assert.deepEqual(body.platforms, { darwin: 1 });
   assert.deepEqual(body.appVersions, { '0.1.18': 1 });
@@ -938,7 +938,7 @@ test('GET /summary with NO filters is backward compatible — matched === total,
   const body = JSON.parse(res.body);
   assert.equal(body.total, 2);
   assert.equal(body.matched, 2, 'unfiltered → matched === total');
-  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
   assert.deepEqual(body.topSignatures, [
     { signature: 'TypeError', type: 'error', count: 1 },
@@ -961,7 +961,7 @@ test('GET /summary?platform=win32 on a store with NO win32 events → matched 0,
   const body = JSON.parse(res.body);
   assert.equal(body.total, 2, 'total still the full persisted count');
   assert.equal(body.matched, 0, 'nothing matched the win32 filter');
-  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   assert.deepEqual(body.topErrorNames, []);
   assert.deepEqual(body.platforms, {});
   assert.deepEqual(body.timeline.buckets, []);
@@ -1620,7 +1620,7 @@ test('retention: /summary stays self-consistent over a pruned store — aggregat
 
   // Retained = the last 2 appended: error@300 (TypeError) + crash@400.
   assert.equal(body.total, 2);
-  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0 });
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0 });
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }], 'RangeError was pruned');
   // topSignatures reflects ONLY the retained set: RangeError was pruned, so the
   // sole error signature is the name-only `TypeError`; crash@400 → `crash:oom`.
