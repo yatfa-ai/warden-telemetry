@@ -35,8 +35,8 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 6,
-  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall'],
+  SCHEMA_VERSION: 7,
+  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall', 'workspace-names'],
   // v6 (WARDEN-1278) added SERVER — warden's backend is a FORKED CHILD of the
   // Electron main process, a third real OS process the wire could not name, so
   // nothing it observed could ever be reported under any consent.
@@ -102,6 +102,46 @@ test('vendored validateEvent accepts identifier-bearing fixtures (chat/session n
     validateEvent({ ...errorFixture, chatName: 'Refactor auth', sessionName: 'claude-7b3a2f1' }),
     true,
     'the optional identifier fields (the `names` category) are well-typed'
+  );
+});
+
+// WARDEN-1416 — the `names` category's OWN carrying event (schema v7). The
+// receiver must accept the exact shape the client's producer emits, and reject
+// the shapes that would let the honest-cap invariant or the runtime pin regress.
+const workspaceNamesFixture = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'workspace-names',
+  runtime: RUNTIME.SERVER,
+  timestamp: 77,
+  windowStartedAt: 60_000,
+  windowEndedAt: 90_000,
+  chats: ['demo', 'refactor auth'],
+  chatCount: 2,
+  truncated: false,
+};
+
+test('vendored validateEvent accepts the workspace-names fixture (schema v7)', () => {
+  assert.equal(validateEvent(workspaceNamesFixture), true, 'workspace-names fixture validates');
+  assert.equal(validateEvent({ ...workspaceNamesFixture, appVersion: '0.1.75', platform: 'linux' }), true, 'optional labels still attach');
+});
+
+test('workspace-names is PINNED to the server runtime and honors the honest-cap invariant', () => {
+  assert.equal(validateEvent({ ...workspaceNamesFixture, runtime: 'main' }), false, 'main runtime rejected');
+  assert.equal(validateEvent({ ...workspaceNamesFixture, runtime: 'renderer' }), false, 'renderer runtime rejected');
+  assert.equal(
+    validateEvent({ ...workspaceNamesFixture, chatCount: 1, truncated: false }),
+    false,
+    'a count SMALLER than the list is rejected (the list cannot exceed the catalog)'
+  );
+  assert.equal(
+    validateEvent({ ...workspaceNamesFixture, chats: ['a', 42] }),
+    false,
+    'a non-string entry is rejected'
+  );
+  assert.equal(
+    validateEvent({ ...workspaceNamesFixture, truncated: 'yes' }),
+    false,
+    'a non-boolean truncated flag is rejected'
   );
 });
 
