@@ -35,8 +35,8 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 7,
-  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall', 'workspace-names'],
+  SCHEMA_VERSION: 8,
+  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall', 'workspace-names', 'workspace-shape'],
   // v6 (WARDEN-1278) added SERVER — warden's backend is a FORKED CHILD of the
   // Electron main process, a third real OS process the wire could not name, so
   // nothing it observed could ever be reported under any consent.
@@ -143,6 +143,61 @@ test('workspace-names is PINNED to the server runtime and honors the honest-cap 
     false,
     'a non-boolean truncated flag is rejected'
   );
+});
+
+// WARDEN-1424 — the renderer's workspace-shape COUNT snapshot (schema v8). The
+// receiver must accept the exact shape the client's producer emits, and reject
+// every shape that would let the counts-only boundary regress: a wrong runtime,
+// a negative / non-integer / non-numeric count, a missing count, and — the
+// type's own hard-exclusion proof — ANY injected extra key.
+const workspaceShapeFixture = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'workspace-shape',
+  runtime: RUNTIME.RENDERER,
+  timestamp: 88,
+  windowStartedAt: 60_000,
+  windowEndedAt: 90_000,
+  workspaces: 2,
+  panesOpen: 5,
+  panesActive: 3,
+  chats: 7,
+  peakPanesOpen: 6,
+  peakChats: 9,
+};
+
+test('vendored validateEvent accepts the workspace-shape fixture (schema v8)', () => {
+  assert.equal(validateEvent(workspaceShapeFixture), true, 'workspace-shape fixture validates');
+  assert.equal(validateEvent({ ...workspaceShapeFixture, appVersion: '0.1.77', platform: 'linux' }), true, 'optional labels still attach');
+  assert.equal(validateBaseEvent(workspaceShapeFixture), true, 'validateBaseEvent accepts it too (the ingest path)');
+});
+
+test('workspace-shape is PINNED to the renderer runtime', () => {
+  assert.equal(validateEvent({ ...workspaceShapeFixture, runtime: 'main' }), false, 'main runtime rejected');
+  assert.equal(validateEvent({ ...workspaceShapeFixture, runtime: 'server' }), false, 'server runtime rejected');
+});
+
+test('workspace-shape is COUNTS ONLY — malformed counts and injected keys are rejected', () => {
+  // A negative count is not a shape snapshot.
+  assert.equal(validateEvent({ ...workspaceShapeFixture, panesOpen: -1 }), false, 'negative count rejected');
+  // A NaN / non-integer / string count is not a count.
+  assert.equal(validateEvent({ ...workspaceShapeFixture, chats: NaN }), false, 'NaN count rejected');
+  assert.equal(validateEvent({ ...workspaceShapeFixture, chats: 2.5 }), false, 'non-integer count rejected');
+  assert.equal(validateEvent({ ...workspaceShapeFixture, chats: 'seven' }), false, 'string count rejected');
+  // A missing count is not a shape snapshot.
+  const missing = { ...workspaceShapeFixture }; delete missing.peakChats;
+  assert.equal(validateEvent(missing), false, 'missing count rejected');
+  // The closed-key set: any key outside the shape rejects the event — this is
+  // the structural guarantee that no identifier (a name, a path, a host) can
+  // ride the counts-only channel.
+  assert.equal(validateEvent({ ...workspaceShapeFixture, name: 'refactor auth' }), false, 'injected name key rejected');
+  assert.equal(validateEvent({ ...workspaceShapeFixture, path: '/home/alice/secret' }), false, 'injected path key rejected');
+  assert.equal(validateEvent({ ...workspaceShapeFixture, host: 'deploy@prod.internal' }), false, 'injected host key rejected');
+  assert.equal(validateEvent({ ...workspaceShapeFixture, chatName: 'Refactor auth' }), false, 'a names-category identifier field is rejected on this type too');
+});
+
+test('workspace-shape honors the honest-peak invariant', () => {
+  assert.equal(validateEvent({ ...workspaceShapeFixture, panesOpen: 7 }), false, 'a peak SMALLER than its closing count is rejected');
+  assert.equal(validateEvent({ ...workspaceShapeFixture, chats: 10 }), false, 'the chats peak is held to the same invariant');
 });
 
 test('vendored validateEvent accepts platform-bearing fixtures (WARDEN-684 OS label)', () => {
