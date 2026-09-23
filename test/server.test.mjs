@@ -654,6 +654,325 @@ test('GET /summary startedAt is a plausible epoch-ms under the DEFAULT real cloc
   assert.ok(startedAt >= before && startedAt <= after, 'startedAt is the real boot instant (bracketed by handler construction)');
 });
 
+// ── GET /summary.readAt + .liveness — the SILENCE signal (WARDEN-1428) ────────
+// The roadmap bar verbatim: "Silence must mean 'nothing broke', not 'nobody was
+// looking.'" Every tally on /summary answers "did an ARRIVING event get LOST?"
+// (rejections / persistErrors / retention / deduped / unreadable) and all of them
+// correctly read ~zero on a receiver nothing is talking to — so a channel dark for
+// days reads `total: 829` with every tally clean, i.e. "healthy". `readAt` gives
+// the body its OWN clock (before it, /summary carried two epoch-ms timestamps and
+// no *now* to subtract them from), and `liveness` is the twin of `startedAt` for
+// the ACCEPTED-event stream.
+//
+// Two contracts are load-bearing and each has its own test below:
+//  - the boot-comparison boolean in BOTH polarities (the live outage IS the false
+//    polarity: the newest event predates the process's own boot, so it came off
+//    disk and this process has accepted nothing in its entire uptime);
+//  - the rejection half reads the tally's CUMULATIVE lastSeen, NEVER its 24h
+//    rolling timeline — the timeline is precisely what rolled past the live
+//    incident, so a test asserting an EMPTY timeline beside a POPULATED
+//    lastRejectionAt pins the whole point of the field.
+// Driven with fake req/res + an INJECTED readable store and the existing injected
+// fake clock; ZERO real fs, ZERO real network — same seam as the startedAt tests.
+
+// An event whose effective instant (receivedAt, WARDEN-692) is exactly `at`.
+function acceptedAt(at) {
+  return { schemaVersion: 1, type: 'error', runtime: 'main', timestamp: at, receivedAt: at, name: 'TypeError', message: 'm', frames: [] };
+}
+
+test('GET /summary carries a top-level readAt epoch-ms equal to the injected read clock', async () => {
+  const store = readableStore([]);
+  const handler = createRequestHandler({ store, now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(typeof body.readAt, 'number', 'readAt is a number (flat epoch-ms, like startedAt/firstSeen/lastSeen)');
+  assert.equal(body.readAt, 86_400_000, 'readAt equals the injected clock at READ time');
+});
+
+test('GET /summary readAt ADVANCES per read while startedAt stays frozen at boot', async () => {
+  // The pair is the whole point: startedAt is the PROCESS clock (read once at
+  // construction), readAt is the READ clock (re-read per request). A MUTATING fake
+  // clock proves they are different reads — if readAt were (wrongly) frozen at boot
+  // alongside startedAt, the two reads would be identical and this trips.
+  let tick = 0;
+  const now = () => 86_400_000 + 1000 * tick++;
+  const handler = createRequestHandler({ store: readableStore([]), now });
+  const res1 = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res1);
+  const b1 = JSON.parse(res1.body);
+  const res2 = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res2);
+  const b2 = JSON.parse(res2.body);
+  assert.equal(b1.startedAt, 86_400_000, 'startedAt is the boot instant');
+  assert.equal(b2.startedAt, b1.startedAt, 'startedAt is IDENTICAL across reads (frozen at boot)');
+  assert.ok(b2.readAt > b1.readAt, 'readAt ADVANCED — it is the READ clock, not the boot clock');
+  assert.ok(b1.readAt > b1.startedAt, 'the first read already happens after boot');
+});
+
+test('GET /summary readAt is a plausible epoch-ms under the DEFAULT real clock (backward-compatible shape)', async () => {
+  // A handler wired the production way — { store }, no `now`. Bracket the READ
+  // (not the construction) so the assertion is deterministic.
+  const handler = createRequestHandler({ store: readableStore([]) }); // no `now` → real clock
+  const res = fakeRes();
+  const before = Date.now();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const after = Date.now();
+  const { readAt } = JSON.parse(res.body);
+  assert.equal(typeof readAt, 'number', 'readAt is a number even under the default clock');
+  assert.ok(Number.isFinite(readAt) && readAt > 0, 'readAt is a finite positive epoch-ms');
+  assert.ok(readAt >= before && readAt <= after, 'readAt is the real read instant (bracketed by the request)');
+});
+
+test('GET /summary liveness.acceptedSinceBoot is FALSE when the newest event predates boot — the live-outage shape', async () => {
+  // THE ONE-COMPARISON PROOF, in the polarity the live production outage wears:
+  // the newest event this process holds landed BEFORE the process booted, so it
+  // came off disk and this process has accepted ZERO events in its whole uptime.
+  // Note `total` still reads a healthy-looking non-zero — that is exactly the
+  // false reassurance this field exists to break.
+  const handler = createRequestHandler({ store: readableStore([acceptedAt(4_000), acceptedAt(4_500)]), now: () => 10_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.total, 2, 'the corpus still reads non-zero — a clean tally is NOT evidence of liveness');
+  assert.equal(body.startedAt, 10_000, 'boot instant');
+  assert.equal(body.liveness.lastAcceptedAt, 4_500, 'the last-accepted instant is RESTATED inside the block (self-contained)');
+  assert.equal(body.liveness.lastAcceptedAt, body.lastSeen, 'and it equals the top-level lastSeen — the two can never disagree');
+  assert.equal(body.liveness.ageSinceLastAcceptedMs, 5_500, 'age is readAt - lastAcceptedAt, computable with NO external clock');
+  assert.equal(body.liveness.acceptedSinceBoot, false, 'lastAcceptedAt < startedAt → this process has accepted NOTHING since boot');
+});
+
+test('GET /summary liveness.acceptedSinceBoot is TRUE when an event arrived after boot (the other polarity)', async () => {
+  // A MUTATING clock so boot (first now()) precedes the event instant, which in
+  // turn precedes the read: a genuinely live channel.
+  let tick = 0;
+  const now = () => 1_000 + 1000 * tick++; // boot = 1000, read = 2000
+  const handler = createRequestHandler({ store: readableStore([acceptedAt(1_500)]), now });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.startedAt, 1_000, 'boot instant');
+  assert.equal(body.liveness.lastAcceptedAt, 1_500, 'the event landed AFTER boot');
+  assert.equal(body.liveness.acceptedSinceBoot, true, 'lastAcceptedAt >= startedAt → this process HAS accepted events');
+  assert.equal(body.liveness.ageSinceLastAcceptedMs, 500, 'age measured against the read clock');
+});
+
+test('GET /summary liveness on an EMPTY store: absent measurements read as ABSENT, never as zero', async () => {
+  // The stable, non-alarming empty shape. The age is `null` (no anchor exists) and
+  // emphatically NOT 0, which would read as "an event just arrived".
+  const handler = createRequestHandler({ store: readableStore([]), now: () => 86_400_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.liveness.lastAcceptedAt, null, 'no last-accepted instant exists on an empty store');
+  assert.equal(body.liveness.ageSinceLastAcceptedMs, null, 'an age with NO ANCHOR is null — never 0');
+  assert.equal(body.liveness.acceptedSinceBoot, false, 'nothing accepted → false (a definite answer, not null)');
+  assert.equal(body.liveness.lastRejectionAt, null, 'no rejection instant either');
+  assert.equal(body.liveness.ageSinceLastRejectionMs, null, 'and so no rejection age');
+  assert.deepEqual(body.liveness.mismatchedDeclaredVersions, [], 'no declared-version disagreement');
+});
+
+test('GET /summary liveness is present with a STABLE shape when NO rejection tally is wired (absent-dep parity)', async () => {
+  // Same convention as EMPTY_REJECTIONS / EMPTY_PERSIST_ERRORS: an absent optional
+  // dep yields the zeroed shape, so every caller reads one shape. Crucially the
+  // rejection instant is `null` (NO MEASUREMENT), NOT a fabricated "no rejections
+  // ever" signal — and the ACCEPTED half is fully populated regardless, because it
+  // does not depend on the tally at all.
+  const handler = createRequestHandler({ store: readableStore([acceptedAt(4_000)]), now: () => 10_000 }); // no `rejections` dep
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const body = JSON.parse(res.body);
+  assert.deepEqual(Object.keys(body.liveness).sort(), [
+    'acceptedSinceBoot', 'ageSinceLastAcceptedMs', 'ageSinceLastRejectionMs', 'lastAcceptedAt', 'lastRejectionAt', 'mismatchedDeclaredVersions',
+  ], 'the SAME six keys are present whether or not the optional tally is wired');
+  assert.equal(body.liveness.lastAcceptedAt, 4_000, 'the accepted half is independent of the rejection dep');
+  assert.equal(body.liveness.acceptedSinceBoot, false);
+  assert.equal(body.liveness.lastRejectionAt, null, 'an unwired tally is NO MEASUREMENT, not "no rejections ever"');
+  assert.deepEqual(body.liveness.mismatchedDeclaredVersions, []);
+});
+
+test('GET /summary liveness separates DRIFT (rejected recently, accepted nothing) from NO TRAFFIC AT ALL', async () => {
+  // The discrimination no other pair of fields on this surface makes. Both handlers
+  // are dark on the accepted stream; only the drifting one has a rejection instant
+  // and a named mismatched version.
+  const rejections = createRejectionTally({ now: () => 9_000 });
+  rejections.record({ status: 415, reason: 'unsupported telemetry schema version', declaredVersion: '6' });
+  const drifting = createRequestHandler({
+    store: readableStore([acceptedAt(4_000)]),
+    rejections,
+    schema: { SCHEMA_VERSION: 8, validateEvent: () => true },
+    now: () => 10_000,
+  });
+  const resA = fakeRes();
+  await drifting(fakeReq({ method: 'GET', url: '/summary' }), resA);
+  const drift = JSON.parse(resA.body).liveness;
+
+  const quiet = createRequestHandler({ store: readableStore([acceptedAt(4_000)]), rejections: createRejectionTally({ now: () => 9_000 }), now: () => 10_000 });
+  const resB = fakeRes();
+  await quiet(fakeReq({ method: 'GET', url: '/summary' }), resB);
+  const silent = JSON.parse(resB.body).liveness;
+
+  assert.equal(drift.acceptedSinceBoot, false, 'DRIFT: nothing accepted since boot');
+  assert.equal(drift.lastRejectionAt, 9_000, 'DRIFT: but traffic IS arriving — it is being rejected');
+  assert.equal(drift.ageSinceLastRejectionMs, 1_000, 'DRIFT: and how long ago, against the read clock');
+  assert.deepEqual(drift.mismatchedDeclaredVersions, ['6'], 'DRIFT: the disagreeing declared version, beside the verdict');
+
+  assert.equal(silent.acceptedSinceBoot, false, 'NO TRAFFIC: nothing accepted since boot either — identical on this axis');
+  assert.equal(silent.lastRejectionAt, null, 'NO TRAFFIC: and nothing arriving at all — THIS is what tells the two apart');
+  assert.deepEqual(silent.mismatchedDeclaredVersions, []);
+});
+
+test('GET /summary liveness.lastRejectionAt survives the 24h window roll that empties rejections.timeline', async () => {
+  // THE LOAD-BEARING TEST. The live failure is self-erasing: the client's drift
+  // circuit-breaker stops sending after ~3 rejections, the 24h rolling window then
+  // rolls, and `rejections.timeline` — the one temporal rejection signal — goes
+  // EMPTY. Reading the tally's CUMULATIVE lastSeen instead is what makes the
+  // incident still legible days later. An empty timeline BESIDE a populated
+  // lastRejectionAt is exactly the live shape.
+  let clock = 1_000;
+  const rejections = createRejectionTally({ now: () => clock });
+  rejections.record({ status: 415, reason: 'unsupported telemetry schema version', declaredVersion: '6' });
+  clock = 1_000 + 48 * 60 * 60 * 1000; // +48h: well past the 24h rolling window
+  const handler = createRequestHandler({
+    store: readableStore([acceptedAt(500)]),
+    rejections,
+    schema: { SCHEMA_VERSION: 8, validateEvent: () => true },
+    now: () => clock,
+  });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const body = JSON.parse(res.body);
+  assert.deepEqual(body.rejections.timeline.buckets, [], 'the rolling timeline has ROLLED — the 415s aged out, exactly as in production');
+  assert.equal(body.rejections.total, 1, 'the cumulative total survives the roll');
+  assert.equal(body.liveness.lastRejectionAt, 1_000, 'and so does the cumulative INSTANT — read from lastSeen, never from the timeline');
+  assert.equal(body.liveness.ageSinceLastRejectionMs, 48 * 60 * 60 * 1000, '48h since the last rejection, statable with no external clock');
+  assert.deepEqual(body.liveness.mismatchedDeclaredVersions, ['6'], 'and the drift diagnosis rides beside it');
+});
+
+test('GET /summary liveness.mismatchedDeclaredVersions excludes the receiver OWN version and the __overflow__ sentinel', async () => {
+  // Two exclusions. The receiver's own version is by definition not a mismatch
+  // (String()-compared, since histogram keys are strings and SCHEMA_VERSION is a
+  // number). `__overflow__` is the WARDEN-829 cardinality-cap SENTINEL, not a
+  // version any client declared — emitting it would hand a maintainer an aggregate
+  // bucket to go chase as if it were a real version. A non-numeric scanner value IS
+  // listed: it is a genuine disagreement the tally deliberately buckets verbatim.
+  const rejections = createRejectionTally({ now: () => 0, maxDeclaredVersions: 2 });
+  rejections.record({ status: 415, declaredVersion: '6' });
+  rejections.record({ status: 415, declaredVersion: '8' });   // the receiver's OWN version
+  rejections.record({ status: 415, declaredVersion: '7' });   // 3rd distinct, cap is 2 → __overflow__
+  rejections.record({ status: 415, declaredVersion: 'abc' }); // 4th distinct → __overflow__ too
+  const handler = createRequestHandler({
+    store: readableStore([]),
+    rejections,
+    schema: { SCHEMA_VERSION: 8, validateEvent: () => true },
+    now: () => 10_000,
+  });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const body = JSON.parse(res.body);
+  assert.ok('__overflow__' in body.rejections.byDeclaredVersion, 'precondition: the cap DID fold the later versions into the sentinel');
+  assert.ok('8' in body.rejections.byDeclaredVersion, 'precondition: the receiver own version IS in the histogram');
+  assert.deepEqual(body.liveness.mismatchedDeclaredVersions, ['6'], 'only the genuine disagreement — not "8" (own) and not "__overflow__" (sentinel)');
+});
+
+test('GET /summary liveness.mismatchedDeclaredVersions lists a non-numeric declared value verbatim, sorted', async () => {
+  // A scanner's non-numeric header ("abc", "") is a REAL disagreement with this
+  // receiver, and the tally buckets it verbatim precisely so real signal is never
+  // silently dropped. Under the cap it gets its own bucket and must be listed here
+  // too. Order is sorted for a deterministic response body.
+  const rejections = createRejectionTally({ now: () => 0 });
+  rejections.record({ status: 415, declaredVersion: '9' });
+  rejections.record({ status: 415, declaredVersion: 'abc' });
+  rejections.record({ status: 415, declaredVersion: '6' });
+  const handler = createRequestHandler({ store: readableStore([]), rejections, schema: { SCHEMA_VERSION: 8, validateEvent: () => true }, now: () => 10_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const { mismatchedDeclaredVersions } = JSON.parse(res.body).liveness;
+  assert.deepEqual(mismatchedDeclaredVersions, ['6', '9', 'abc'], 'every disagreeing value, sorted deterministically');
+});
+
+test('GET /summary liveness is UNSCOPED — a ?platform= filter cannot hide the channel-liveness signal', async () => {
+  // The operational side of the scoped/unscoped split, matching the reasoning
+  // already recorded beside the tallies: "is this CHANNEL receiving anything?" is a
+  // question about the RECEIVER, not about a release slice. If liveness were scoped,
+  // a maintainer filtering to a platform with no traffic would read "dark since
+  // boot" for a perfectly live receiver. `matched` and the top-level `lastSeen` DO
+  // scope (that is their contract); `liveness.lastAcceptedAt` deliberately does not.
+  let tick = 0;
+  const now = () => 1_000 + 1000 * tick++; // boot = 1000, read = 2000
+  const handler = createRequestHandler({
+    store: readableStore([{ ...acceptedAt(1_500), platform: 'darwin' }]),
+    now,
+  });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?platform=win32' }), res);
+  const body = JSON.parse(res.body);
+  assert.equal(body.matched, 0, 'the SCOPED aggregates are correctly empty for win32');
+  assert.equal(body.lastSeen, null, 'and the scoped lastSeen is null');
+  assert.equal(body.liveness.lastAcceptedAt, 1_500, 'but liveness reads the UNSCOPED stream — the receiver IS receiving');
+  assert.equal(body.liveness.acceptedSinceBoot, true, 'so the filter cannot manufacture a false "dark since boot"');
+});
+
+test('GET /summary liveness ages are computed against the SAME instant the body reports as readAt', async () => {
+  // Internal consistency: one now() read per request serves readAt AND every age,
+  // so a consumer can reproduce each age by subtracting from readAt. A MUTATING
+  // clock would expose a second read (two different anchors in one body).
+  let tick = 0;
+  const now = () => 1_000 + 1000 * tick++;
+  const rejections = createRejectionTally({ now: () => 1_200 });
+  rejections.record({ status: 415, declaredVersion: '6' });
+  const handler = createRequestHandler({ store: readableStore([acceptedAt(1_100)]), rejections, now });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const { readAt, liveness } = JSON.parse(res.body);
+  assert.equal(liveness.ageSinceLastAcceptedMs, readAt - liveness.lastAcceptedAt, 'the accepted age reproduces from readAt exactly');
+  assert.equal(liveness.ageSinceLastRejectionMs, readAt - liveness.lastRejectionAt, 'and so does the rejection age — ONE anchor, not two');
+});
+
+test('GET /summary liveness carries NO verdict word and NO threshold — instants, ages and booleans only', async () => {
+  // Explicitly out of scope per the ticket: report the data, never label the channel
+  // "broken" / "stale" / "degraded". Naming an outage is the READER's judgement.
+  // This pins that boundary so a later "helpful" status string cannot slip in.
+  const rejections = createRejectionTally({ now: () => 0 });
+  rejections.record({ status: 415, declaredVersion: '6' });
+  const handler = createRequestHandler({ store: readableStore([acceptedAt(1)]), rejections, schema: { SCHEMA_VERSION: 8, validateEvent: () => true }, now: () => 10_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const { liveness } = JSON.parse(res.body);
+  for (const [key, value] of Object.entries(liveness)) {
+    if (key === 'mismatchedDeclaredVersions') {
+      assert.ok(Array.isArray(value), 'the declared-version list is an array of bounded histogram KEYS');
+      continue;
+    }
+    assert.ok(typeof value === 'number' || typeof value === 'boolean' || value === null, `${key} is an epoch-ms / age / boolean / null — never a verdict string`);
+  }
+  const json = JSON.stringify(liveness).toLowerCase();
+  for (const word of ['broken', 'stale', 'degraded', 'unhealthy', 'healthy', 'ok', 'warn']) {
+    assert.equal(json.includes(word), false, `no verdict word "${word}" anywhere in the block`);
+  }
+});
+
+test('GET /summary liveness echoes NO event payloads or extended-tier identifiers', async () => {
+  // Same trust posture as every sibling tally: bounded output only — counts,
+  // booleans, epoch-ms and already-bounded declared-version keys.
+  const loud = {
+    ...acceptedAt(1_000),
+    name: 'TypeError',
+    message: 'super secret stack detail',
+    chatName: 'Refactor auth',
+    sessionName: 'claude-7b3a2f1',
+  };
+  const handler = createRequestHandler({ store: readableStore([loud]), now: () => 10_000 });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const json = JSON.stringify(JSON.parse(res.body).liveness);
+  assert.equal(json.includes('Refactor auth'), false, 'no chatName');
+  assert.equal(json.includes('claude-7b3a2f1'), false, 'no sessionName');
+  assert.equal(json.includes('super secret stack detail'), false, 'no message');
+  assert.equal(json.includes('TypeError'), false, 'no error name — only instants, ages and booleans');
+});
+
 // ── SCOPED /summary — ?type= / ?platform= / ?appVersion= / ?since= (WARDEN-727) ─
 // The scoped-OVERVIEW complement to /events' scoped drill-down: the SAME conjunctive
 // filters select which ALREADY-redacted, ALREADY-validated events get aggregated, so

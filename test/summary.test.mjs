@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, summarizeTimeline, summarizeStallsTimeline } from '../summary.mjs';
+import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant } from '../summary.mjs';
 
 // Canonical valid events (verbatim shapes ingest persists — one per base type).
 const validError = {
@@ -1488,4 +1488,69 @@ test('summarizeStallsTimeline bySource is bounded too (same class of client key)
   assert.equal(sources.length, CLIENT_HISTOGRAM_CAP + 1, 'capped + overflow');
   assert.ok(sources.every((k) => k.length <= CLIENT_KEY_MAX_LENGTH), 'every source key is length-bounded');
   assert.equal(tl.buckets[0].bySource['__overflow__'].count, 3, 'overflow counted');
+});
+
+// ── lastAcceptedInstant (WARDEN-1428) ────────────────────────────────────────
+// The newest effective instant across a batch — i.e. WHEN the newest ACCEPTED
+// event landed. PURE, single-arg, no clock, exactly like summarize(). It backs
+// the `/summary` `liveness` verdict, which RESTATES that instant so the verdict
+// is self-contained; the equal-to-lastSeen test below is the contract that keeps
+// the two from ever disagreeing inside one response body.
+
+test('lastAcceptedInstant returns the NEWEST effective instant across the batch', () => {
+  const events = [
+    { ...validError, timestamp: 100, receivedAt: 100 },
+    { ...validCrash, timestamp: 900, receivedAt: 900 },
+    { ...validStall, timestamp: 400, receivedAt: 400 },
+  ];
+  assert.equal(lastAcceptedInstant(events), 900, 'the maximum, regardless of array order');
+});
+
+test('lastAcceptedInstant PREFERS receivedAt over a skewed client timestamp', () => {
+  // Same WARDEN-692 skew-robustness summarize()/summarizeTimeline already have: a
+  // client clock far in the future must not push the apparent last-accepted instant.
+  const events = [{ ...validError, timestamp: 9_999_999, receivedAt: 500 }];
+  assert.equal(lastAcceptedInstant(events), 500, 'the RECEIVER stamp wins when present');
+});
+
+test('lastAcceptedInstant falls back to timestamp when receivedAt is absent (old persisted events)', () => {
+  const events = [{ ...validError, timestamp: 700 }]; // pre-annotation shape, no receivedAt
+  assert.equal(lastAcceptedInstant(events), 700, 'the client timestamp is the documented fallback');
+});
+
+test('lastAcceptedInstant is null on an empty / non-array input — ABSENCE, never 0', () => {
+  // `0` would read as "an event just arrived at the epoch" — the precise false
+  // reassurance the liveness block exists to prevent. Mirrors firstSeen/lastSeen.
+  assert.equal(lastAcceptedInstant([]), null, 'empty store → null');
+  assert.equal(lastAcceptedInstant(undefined), null, 'non-array → null (total, like summarize)');
+  assert.equal(lastAcceptedInstant(null), null);
+  assert.equal(lastAcceptedInstant('nope'), null);
+});
+
+test('lastAcceptedInstant is skip-robust: malformed entries and non-finite instants never crash or count', () => {
+  const events = [
+    null,
+    'garbage',
+    42,
+    { ...validError, timestamp: undefined, receivedAt: undefined },
+    { ...validError, timestamp: NaN, receivedAt: NaN },
+    { ...validError, timestamp: 'later', receivedAt: 'later' },
+    { ...validError, timestamp: Infinity, receivedAt: Infinity },
+    { ...validError, timestamp: 250, receivedAt: 250 },
+  ];
+  assert.equal(lastAcceptedInstant(events), 250, 'only the one FINITE instant counts; nothing throws');
+});
+
+test('lastAcceptedInstant returns exactly summarize().lastSeen for the SAME array (cannot drift)', () => {
+  // The load-bearing contract: /summary serves both in one body, so a divergence
+  // would make the response contradict itself. Both read the SAME shared
+  // _effectiveInstant rule, and this pins that they agree over a mixed batch.
+  const events = [
+    { ...validError, timestamp: 9_999_999, receivedAt: 100 }, // skewed client clock
+    { ...validCrash, timestamp: 880 },                        // no receivedAt → fallback
+    { ...validStall, timestamp: NaN, receivedAt: NaN },       // contributes nothing
+    null,                                                     // skipped
+  ];
+  assert.equal(lastAcceptedInstant(events), summarize(events).lastSeen, 'identical by construction');
+  assert.equal(lastAcceptedInstant(events), 880, 'and the value is the honest maximum');
 });
