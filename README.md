@@ -111,6 +111,15 @@ curl http://localhost:7421/summary
 #   "firstSeen": 1719820800000,
 #   "lastSeen": 1720000000000,
 #   "startedAt": 1719980000000,                 # epoch-ms this receiver (re)booted — the observation window for the tallies below
+#   "readAt": 1720000400000,                    # epoch-ms THIS response was produced — the read's own clock; subtract it from any timestamp above to get an age
+#   "liveness": {                               # is the channel RECEIVING? the twin of startedAt for the ACCEPTED-event stream (WARDEN-1428)
+#     "lastAcceptedAt": 1720000000000,          # when the newest ACCEPTED event landed (equal to top-level lastSeen on an UNFILTERED read — on a filtered read lastSeen is scoped and this is not, see the unscoped note below — restated so the verdict is self-contained); null on an empty store
+#     "ageSinceLastAcceptedMs": 400000,         # readAt - lastAcceptedAt; null when there is no anchor (NEVER 0)
+#     "acceptedSinceBoot": true,                # lastAcceptedAt >= startedAt. FALSE = this process has accepted ZERO events in its entire uptime
+#     "lastRejectionAt": 1720000099000,         # cumulative last rejection instant (from rejections.lastSeen, NOT the 24h timeline); null = nothing arriving at all
+#     "ageSinceLastRejectionMs": 301000,        # readAt - lastRejectionAt; null when there is no anchor
+#     "mismatchedDeclaredVersions": ["3", "5"]  # declared versions that DISAGREE with this receiver (own version + the __overflow__ sentinel excluded)
+#   },
 #   "rejections": {
 #     "total": 13,                          # count of hard-rejected requests
 #     "byStatus": { "415": 11, "401": 2 },  # histogram keyed by HTTP status
@@ -177,7 +186,8 @@ identifiers (chat/session names). `total` is the record count; `byType` is alway
 `{ error, crash, performance-stall, operational-metrics, server-stall }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
 error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen`/`lastSeen` bound the
 observed time window (`null` on an empty store); `startedAt` is the epoch-ms at which **this receiver
-(re)booted**. A fresh receiver with no traffic returns `total: 0` with zeroed counters.
+(re)booted**; `readAt` is the epoch-ms at which **this response was produced**. A fresh receiver with no
+traffic returns `total: 0` with zeroed counters.
 
 `startedAt` is the key that makes the **restart-wiped** tallies below (`rejections`, `persistErrors`,
 `retention`, `deduped`) interpretable. All four are in-memory and zeroed on every restart BY DESIGN — a
@@ -196,6 +206,79 @@ genuinely reflect that whole window. `startedAt` is itself receiver-local and in
 survive a restart, so after a restart it shows the **new** boot time, immediately self-documenting that the
 tallies were just zeroed. It is operational metadata about the process (an epoch-ms, never raw events or
 extended-tier identifiers), exactly like `firstSeen`/`lastSeen`, and is never persisted.
+
+`readAt` is the **read's own clock** — the epoch-ms at which this response was produced. Before it,
+`/summary` served two epoch-ms timestamps (`startedAt`, `lastSeen`) and **no `now` to subtract them from**,
+so the surface could not state its own staleness and every consumer had to supply an external clock to
+learn anything temporal from it. With `readAt`, a reader holding **only the response body** can compute the
+age of every timestamp on it. It is the sibling of `startedAt` with one deliberate difference: `startedAt`
+is the **process** clock (read once at boot and frozen), `readAt` is the **read** clock (re-read on every
+request), so the pair also tells you the receiver's uptime at the moment of the read. It is read **once**
+per request and reused for every age inside `liveness` below, so a single response body can never carry two
+ages measured against two different instants. Flat top-level epoch-ms, exactly like `startedAt` /
+`firstSeen` / `lastSeen`; operational metadata about the read, never persisted.
+
+`liveness` is the twin of `startedAt` for the **accepted-event stream**: it answers *"is this channel
+receiving anything?"*, which **no other field on this surface can** (WARDEN-1428). Every tally above answers
+a different question — *"did an **arriving** event get lost?"* — and `rejections`, `persistErrors`,
+`retention`, `deduped` and `unreadable` all correctly read ~zero on a receiver **nothing is talking to**. So
+a channel that has been dark for days reads `total: 829` with every tally clean, and an agent reading
+`/summary` to answer "what is actually happening for the owner" concludes *"healthy"* and is wrong by two
+days. `timeline` is the closest existing signal and still cannot discriminate: an empty `timeline` is
+shape-identical between a dark channel and a legitimately quiet one (app closed, consent off, owner asleep).
+
+The failure this makes legible is **self-erasing by design**, which is why a rolling-window signal provably
+cannot carry it. A client/receiver schema-version skew `415`s every batch; the client's drift
+circuit-breaker then **correctly stops sending** within three requests — converting a loud rejection storm
+into total silence. The 24h `rejections.timeline` then rolls, the `415`s age out, and the only remaining
+evidence is an absence. `liveness` therefore reads the rejection tally's **cumulative** `lastSeen` and
+`byDeclaredVersion`, **never** its rolling timeline: a cumulative instant survives exactly the window roll
+that erased the incident.
+
+The six fields let you answer four questions with no external clock:
+
+- **How long since the last accepted event?** `lastAcceptedAt` (the same instant as the top-level `lastSeen`
+  **on an unfiltered read** — on a filtered read `lastSeen` is scoped and this is not, see the unscoped note
+  below — restated inside the block so the verdict is self-contained) and `ageSinceLastAcceptedMs` against
+  `readAt`. The age is `null` on an empty store — an absent measurement reads as **absent**, never as `0`,
+  which would say "an event just arrived". It is deliberately **unclamped**: a negative age means the
+  receiver's own clock moved backwards (a restart onto a rewound clock, an NTP step), which is a real signal
+  and better shown than hidden.
+- **Has this process accepted anything at all since it booted?** `acceptedSinceBoot` — `lastAcceptedAt >=
+  startedAt`. **`false` is positive proof this receiver process has accepted zero events in its entire
+  uptime**: the newest event it holds predates its own boot, so it came off disk. That single comparison is
+  the shape a real outage wears, and without this field it is unanswerable without doing the arithmetic by
+  hand — with nothing on the surface prompting a reader to try. An empty store reads `false` (nothing has
+  been accepted — a definite answer, not `null`).
+- **Is traffic arriving and being rejected, or not arriving at all?** `lastRejectionAt` /
+  `ageSinceLastRejectionMs`. A recent rejection instant beside `acceptedSinceBoot: false` is **drift**
+  (traffic is arriving and being refused); `lastRejectionAt: null` beside the same is **nothing arriving at
+  all** (app closed / consent off). No other pair of fields on this surface separates those two.
+- **Which declared schema versions disagree with this receiver?** `mismatchedDeclaredVersions` — the
+  distinct keys of `rejections.byDeclaredVersion` that differ from the receiver's own `SCHEMA_VERSION`, so
+  the drift diagnosis rides beside the liveness verdict instead of requiring a second inference. It excludes
+  the receiver's own version (by definition not a mismatch) and the `__overflow__` **sentinel** (a
+  cardinality-cap artifact, not a version any client declared — emitting it would hand you an aggregate
+  bucket to chase as if it were real). Because it is a subset of an already-capped key set it inherits that
+  bound and adds no new unbounded surface. A scanner's non-numeric value (`"abc"`) **is** listed: it is a
+  genuine disagreement, and the tally buckets it verbatim precisely so real signal is never silently dropped.
+
+`liveness` **reports; it does not judge**. There is no threshold and no verdict word anywhere in the block —
+it carries instants, ages and booleans only, and deliberately never labels the channel "broken", "stale" or
+"degraded". Naming an outage is the reader's judgement; the job here is to make the states distinguishable.
+
+Unlike the scoped aggregates, `liveness` is **unscoped** by the `?type=` / `?platform=` / `?appVersion=` /
+`?since=` filters — the same reasoning recorded beside the operational tallies. "Is this **channel**
+receiving anything?" is a question about the **receiver**, not about a release slice; if it were scoped, a
+maintainer filtering to a platform with no recent traffic would read "dark since boot" for a perfectly live
+receiver. It is present on **every** read whether or not the optional rejection tally is wired: an unwired
+tally yields `lastRejectionAt: null` — **no measurement**, never a fabricated "no rejections ever" — while
+the accepted half stays fully populated, since it does not depend on the tally at all. Every value is
+derived per read from state the handler already holds (the frozen boot instant, the events it already read,
+the rejection snapshot it already takes, its own schema version): no new state, no new tally, no new store
+read, and no clock call beyond the one already made per request. Receiver-local and in-memory, with the same
+trust posture as `startedAt` and every sibling tally — bounded output only (epoch-ms, ages, booleans and the
+already-bounded declared-version keys), never event payloads, identifiers, or raw header values.
 
 `rejections` is a bounded, in-memory tally of the requests the receiver **hard-rejected** — a `401` at the
 auth gate, a `404` routing miss, a `400` malformed body, or a `400`/`415`/`422` from schema validation. It

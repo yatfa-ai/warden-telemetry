@@ -65,7 +65,7 @@ import { dirname, join } from 'node:path';
 import { SCHEMA_VERSION, validateEvent } from './schema.ts';
 import { createNdjsonStore, fileSink, fileSource, fileRewrite, fileSeenKeysSource, fileSeenKeysSink } from './store.mjs';
 import { ingest } from './ingest.mjs';
-import { summarize, summarizeTimeline, summarizeStallsTimeline, DEFAULT_TIMELINE_MAX_BUCKETS, DEFAULT_TIMELINE_WINDOW_MS } from './summary.mjs';
+import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, DEFAULT_TIMELINE_MAX_BUCKETS, DEFAULT_TIMELINE_WINDOW_MS } from './summary.mjs';
 import { selectEvents, filterEvents, resolveLimit, resolveOffset } from './events.mjs';
 
 export const DEFAULT_PORT = 7421;
@@ -565,6 +565,15 @@ export function createBoundedRollingTimeline({
 // eviction) so an early legit version is never evicted by a later adversarial flood.
 export const DEFAULT_REJECTION_MAX_DECLARED_VERSIONS = 32;
 
+// Sentinel key for the SINGLE overflow bucket in `byDeclaredVersion` (WARDEN-829).
+// A client value that literally equals `__overflow__` is indistinguishable from the
+// aggregate (benign: same bound, identical count semantics). Chosen to be an
+// unlikely real schema version. Module-scoped (WARDEN-1428) because the liveness
+// composer must EXCLUDE it when listing mismatched declared versions — the sentinel
+// is a cap artifact, not a version a client declared — and a second spelling of the
+// key would silently let it leak through as a real version the day either copy moved.
+export const REJECTION_OVERFLOW_KEY = '__overflow__';
+
 // The zeroed shape returned when no tally is wired OR no rejection has been
 // recorded yet — identical to a fresh tally's snapshot(), so an idle receiver
 // reads the same zeroed `rejections` whether or not the tally is wired (parity
@@ -648,10 +657,10 @@ export function createRejectionTally({
   const maxDeclared = Number.isFinite(maxDeclaredVersions) && maxDeclaredVersions >= 1
     ? Math.floor(maxDeclaredVersions)
     : DEFAULT_REJECTION_MAX_DECLARED_VERSIONS;
-  // Sentinel for the single overflow bucket. A client value that literally equals
-  // `__overflow__` is indistinguishable from the aggregate (benign: same bound, the
-  // count semantics are identical). Chosen to be an unlikely real schema version.
-  const OVERFLOW_KEY = '__overflow__';
+  // Sentinel for the single overflow bucket — the module-scoped
+  // REJECTION_OVERFLOW_KEY (hoisted by WARDEN-1428 so the /summary liveness
+  // composer excludes exactly this key, from one definition).
+  const OVERFLOW_KEY = REJECTION_OVERFLOW_KEY;
 
   // The bounded rolling-window timeline (WARDEN-834): the stateful twin of the
   // pure summarizeTimeline, now shared by all three tallies via a single helper.
@@ -1333,6 +1342,147 @@ export function createSeenKeys({
   };
 }
 
+// ── ACCEPTED-STREAM LIVENESS (WARDEN-1428) ───────────────────────────────────
+// The twin of `startedAt` (WARDEN-768) for the ACCEPTED-event stream, closing the
+// last hole the roadmap's own bar names: "Silence must mean 'nothing broke', not
+// 'nobody was looking.'"
+//
+// Every tally on /summary answers "did an ARRIVING event get lost?" —
+// `rejections`, `persistErrors`, `retention`, `deduped`, `unreadable` are each a
+// loss counter, and all correctly read ~zero on a receiver nothing is talking to.
+// NOT ONE of them answers "is anything ARRIVING?". `timeline` is the closest, and
+// an empty `timeline` is shape-identical between a dark channel and a legitimately
+// quiet one (app closed, consent off) — it cannot discriminate. So a receiver that
+// has accepted NOTHING for days reads `total: 829`, every tally clean: "healthy".
+//
+// The failure this makes legible is SELF-ERASING BY DESIGN, which is why a
+// rolling-window signal provably cannot carry it. A client/receiver schema skew
+// 415s every batch; the client's drift circuit-breaker (WARDEN-614/631) then
+// correctly STOPS SENDING within three requests — converting the loud rejection
+// storm into total silence. The 24h `rejections.timeline` rolls, the 415s age out,
+// and the only remaining evidence is an absence. This block therefore reads the
+// tally's CUMULATIVE `lastSeen` / `byDeclaredVersion` snapshot, NEVER its rolling
+// timeline: a cumulative last-instant survives exactly the window roll that erased
+// the incident.
+//
+// TRUST POSTURE — identical to `startedAt` and every sibling tally: epoch-ms,
+// ages, booleans and the already-bounded declared-version KEYS only. No event
+// payloads, no identifiers, no raw header values beyond keys the WARDEN-829 cap
+// already bounds. Receiver-local, in-memory, derived per read from state the
+// handler ALREADY holds (the frozen boot instant, the events it already read, the
+// rejection snapshot it already takes, its own schema version) — no new state, no
+// new tally, no new store read, no clock call beyond the one already made.
+//
+// DELIBERATELY NO VERDICT WORD AND NO THRESHOLD: it reports instants, ages and
+// booleans and never labels the channel "broken" / "stale" / "degraded". Naming an
+// outage is the READER's judgement; the job here is to make the two states
+// distinguishable, not to alarm.
+
+// The "no measurement" shape of the REJECTION half of the liveness verdict, used
+// when no rejection tally is wired. Mirrors the EMPTY_REJECTIONS /
+// EMPTY_PERSIST_ERRORS discipline: an absent dep must yield the SAME stable shape a
+// wired-but-idle tally yields, so every caller reads one shape whether or not the
+// optional dep is present. Crucially it must NOT manufacture a false "no rejections
+// ever" signal — so the instant is `null` (NO MEASUREMENT) rather than a fabricated
+// timestamp or a `0`, exactly as `lastSeen` is `null` on an empty store. Note a
+// wired-but-idle tally reads IDENTICALLY (its `lastSeen` is `null` and its
+// `byDeclaredVersion` is `{}`), which is the parity the sibling EMPTY_* constants
+// are built for.
+const EMPTY_REJECTION_LIVENESS = Object.freeze({
+  lastRejectionAt: null,
+  ageSinceLastRejectionMs: null,
+  mismatchedDeclaredVersions: Object.freeze([]),
+});
+
+/**
+ * Compose the bounded accepted-stream liveness verdict for GET /summary
+ * (WARDEN-1428). Handler-composed, NOT folded into `summarize()` — which is a
+ * documented, tested PURE single-argument function of the event array with no
+ * clock — exactly as `timeline` / `stallsTimeline` are composed for the same
+ * reason.
+ *
+ * @param {{
+ *   readAt: number,
+ *   startedAt: number,
+ *   lastAcceptedAt: number | null,
+ *   rejectionSnapshot: { lastSeen?: number | null, byDeclaredVersion?: Record<string, number> } | null,
+ *   schemaVersion: unknown,
+ * }} input
+ * @returns {{
+ *   lastAcceptedAt: number | null,
+ *   ageSinceLastAcceptedMs: number | null,
+ *   acceptedSinceBoot: boolean,
+ *   lastRejectionAt: number | null,
+ *   ageSinceLastRejectionMs: number | null,
+ *   mismatchedDeclaredVersions: string[],
+ * }}
+ * @private
+ */
+function _composeLiveness({ readAt, startedAt, lastAcceptedAt, rejectionSnapshot, schemaVersion }) {
+  // An age with no anchor is `null`, NEVER `0` — `0` reads as "an event just
+  // arrived", the precise false reassurance this block exists to prevent. Same
+  // distinction the sibling fields already model (firstSeen/lastSeen are `null` on
+  // an empty store, not `0`).
+  //
+  // Deliberately UNCLAMPED: a stored instant AHEAD of the read's clock yields a
+  // NEGATIVE age, which is the honest arithmetic and a real skew signal (the
+  // receiver stamps `receivedAt` itself, so this means its own clock moved
+  // backwards — a restart onto a rewound clock, an NTP step). Clamping it to `0`
+  // would render exactly the "an event just arrived" reassurance the `null` rule
+  // one line up exists to forbid, on a receiver whose clock is untrustworthy.
+  const ageSinceLastAcceptedMs = lastAcceptedAt === null ? null : readAt - lastAcceptedAt;
+
+  // THE ONE-COMPARISON PROOF. `lastAcceptedAt < startedAt` means the newest event
+  // this process holds arrived BEFORE it booted — i.e. it came off disk and this
+  // process has accepted ZERO events in its entire uptime. That is exactly the
+  // shape the live outage wears, and today it is unanswerable without performing
+  // the comparison by hand, with nothing on the surface prompting a reader to try.
+  // An empty store reads `false`: nothing has been accepted, which is the honest
+  // answer (never `null` — "has this process accepted anything?" has a definite
+  // answer even with no events at all).
+  const acceptedSinceBoot = lastAcceptedAt !== null && lastAcceptedAt >= startedAt;
+
+  const accepted = { lastAcceptedAt, ageSinceLastAcceptedMs, acceptedSinceBoot };
+  if (!rejectionSnapshot) return { ...accepted, ...EMPTY_REJECTION_LIVENESS };
+
+  // The rejection instant is read from the tally's CUMULATIVE `lastSeen`, NOT its
+  // rolling `timeline` — see the block comment above: the timeline is precisely
+  // what rolled past the live incident. With it, "rejected recently, accepted
+  // nothing since boot" (drift) reads apart from "nothing arriving at all" (app
+  // closed / consent off), which no other pair of fields on this surface separates.
+  const rawLastRejection = rejectionSnapshot.lastSeen;
+  const lastRejectionAt = Number.isFinite(rawLastRejection) ? rawLastRejection : null;
+  const ageSinceLastRejectionMs = lastRejectionAt === null ? null : readAt - lastRejectionAt;
+
+  // The declared versions in DISAGREEMENT with this receiver — read off the
+  // EXISTING `byDeclaredVersion` histogram (populated only at the 415 seams, so it
+  // is the drift population by construction), so the drift diagnosis rides beside
+  // the liveness verdict instead of requiring a second inference.
+  //
+  // Two exclusions, both load-bearing:
+  //  - `__overflow__` is the WARDEN-829 cardinality-cap SENTINEL, not a declared
+  //    version any client sent. Emitting it would present an aggregate bucket as a
+  //    real version a maintainer could go chase. Dropping it PRESERVES that bound:
+  //    this list is a subset of an already-capped key set, so it inherits the ≤ N
+  //    bound and adds no new unbounded surface.
+  //  - the receiver's OWN version, which by definition is not a mismatch. String()
+  //    compared because the histogram keys are strings while `schema.SCHEMA_VERSION`
+  //    is a number — the same String() coercion the tally applies when bucketing.
+  // A non-numeric scanner value ("abc", "") is a genuine disagreement and IS listed:
+  // the tally deliberately buckets it verbatim, and silently dropping it here would
+  // re-open the "real signal silently dropped" hole the tally closed.
+  const ownVersion = String(schemaVersion);
+  const histogram = rejectionSnapshot.byDeclaredVersion;
+  const mismatchedDeclaredVersions =
+    histogram && typeof histogram === 'object'
+      ? Object.keys(histogram)
+          .filter((v) => v !== REJECTION_OVERFLOW_KEY && v !== ownVersion)
+          .sort()
+      : [];
+
+  return { ...accepted, lastRejectionAt, ageSinceLastRejectionMs, mismatchedDeclaredVersions };
+}
+
 /**
  * Build the request handler. `store` and `schema` are injected so the handler is
  * testable with a capturing store and WITHOUT a live port (tests call the handler
@@ -1408,6 +1558,10 @@ export function createSeenKeys({
  * unchanged when `now` is omitted (real clock). The timeline itself is ALWAYS
  * computed (it is a pure read over persisted `timestamp`s, like `summarize()`),
  * so every /summary response carries the field whether or not `now` is wired.
+ * The SAME dep is the boot clock for `startedAt` (WARDEN-768, read once at
+ * construction) and, since WARDEN-1428, the read clock for the top-level `readAt`
+ * plus every age inside `liveness` (read ONCE per request, so one body can never
+ * carry two ages measured against two different instants).
  *
  * `maxBodyBytes` (optional body cap, WARDEN-627, default 0 = unbounded): bounds
  * the POST /ingest request body — the one remaining unbounded INPUT after
@@ -1626,11 +1780,27 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           appVersion: searchParams.get('appVersion') ?? undefined,
           since: searchParams.has('since') ? Number(searchParams.get('since')) : undefined,
         });
+        // The READ's own clock (WARDEN-1428): ONE `now()` read per request, taken
+        // here and reused for the top-level `readAt` AND every age inside
+        // `liveness`. Read once rather than per-field so a body can never be
+        // internally inconsistent (two ages computed against two different
+        // instants). It uses the handler's ALREADY-INJECTED `now` dep — the same
+        // seam `startedAt` and the two timeline composers use — so it adds no new
+        // dependency and stays fake-clock testable; `summarizeTimeline` /
+        // `summarizeStallsTimeline` keep taking the `now` FUNCTION (their
+        // documented injected-clock contract, unchanged).
+        const readAt = now();
+        // The rejection snapshot, taken ONCE and shared by the `rejections`
+        // response key and the `liveness` block below — a second `.snapshot()`
+        // call could observe a rejection that landed between them, so one body
+        // would report a `lastSeen` its own liveness verdict disagreed with.
+        const rejectionSnapshot = rejections ? rejections.snapshot() : EMPTY_REJECTIONS;
         // Compose the bounded `rejections` tally, the bounded `persistErrors`
-        // tally, the bounded `deduped` tally, the bounded `retention` tally, AND
-        // the bounded `timeline` distribution here — NOT inside summarize().
+        // tally, the bounded `deduped` tally, the bounded `retention` tally, the
+        // bounded `timeline` distribution, AND the bounded `liveness` verdict
+        // (WARDEN-1428) here — NOT inside summarize().
         // summarize(filtered) stays a PURE single-arg function of the
-        // (already-filtered) event array (documented + tested that way); all five
+        // (already-filtered) event array (documented + tested that way); all six
         // are handler-composed, exactly the way the retention TRIGGER is
         // handler-injected rather than summarize-injected. `rejections`,
         // `persistErrors`, `deduped`, and `retention` are each the tally's
@@ -1638,7 +1808,10 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
         // shape for every caller). They are intentionally UNSCOPED — they tally
         // the REQUEST/OPERATIONAL seam (every rejection / persist site / dedup /
         // retention prune on THIS receiver), NOT the event subset; a
-        // platform/release filter must not hide receiver-health signal.
+        // platform/release filter must not hide receiver-health signal. `liveness`
+        // is UNSCOPED for that SAME reason (it answers "is this CHANNEL receiving
+        // anything?", a receiver question, not a release-slice one) — see its own
+        // comment at the response site.
         // `timeline` is ALWAYS computed — a pure read over the FILTERED events'
         // effective `receivedAt ?? timestamp`s measured back from the injected
         // `now` (default Date.now) — so the field is present for every caller,
@@ -1672,7 +1845,45 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           // tallies). Never persisted — operational metadata about the process,
           // counts/epoch-ms only, no JSONB allow-list concern.
           startedAt,
-          rejections: rejections ? rejections.snapshot() : EMPTY_REJECTIONS,
+          // `readAt` (WARDEN-1428): the READ's OWN clock — epoch-ms stating when
+          // THIS response was produced, from the single `now()` read above.
+          // Before it, /summary served 22 top-level keys and NOT ONE of them was
+          // the read's own clock: the surface carried two epoch-ms timestamps
+          // (`startedAt`, `lastSeen`) and no *now* to subtract them from, so it
+          // could not state its own staleness and EVERY consumer had to supply an
+          // external clock to learn anything temporal. With it, every timestamp
+          // already on this body becomes self-interpreting. Flat top-level
+          // epoch-ms in the same shape as `startedAt` / `firstSeen` / `lastSeen`.
+          // Unlike `startedAt` (frozen at boot) this is re-read PER REQUEST — it
+          // is the read's clock, not the process's.
+          readAt,
+          // `liveness` (WARDEN-1428): the bounded accepted-stream liveness verdict
+          // — the twin of `startedAt` for the ACCEPTED-event stream. See the
+          // _composeLiveness block comment for the full rationale (every existing
+          // tally answers "did an arriving event get LOST?"; none answers "is
+          // anything ARRIVING?", and the drift failure erases its own louder
+          // symptom into silence within three requests).
+          //
+          // UNSCOPED, on the same reasoning recorded beside the operational
+          // tallies above: "is this channel receiving anything at all?" is a
+          // question about the RECEIVER, not about a release slice, so a
+          // ?platform= / ?appVersion= filter must not be able to hide it. Hence
+          // `lastAcceptedInstant(events)` over the FULL array, never `filtered` —
+          // the field would otherwise read "dark since boot" for any maintainer
+          // who happened to scope to a platform with no recent traffic.
+          //
+          // ALWAYS present, wired or not: when no rejection tally is wired the
+          // rejection half falls back to the zeroed EMPTY_REJECTION_LIVENESS
+          // shape, exactly as `rejections` falls back to EMPTY_REJECTIONS — so
+          // the response shape is stable for every caller.
+          liveness: _composeLiveness({
+            readAt,
+            startedAt,
+            lastAcceptedAt: lastAcceptedInstant(events),
+            rejectionSnapshot: rejections ? rejectionSnapshot : null,
+            schemaVersion: schema.SCHEMA_VERSION,
+          }),
+          rejections: rejectionSnapshot,
           persistErrors: persistErrors ? persistErrors.snapshot() : EMPTY_PERSIST_ERRORS,
           retention: retentionHealth ? retentionHealth.snapshot() : EMPTY_RETENTION,
           deduped: deduped ? deduped.snapshot() : EMPTY_DEDUPED,

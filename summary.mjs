@@ -6,6 +6,15 @@
 //                                  / topSignatures / schemaVersions / appVersions
 //                                  / platforms / crashReasons / stalls / firstSeen
 //                                  / lastSeen).
+//   - `lastAcceptedInstant(events)` → the newest effective instant across the batch
+//                                  (WARDEN-1428) — i.e. WHEN the newest ACCEPTED
+//                                  event landed, or `null` on an empty store. Equal
+//                                  by construction to `summarize(events).lastSeen`
+//                                  (both read the same `_effectiveInstant` rule); it
+//                                  exists separately so the `/summary` handler can
+//                                  restate that instant inside its UNSCOPED liveness
+//                                  verdict in one cheap pass, without a second
+//                                  `summarize()` over the unfiltered array.
 //   - `summarizeTimeline(events)` → a bounded temporal distribution (event counts
 //                                  per time bucket over a rolling recent window,
 //                                  WARDEN-603) so a maintainer can distinguish a
@@ -344,6 +353,64 @@ function _stallSnapshot({ count, sum, finiteCount, min, max }) {
 }
 
 /**
+ * Resolve an event's EFFECTIVE observation instant — the single shared rule every
+ * time-axis in this module keys off (WARDEN-1428 extracted it; the expression
+ * predates it and was previously written out three times).
+ *
+ * PREFERS the receiver's `receivedAt` (when IT saw the batch, WARDEN-692) and falls
+ * back to the client's `timestamp` only when `receivedAt` is absent — so a skewed
+ * client clock cannot push an event's apparent time around. Returns `null` (never
+ * `0`, never `NaN`) for a non-object entry or a non-finite instant, so every caller
+ * gets the same skip-robust "no measurement" sentinel.
+ *
+ * It is shared rather than copied because `summarize()`'s `lastSeen`,
+ * `lastAcceptedInstant()` (which RESTATES that same instant for the liveness
+ * verdict) and `_assignTimelineBuckets()`'s window math must never disagree about
+ * WHEN an event happened — a divergence there would make `/summary` contradict
+ * itself.
+ *
+ * @param {unknown} event
+ * @returns {number | null} the finite effective epoch-ms, or `null`
+ * @private
+ */
+function _effectiveInstant(event) {
+  if (!event || typeof event !== 'object') return null;
+  const when = event.receivedAt ?? event.timestamp;
+  // Number.isFinite is false for every non-number, so this subsumes the typeof guard.
+  return Number.isFinite(when) ? when : null;
+}
+
+/**
+ * The most recent effective instant across a batch of persisted events — i.e. WHEN
+ * the newest ACCEPTED event landed (WARDEN-1428).
+ *
+ * Sibling of `summarize()` / `summarizeTimeline()`: PURE, single-arg, no clock, no
+ * fs, no deps. It returns exactly the value `summarize(events).lastSeen` returns
+ * for the same array — by construction, since both read `_effectiveInstant` — so it
+ * can never drift from the `lastSeen` a caller reads beside it. It exists as its own
+ * function because the `/summary` handler needs that instant over the UNSCOPED event
+ * array (the channel-liveness question is operational, so a `?platform=` filter must
+ * not be able to hide it) while `summarize()` runs over the SCOPED subset; computing
+ * it separately is one cheap pass instead of a second full `summarize()`.
+ *
+ * `null` on an empty store / an array with no finite instant — a genuine ABSENCE of
+ * measurement, never `0`, which would read as "an event just arrived at the epoch".
+ *
+ * @param {unknown} [events]
+ * @returns {number | null} the newest effective epoch-ms, or `null`
+ */
+export function lastAcceptedInstant(events) {
+  const list = Array.isArray(events) ? events : [];
+  let latest = null;
+  for (const event of list) {
+    const when = _effectiveInstant(event);
+    if (when === null) continue;
+    if (latest === null || when > latest) latest = when;
+  }
+  return latest;
+}
+
+/**
  * Summarize a batch of persisted telemetry events into aggregate signal.
  *
  * Pure and total: a non-array (or empty) input yields a fully-zeroed summary so
@@ -423,7 +490,10 @@ export function summarize(events) {
     if (!event || typeof event !== 'object') continue;
     total += 1;
 
-    const { type, name, schemaVersion, timestamp, appVersion, platform, runtime, reason, lagMs, source } = event;
+    // `timestamp` is deliberately NOT destructured here: the ONLY consumer of it in
+    // this loop was the time-bounds fallback, which now reads it through the shared
+    // `_effectiveInstant(event)` helper (WARDEN-1428).
+    const { type, name, schemaVersion, appVersion, platform, runtime, reason, lagMs, source } = event;
 
     if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(byType, type)) {
       byType[type] += 1;
@@ -531,9 +601,12 @@ export function summarize(events) {
     // the skew-robustness the timeline / retention / ?since surfaces already
     // have (summarizeTimeline / store applyRetention / selectEvents). Old
     // persisted events (pre-annotation, no receivedAt) still read via the
-    // fallback, so nothing regresses and no migration is needed.
-    const when = event.receivedAt ?? timestamp;
-    if (typeof when === 'number' && Number.isFinite(when)) {
+    // fallback, so nothing regresses and no migration is needed. The rule itself
+    // lives in the shared `_effectiveInstant` helper (WARDEN-1428) so `lastSeen`
+    // here and `lastAcceptedInstant()` — which RESTATES this instant inside the
+    // `/summary` liveness verdict — can never disagree about WHEN an event happened.
+    const when = _effectiveInstant(event);
+    if (when !== null) {
       if (firstSeen === null || when < firstSeen) firstSeen = when;
       if (lastSeen === null || when > lastSeen) lastSeen = when;
     }
@@ -638,10 +711,12 @@ function _assignTimelineBuckets(events, { now, maxBuckets, windowMs }) {
   // every in-window event maps to one of at most `maxBuckets` grid slots.
   const slots = new Map();
   for (const event of list) {
-    // Skip-robust: a non-object entry must not crash the distribution.
-    if (!event || typeof event !== 'object') continue;
-    const when = event.receivedAt ?? event.timestamp;
-    if (typeof when !== 'number' || !Number.isFinite(when)) continue;
+    // Skip-robust: a non-object entry must not crash the distribution. The
+    // effective-instant rule (receivedAt preferred, timestamp fallback, non-finite
+    // → null) is the SHARED `_effectiveInstant` helper (WARDEN-1428), so the window
+    // math here can never disagree with `summarize()`'s firstSeen/lastSeen.
+    const when = _effectiveInstant(event);
+    if (when === null) continue;
     if (when < windowStart || when > currentTime) continue;
     let idx = Math.floor((when - windowStart) / bucketMs);
     // The `when === currentTime` edge lands exactly on the top boundary; fold it
