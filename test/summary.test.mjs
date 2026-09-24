@@ -5,8 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant } from '../summary.mjs';
-
+import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP } from '../summary.mjs';
 // Canonical valid events (verbatim shapes ingest persists — one per base type).
 const validError = {
   schemaVersion: 1,
@@ -49,6 +48,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.deepEqual(s.platforms, {});
   assert.deepEqual(s.byRuntime, {});
   assert.deepEqual(s.crashReasons, {});
+  assert.deepEqual(s.operations, {});
   assert.equal(s.firstSeen, null);
   assert.equal(s.lastSeen, null);
 });
@@ -724,6 +724,247 @@ test('stalls: a sourceless stall is counted overall but not bucketed in bySource
   });
 });
 
+// ── PER-OPERATION AGGREGATE (WARDEN-1435) ─────────────────────────────────────
+// `operations` is the per-operation axis the `operational-metrics` COUNT
+// (`byType`) discards: a day of 5-minute windows carrying every /api route's
+// latency reduces on `byType` to `"operational-metrics": 288`. It folds every
+// window's `operations[]` across the retained set into bounded per-NAME
+// buckets carrying count / okCount / failCount / min / avg / max — the
+// crashReasons-style histogram discipline with a stall-style magnitude inside
+// each bucket. NO histogram axis is projected (see the mixed-scales test
+// below for why); the numbers are scale-free and always comparable.
+
+// Copyable fixtures. The server-side scale (8 boundaries / 9 buckets — the
+// DEFAULT_BUCKET_BOUNDARIES_MS shape requestTelemetry ships) and the renderer
+// scale (12 boundaries / 13 buckets — PANE_LATENCY_BOUNDARIES_MS, reaching the
+// wire through buildOperationalMetricsEvent) are the two REAL scales the
+// receiver's store holds for this ONE event type.
+const SERVER_BOUNDARIES = [50, 100, 250, 500, 1000, 2500, 5000, 10000];
+const RENDERER_BOUNDARIES = [25, 50, 75, 100, 150, 200, 300, 500, 800, 1200, 2000, 5000];
+const op = (operation, count, okCount, failCount, min, avg, max, buckets) => ({
+  operation, count, okCount, failCount, min, avg, max, buckets,
+});
+const metricsWindow = (operations, overrides = {}) => ({
+  schemaVersion: 8,
+  type: 'operational-metrics',
+  runtime: 'server',
+  timestamp: 4,
+  windowStartedAt: 1,
+  windowEndedAt: 4,
+  boundaries: SERVER_BOUNDARIES,
+  operations,
+  rejected: 0,
+  ...overrides,
+});
+
+test('operations is a stable empty shape on a metrics-free store (no false alarm)', () => {
+  // Non-metrics events contribute nothing — operations reads only
+  // operational-metrics windows.
+  assert.deepEqual(summarize([validError, validCrash, validStall]).operations, {});
+  assert.deepEqual(summarize([]).operations, {});
+});
+
+test('operations folds a window into one bucket per operation name', () => {
+  const s = summarize([metricsWindow([
+    op('file-exists-local', 2, 1, 1, 0.5, 1, 1.5, [2, 0, 0, 0, 0, 0, 0, 0, 0]),
+    op('file-exists-remote', 1, 1, 0, 300, 300, 300, [0, 0, 1, 0, 0, 0, 0, 0, 0]),
+  ])]);
+  assert.deepEqual(s.operations, {
+    'file-exists-local': { count: 2, okCount: 1, failCount: 1, min: 0.5, avg: 1, max: 1.5 },
+    'file-exists-remote': { count: 1, okCount: 1, failCount: 0, min: 300, avg: 300, max: 300 },
+  });
+});
+
+test('operations folds across windows — Σ bucket.count equals Σ per-entry count (no count loss)', () => {
+  // The crashReasons-style equality invariant, held through the cross-window
+  // fold: every seeded observation is represented exactly once.
+  const windows = [
+    metricsWindow([op('get-api-claude-sessions', 10, 9, 1, 80, 100, 4000, [1, 2, 3, 2, 1, 1, 0, 0, 0])]),
+    metricsWindow([op('get-api-claude-sessions', 1, 1, 0, 950, 1000, 1000, [0, 0, 0, 0, 1, 0, 0, 0, 0])]),
+    metricsWindow([op('fs-read-file-sync', 4, 4, 0, 5, 6, 9, [4, 0, 0, 0, 0, 0, 0, 0, 0])]),
+  ];
+  const s = summarize(windows);
+  assert.equal(s.operations['get-api-claude-sessions'].count, 11, 'same name across windows folds into ONE bucket');
+  const sumOfBuckets = Object.values(s.operations).reduce((a, b) => a + b.count, 0);
+  const sumOfEntries = windows.flatMap((w) => w.operations).reduce((a, e) => a + e.count, 0);
+  assert.equal(sumOfBuckets, sumOfEntries, 'Σ buckets == Σ entries');
+});
+
+test('a slow route surfaces its true max beside fast ones — no /events paging needed', () => {
+  // The read the count axis cannot give: one 4s route in a sea of 30ms ones is
+  // a single bucket away, not N raw windows to re-fold by hand.
+  const s = summarize([
+    metricsWindow([
+      op('get-api-fast', 20, 20, 0, 10, 12, 30, [20, 0, 0, 0, 0, 0, 0, 0, 0]),
+      op('get-api-slow-route', 5, 5, 0, 3000, 3500, 4000, [0, 0, 0, 0, 0, 5, 0, 0, 0]),
+    ]),
+    metricsWindow([op('get-api-fast', 20, 20, 0, 10, 12, 30, [20, 0, 0, 0, 0, 0, 0, 0, 0])]),
+  ]);
+  assert.equal(s.operations['get-api-slow-route'].max, 4000);
+  assert.equal(s.operations['get-api-fast'].max, 30);
+  assert.equal(s.operations['get-api-fast'].count, 40, 'the fast route folded across both windows');
+});
+
+test('avg is WEIGHTED — Σ(avg×count)/Σcount, never a mean of window means', () => {
+  // 10 observations @ avg 100 + 1 observation @ avg 1000: weighted reads
+  // 2000/11 ≈ 181.8; a mean of means would read 550 — nearly 3× wrong, and it
+  // would get WORSE the more windows carried the slow tail.
+  const s = summarize([
+    metricsWindow([op('get-api-claude-sessions', 10, 10, 0, 80, 100, 200, [10, 0, 0, 0, 0, 0, 0, 0, 0])]),
+    metricsWindow([op('get-api-claude-sessions', 1, 1, 0, 950, 1000, 1100, [0, 0, 0, 0, 1, 0, 0, 0, 0])]),
+  ]);
+  const b = s.operations['get-api-claude-sessions'];
+  assert.equal(b.count, 11);
+  assert.ok(Math.abs(b.avg - 2000 / 11) < 1e-9, `weighted avg ≈ 181.8 (got ${b.avg})`);
+  assert.ok(Math.abs(b.avg - 550) > 1, 'explicitly NOT the mean of the two window means');
+});
+
+test('okCount + failCount == count holds per bucket for producer-satisfying inputs, and a fail-heavy operation is identifiable by ratio alone', () => {
+  // The producer maintains the identity but the validator range-checks the
+  // three integers INDEPENDENTLY, so the receiver's fold must PRESERVE it (Σok
+  // + Σfail == Σcount) without ever ASSUMING it.
+  const s = summarize([
+    metricsWindow([
+      op('get-api-healthy', 9, 9, 0, 10, 12, 30, [9, 0, 0, 0, 0, 0, 0, 0, 0]),
+      op('get-api-degraded', 4, 1, 3, 500, 800, 2000, [0, 0, 0, 1, 1, 1, 1, 0, 0]),
+    ]),
+    metricsWindow([op('get-api-degraded', 6, 2, 4, 400, 700, 1500, [0, 0, 0, 2, 2, 1, 1, 0, 0])]),
+  ]);
+  for (const [name, b] of Object.entries(s.operations)) {
+    assert.equal(b.okCount + b.failCount, b.count, `${name}: the identity survives the fold`);
+  }
+  const degraded = s.operations['get-api-degraded'];
+  assert.equal(degraded.count, 10);
+  assert.equal(degraded.failCount, 7, 'failures fold across windows');
+  assert.equal(degraded.failCount / degraded.count, 0.7, 'a 70% failure ratio is readable from the bucket alone');
+});
+
+test('a zero-count placeholder entry does not corrupt the fold (idle renderer windows)', () => {
+  // paneLatency.ts resets its accumulators but KEEPS the keys, so idle windows
+  // carry { count: 0, min: 0, avg: 0, max: 0 } placeholders beside real
+  // observations in other windows. Folding a placeholder's extrema would
+  // report a false `min: 0` for an operation that was simply idle — the most
+  // likely silent defect in this fold.
+  const s = summarize([
+    metricsWindow(
+      [op('pane-echo-e2e', 0, 0, 0, 0, 0, 0, new Array(13).fill(0))],
+      { boundaries: RENDERER_BOUNDARIES, runtime: 'renderer' }
+    ),
+    metricsWindow(
+      [op('pane-echo-e2e', 1, 1, 0, 250, 250, 250, new Array(13).fill(0).map((v, i) => (i === 3 ? 1 : v)))],
+      { boundaries: RENDERER_BOUNDARIES, runtime: 'renderer' }
+    ),
+  ]);
+  const b = s.operations['pane-echo-e2e'];
+  assert.equal(b.count, 1, 'the placeholder contributes no count');
+  assert.equal(b.min, 250, 'min is the real observation, NOT the placeholder 0');
+  assert.equal(b.max, 250);
+  assert.equal(b.avg, 250);
+  assert.equal(JSON.stringify(s.operations).includes('null'), false, 'no null/NaN anywhere in the payload');
+});
+
+test('a non-finite min/max/avg is skipped from the stats but its count still folds (defence over a NON-validated row)', () => {
+  // Defence-in-depth, NOT a wire case: the ingest validator rejects non-finite
+  // values, so this reaches summarize() only off a hand-written / partial-read
+  // row. The honesty posture mirrors `stalls`: skip the value, keep the
+  // observation. min/max read null (never 0) when nothing finite was folded.
+  const s = summarize([metricsWindow([
+    { operation: 'hand-written-row', count: 2, okCount: 1, failCount: 1, min: NaN, avg: Infinity, max: NaN, buckets: [] },
+    op('hand-written-row', 1, 1, 0, 500, 500, 500, [1, 0, 0, 0, 0, 0, 0, 0, 0]),
+  ])]);
+  const b = s.operations['hand-written-row'];
+  assert.equal(b.count, 3, 'every admitted observation is still counted');
+  assert.equal(b.okCount + b.failCount, b.count);
+  assert.equal(b.min, 500);
+  assert.equal(b.max, 500, 'extrema reflect ONLY the finite record');
+  assert.equal(b.avg, 500, 'the weighted avg reflects ONLY the finite record');
+});
+
+test('a count-bearing row with NO finite stats reads count with null extrema and avg 0 — absence is not 0', () => {
+  // The `min`/`max` are `null` rather than `0` honesty clause: `0` is a REAL
+  // measured duration here (a cache hit), so it can never double as the empty
+  // sentinel.
+  const s = summarize([metricsWindow([
+    { operation: 'stats-less-row', count: 5, okCount: 5, failCount: 0, buckets: [] },
+  ])]);
+  assert.deepEqual(s.operations['stats-less-row'], { count: 5, okCount: 5, failCount: 0, min: null, avg: 0, max: null });
+});
+
+test('a malformed or partial operations entry is skipped whole — never fatal, event still counted', () => {
+  const s = summarize([
+    metricsWindow([
+      null, // non-object entry
+      'garbage', // primitive entry
+      {}, // missing operation AND count
+      { operation: 'no-count' }, // partial: no count
+      { operation: 42, count: 5 }, // non-string operation
+      { operation: '', count: 5 }, // empty operation
+      { operation: 'negative-count', count: -1, okCount: 0, failCount: 0, min: 1, avg: 1, max: 1, buckets: [] },
+      { operation: 'nan-count', count: NaN, okCount: 0, failCount: 0, min: 1, avg: 1, max: 1, buckets: [] },
+      op('real-op', 3, 2, 1, 10, 20, 30, [3, 0, 0, 0, 0, 0, 0, 0, 0]),
+    ]),
+    metricsWindow('not-an-array'), // a non-array operations field is skipped, not fatal
+  ]);
+  assert.deepEqual(
+    s.operations,
+    { 'real-op': { count: 3, okCount: 2, failCount: 1, min: 10, avg: 20, max: 30 } },
+    'only the well-formed entry is bucketed; nothing throws, no NaN poisons the bucket'
+  );
+  assert.equal(s.byType['operational-metrics'], 2, 'both events still count in byType');
+});
+
+test('over-cap distinct names fold into ONE counted __overflow__ bucket with no count loss', () => {
+  // The cap is anchored to the wire's own structural bound
+  // (MAX_OPERATIONS_PER_EVENT = 129), NOT the free-text histograms' 10: the
+  // live name space is ~104 names, and a cap of 10 would answer "which route
+  // is slow?" with __overflow__.
+  const names = [];
+  for (let i = 0; i < OPERATIONS_SUMMARY_CAP + 10; i += 1) names.push(`op-${String(i).padStart(3, '0')}`);
+  const s = summarize([metricsWindow(names.map((n, i) => op(n, 1, 1, 0, i, i, i, [1, 0, 0, 0, 0, 0, 0, 0, 0])))]);
+  const keys = Object.keys(s.operations);
+  assert.equal(keys.length, OPERATIONS_SUMMARY_CAP + 1, 'bounded: cap distinct names + one overflow bucket');
+  assert.ok(keys.includes('__overflow__'), 'the overflow bucket exists');
+  assert.equal(s.operations.__overflow__.count, 10, 'the over-cap observations are REPRESENTED, not dropped');
+  const sumOfBuckets = Object.values(s.operations).reduce((a, b) => a + b.count, 0);
+  assert.equal(sumOfBuckets, names.length, 'no count loss in the overflow fold');
+});
+
+test('mixed boundary scales (9-bucket server + 13-bucket renderer) fold coherently — and NO histogram axis is projected', () => {
+  // The two live producers ship INCOMPATIBLE bucket scales into this ONE event
+  // type. The fold reads none of `buckets[]` / `boundaries`, so it can never
+  // hit an array-length error or silently index-sum two different x-axes into
+  // one meaningless array — the refusal is structural.
+  const s = summarize([
+    metricsWindow(
+      [op('get-api-claude-sessions', 2, 2, 0, 60, 75, 90, [2, 0, 0, 0, 0, 0, 0, 0, 0])],
+      { boundaries: SERVER_BOUNDARIES }
+    ),
+    metricsWindow(
+      [op('get-api-claude-sessions', 3, 3, 0, 40, 60, 150, [0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])],
+      { boundaries: RENDERER_BOUNDARIES, runtime: 'renderer' }
+    ),
+  ]);
+  assert.deepEqual(
+    s.operations['get-api-claude-sessions'],
+    { count: 5, okCount: 5, failCount: 0, min: 40, avg: 66, max: 150 },
+    'one coherent scale-free bucket (weighted avg = (75×2 + 60×3)/5 = 66)'
+  );
+  assert.equal('buckets' in s.operations['get-api-claude-sessions'], false, 'no histogram axis: the two x-axes cannot merge');
+  assert.equal(Object.keys(s.operations).length, 1, 'the shared name is ONE bucket');
+});
+
+test('an over-128-char operation name is truncated — defence-in-depth over a NON-validated store row', () => {
+  // NOT a wire need: OPERATION_NAME_RE (schema.ts) caps a validator-accepted
+  // operation name at 64 chars, so truncation can never fire on an accepted
+  // event (there is no fixture for it — manufacturing one would fake a wire
+  // gap). This pins the bound that defends a hand-written / partial-read row,
+  // the same posture as the client-keyed histograms.
+  const s = summarize([metricsWindow([op('a'.repeat(200), 1, 1, 0, 5, 5, 5, [1, 0, 0, 0, 0, 0, 0, 0, 0])])]);
+  const keys = Object.keys(s.operations);
+  assert.equal(keys.length, 1);
+  assert.equal(keys[0].length, CLIENT_KEY_MAX_LENGTH, 'truncated at the shared client-key bound');
+});
+
 // ── TIME WINDOW ───────────────────────────────────────────────────────────────
 
 test('firstSeen/lastSeen are the min/max of finite timestamps', () => {
@@ -1395,8 +1636,6 @@ test('stallsTimeline: the HEADLINE — two stores with byte-identical stalls.max
 // the client-keyed breakdowns are bounded in BOTH key length and distinct-key
 // cardinality, with overflow REPRESENTED via the `__overflow__` sentinel (the
 // same shape as createRejectionTally's byDeclaredVersion, WARDEN-829).
-
-import { CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP } from '../summary.mjs';
 
 test('an oversized client key is truncated in every client-keyed histogram', () => {
   const huge = 'x'.repeat(CLIENT_KEY_MAX_LENGTH * 40); // far over the cap

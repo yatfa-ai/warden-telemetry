@@ -259,6 +259,37 @@ test('GET /summary returns the aggregate over a pre-populated store → 200 + JS
   assert.equal(body.lastSeen, 9);
 });
 
+test('GET /summary serves the per-operation aggregate for operational-metrics events (WARDEN-1435)', async () => {
+  // End-to-end pin for the additive key: the /summary handler spreads
+  // `...summarize(filtered)` (no route change), so the per-operation fold the
+  // count axis (byType) discards rides the SAME response body.
+  const metricsEvent = {
+    schemaVersion: SCHEMA_VERSION,
+    type: 'operational-metrics',
+    runtime: 'main',
+    timestamp: 11,
+    windowStartedAt: 1,
+    windowEndedAt: 11,
+    boundaries: [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+    operations: [
+      { operation: 'file-exists-local', count: 2, okCount: 1, failCount: 1, min: 0.5, avg: 1, max: 1.5, buckets: [2, 0, 0, 0, 0, 0, 0, 0, 0] },
+      { operation: 'file-exists-remote', count: 1, okCount: 1, failCount: 0, min: 300, avg: 300, max: 300, buckets: [0, 0, 1, 0, 0, 0, 0, 0, 0] },
+    ],
+    rejected: 0,
+  };
+  const store = readableStore([errorEvent, metricsEvent]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.byType['operational-metrics'], 1, 'the count axis is unchanged');
+  assert.deepEqual(body.operations, {
+    'file-exists-local': { count: 2, okCount: 1, failCount: 1, min: 0.5, avg: 1, max: 1.5 },
+    'file-exists-remote': { count: 1, okCount: 1, failCount: 0, min: 300, avg: 300, max: 300 },
+  }, 'the per-operation payload rides the same response, additively');
+});
+
 test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an error)', async () => {
   const store = readableStore([]);
   const handler = createRequestHandler({ store });

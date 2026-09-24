@@ -177,6 +177,11 @@ curl http://localhost:7421/summary
 #         "bySource": { "event-loop": { "count": 2, "max": 300 }, "unresponsive": { "count": 1, "max": 5000 } } }
 #     ],
 #     "bucketMs": 1800000                                                          # 30-min buckets — SAME window/granularity as `timeline` (the two share the bucket math)
+#   },
+#   "operations": {                                                                # the per-operation axis the operational-metrics COUNT hides (WARDEN-1435): a day of route latencies reads on byType as one integer
+#     "get-api-claude-sessions": { "count": 288, "okCount": 284, "failCount": 4, "min": 80, "avg": 141, "max": 4000 },  # folded across every retained window; avg is WEIGHTED (Σ avg×count / Σ count), max is the worst single observation
+#     "pane-echo-e2e":           { "count": 96, "okCount": 96, "failCount": 0, "min": 250, "avg": 302, "max": 800 },   # a renderer operation reading 100% ok is correct — that producer only ever counts successes
+#     "__overflow__":            { "count": 12, "okCount": 12, "failCount": 0, "min": 1, "avg": 3, "max": 9 }          # past the 129-name cap, further distinct names fold here — represented, never dropped
 #   }
 # }
 ```
@@ -373,6 +378,27 @@ freeze in an older bucket has passed. Each bucket carries `count` (every stall i
 (`bySource`) exactly like `stalls`. It is purely additive — a pure read over already-accepted, already-redacted
 events, computed on read; no new collection, wire field, schema bump, or identifier. A stall-free store reads
 a clean `buckets: []` with the `bucketMs` granularity still conveyed.
+
+`operations` is the per-operation axis the `operational-metrics` COUNT (`byType`) cannot show (WARDEN-1435):
+a day of 5-minute windows carrying every `/api` route's latency reduces on `byType` to one integer —
+`"operational-metrics": 288` — so "which operation is slow? which one is failing?" was answerable only by
+paging `/events` and re-folding thousands of raw per-window accumulators by hand. `operations` folds every
+retained window's `operations[]` by operation NAME into bounded buckets carrying `count` / `okCount` /
+`failCount` / `min` / `avg` / `max`: the failure ratio and the worst single observation of each route,
+readable at a glance. `avg` is **weighted** — `Σ(avg × count) / Σcount`, never a mean of window means (10
+observations @ 100ms + 1 @ 1000ms must read ≈182, not 550); `min`/`max` are true extrema across windows and
+read `null` (never `0`) when no finite observation was folded — `0` is a REAL measured duration here (a cache
+hit), so it cannot double as the empty sentinel, and a zero-count placeholder entry (an idle renderer window
+keeps its keys with `count: 0`) contributes nothing to the extrema. **No histogram axis is projected,
+deliberately**: the two live producers ship different, incompatible bucket scales into this one event type
+(8-boundary server-side windows vs 12-boundary renderer pane-latency windows), and summing them would merge
+two different x-axes into one meaningless array — the numbers here are scale-free, and the per-window
+histograms stay readable on `/events`. The name space is bounded like every other histogram (the first 129
+distinct names — the same cap the schema already puts on ONE event — then ONE counted `__overflow__` bucket;
+no count loss), and the keys are safe by construction: an operation name is a constant kebab-case literal by
+the schema (`OPERATION_NAME_RE`), so a path or hostname can never ride the aggregate key. It is purely
+additive — a pure read over already-accepted, already-redacted events, computed on read; no new collection,
+wire field, schema bump, or identifier, and no change to `/events`.
 
 #### Scoping the aggregates — `?type=` / `?platform=` / `?appVersion=` / `?since=`
 
