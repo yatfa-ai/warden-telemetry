@@ -227,6 +227,39 @@ function _createBoundedClientHistogram() {
   };
 }
 
+// ── PER-OPERATION AGGREGATE bound (WARDEN-1435) ───────────────────────────────
+// `operations` (below) buckets per-operation aggregates by the event's
+// `operation` NAME — and the live name space is an order of magnitude wider
+// than the free-text client-keyed histograms above: the warden client's route
+// census alone carries ~96 request-operation names (requestTelemetry.js
+// REQUEST_MAX_OPERATIONS) beside the pane/fileExists/renderer-pane producers,
+// so borrowing CLIENT_HISTOGRAM_CAP (10) unchanged would fold ~90% of the key
+// space into `__overflow__` and "which route is slow?" would answer
+// `__overflow__` — destroying the exact capability this axis exists to add.
+// The bound is instead anchored to the WIRE's own structural cap: the schema
+// caps ONE operational-metrics event at MAX_OPERATIONS_PER_EVENT = 129
+// distinct operations (schema.ts:479, module-private — do not import; schema.ts
+// is vendored byte-identical to the client and must not be edited). A
+// per-summary cap at the same scale keeps the response bounded by the same
+// constant the producer is already bounded by, while keeping every realistic
+// operation name in its own readable bucket. Same shape as the histograms:
+// the first OPERATIONS_SUMMARY_CAP distinct names get their own bucket; every
+// FURTHER distinct name folds into ONE counted `__overflow__` accumulator —
+// bounded cardinality, no count loss. (An operation literally named
+// `__overflow__` is impossible on validated data — OPERATION_NAME_RE admits
+// only `[a-z0-9-]` — the same benign collision note the histograms carry.)
+//
+// HISTOGRAM REFUSAL (deliberate): the two live producers ship DIFFERENT,
+// incompatible bucket scales into this ONE event type — server-side
+// aggregators use DEFAULT_BUCKET_BOUNDARIES_MS (8 boundaries / 9 buckets) while
+// the renderer's pane-latency producer uses PANE_LATENCY_BOUNDARIES_MS
+// (12 boundaries / 13 buckets). Summing or concatenating `buckets[]` across
+// windows would merge two different x-axes into one meaningless array, so
+// `operations` projects NO histogram axis at all: count / okCount / failCount /
+// min / avg / max only. The numbers are scale-free and always comparable; the
+// per-window histograms stay readable on /events.
+export const OPERATIONS_SUMMARY_CAP = 129; // anchored to schema.ts's MAX_OPERATIONS_PER_EVENT
+
 // ── TEMPORAL DISTRIBUTION config (WARDEN-603) ────────────────────────────────
 // The rolling recent window a maintainer reads to spot a RECENT volume spike
 // (a regression / deploy event) apart from long-running baseline. Events older
@@ -353,6 +386,119 @@ function _stallSnapshot({ count, sum, finiteCount, min, max }) {
 }
 
 /**
+ * Render ONE per-operation accumulator as the public
+ * `{ count, okCount, failCount, min, avg, max }` snapshot (WARDEN-1435) — the
+ * per-operation sibling of `_stallSnapshot`. `count`/`okCount`/`failCount` are
+ * the folded totals (Σ over every admitted window entry for that operation
+ * name); `avg` is the WEIGHTED mean `Σ(avg × count) / Σcount` over the entries
+ * whose `avg` was finite and count-bearing — never a mean of window means (10
+ * observations @ 100ms + 1 @ 1000ms must read ≈182, not 550); `min`/`max` are
+ * the true extrema across windows. With no finite, count-bearing record seen,
+ * `min`/`max` are `null` (the `_stallSnapshot` honesty posture — `0` is a REAL
+ * measured duration here, e.g. cache hits, so it cannot double as the empty
+ * sentinel) and `avg` is `0` (the guarded empty case can never read `NaN`).
+ *
+ * @param {{ count: number, okCount: number, failCount: number, weightedSum: number, weightCount: number, min: number | null, max: number | null }} acc
+ * @returns {{ count: number, okCount: number, failCount: number, min: number | null, avg: number, max: number | null }}
+ * @private
+ */
+function _operationSnapshot({ count, okCount, failCount, weightedSum, weightCount, min, max }) {
+  return {
+    count,
+    okCount,
+    failCount,
+    min,
+    avg: weightCount > 0 ? weightedSum / weightCount : 0,
+    max,
+  };
+}
+
+// An empty per-operation accumulator (the exact key set _operationSnapshot reads).
+function _newOperationAccumulator() {
+  return { count: 0, okCount: 0, failCount: 0, weightedSum: 0, weightCount: 0, min: null, max: null };
+}
+
+/**
+ * Fold ONE operational-metrics event's `operations[]` into the per-name
+ * accumulator map `accs` (WARDEN-1435). Skip-robust per `summarize()`'s stated
+ * discipline: a malformed or partial entry is SKIPPED — it can never throw and
+ * never poison an aggregate to `NaN` — while its EVENT still counts in
+ * `byType` (counting is independent of this fold).
+ *
+ * Admission + guards, and WHY each exists:
+ * - An entry needs a non-empty string `operation` (attributable) and a finite
+ *   non-negative `count` (countable) — anything else is skipped whole.
+ * - `okCount` / `failCount` fold only when finite and non-negative. The
+ *   producer maintains `okCount + failCount == count` (telemetry-metrics.cjs /
+ *   paneLatency.ts) but the validator range-checks the three integers
+ *   INDEPENDENTLY — it never checks the sum — so this fold PRESERVES the
+ *   identity for inputs that satisfy it and never ASSUMES it of an arbitrary
+ *   stored row. (A renderer operation reading 100% ok is correct, not a bug —
+ *   that producer only ever increments okCount.)
+ * - `min` / `avg` / `max` fold only when the entry's `count` > 0 AND the value
+ *   is finite. The count>0 guard is load-bearing: a producer that resets its
+ *   accumulators but KEEPS the keys (paneLatency.ts emptyAccumulator → project)
+ *   emits zero-count placeholder entries (`min: 0 / avg: 0 / max: 0`) in every
+ *   idle window — folding their extrema would report a false `min: 0` for an
+ *   operation that was simply idle, and their `avg × count` would be
+ *   `0 × 0` at best, `NaN × 0` at worst. The finite guard is the
+ *   `_stallSnapshot` honesty posture: a non-finite value is skipped from the
+ *   extrema / weighted sum but the observation (its `count`) is still counted.
+ * - NO histogram axis is folded, deliberately: the two live producers ship
+ *   incompatible boundary scales into this one event type (see the
+ *   OPERATIONS_SUMMARY_CAP block above), so `buckets[]` is never summed,
+ *   concatenated, or index-merged — the numbers here are scale-free.
+ *
+ * `operation` names are ≤64 chars on every validator-accepted event
+ * (OPERATION_NAME_RE), so `_boundClientKey` can never truncate one — it is
+ * defence-in-depth over a NON-validated store row (a partial read or hand-written
+ * line), never a wire need. New distinct names fill their own buckets up to
+ * OPERATIONS_SUMMARY_CAP; past the cap every further NEW name folds into the
+ * one shared `__overflow__` accumulator (bounded cardinality, no count loss),
+ * mirroring `stallBySource`'s overflow exactly.
+ *
+ * @param {unknown} operations the event's `operations` array (any shape)
+ * @param {Map<string, object>} accs name → accumulator (mutated in place)
+ * @private
+ */
+function _foldOperations(operations, accs) {
+  if (!Array.isArray(operations)) return;
+  for (const op of operations) {
+    if (!op || typeof op !== 'object') continue;
+    const { operation, count, okCount, failCount, min, avg, max } = op;
+    if (typeof operation !== 'string' || operation.length === 0) continue;
+    if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) continue;
+    const key = _boundClientKey(operation);
+    let acc = accs.get(key);
+    if (acc === undefined) {
+      if (accs.size < OPERATIONS_SUMMARY_CAP) {
+        acc = _newOperationAccumulator();
+        accs.set(key, acc);
+      } else {
+        // Cap reached → fold every further NEW distinct name into the single
+        // overflow accumulator: bounded cardinality, no count loss.
+        acc = accs.get(OVERFLOW_KEY);
+        if (acc === undefined) {
+          acc = _newOperationAccumulator();
+          accs.set(OVERFLOW_KEY, acc);
+        }
+      }
+    }
+    acc.count += count;
+    if (typeof okCount === 'number' && Number.isFinite(okCount) && okCount >= 0) acc.okCount += okCount;
+    if (typeof failCount === 'number' && Number.isFinite(failCount) && failCount >= 0) acc.failCount += failCount;
+    if (count > 0) {
+      if (typeof min === 'number' && Number.isFinite(min) && (acc.min === null || min < acc.min)) acc.min = min;
+      if (typeof max === 'number' && Number.isFinite(max) && (acc.max === null || max > acc.max)) acc.max = max;
+      if (typeof avg === 'number' && Number.isFinite(avg)) {
+        acc.weightedSum += avg * count;
+        acc.weightCount += count;
+      }
+    }
+  }
+}
+
+/**
  * Resolve an event's EFFECTIVE observation instant — the single shared rule every
  * time-axis in this module keys off (WARDEN-1428 extracted it; the expression
  * predates it and was previously written out three times).
@@ -432,6 +578,8 @@ export function lastAcceptedInstant(events) {
  *   crashReasons: Record<string, number>,
  *   stalls: { count: number, min: number | null, avg: number, max: number | null,
  *             bySource: Record<string, { count: number, min: number | null, avg: number, max: number | null }> },
+ *   operations: Record<string, { count: number, okCount: number, failCount: number,
+ *                                min: number | null, avg: number, max: number | null }>,
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
@@ -464,6 +612,12 @@ export function summarize(events) {
   // a fixed enum. Skip-robust — a reasonless crash is counted by byType.crash
   // but NOT bucketed here.
   const crashReasons = _createBoundedClientHistogram();
+  // Per-operation aggregates (WARDEN-1435): the per-operation tallies the
+  // `operational-metrics` COUNT (byType) discards — every window entry's
+  // count / ok / fail / min / weighted-avg / max folded by operation NAME into
+  // bounded buckets (see _foldOperations + OPERATIONS_SUMMARY_CAP). Populated
+  // in the event loop below, snapshotted into the `operations` return key.
+  const operationsByName = new Map();
   // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
   // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
   // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
@@ -493,7 +647,7 @@ export function summarize(events) {
     // `timestamp` is deliberately NOT destructured here: the ONLY consumer of it in
     // this loop was the time-bounds fallback, which now reads it through the shared
     // `_effectiveInstant(event)` helper (WARDEN-1428).
-    const { type, name, schemaVersion, appVersion, platform, runtime, reason, lagMs, source } = event;
+    const { type, name, schemaVersion, appVersion, platform, runtime, reason, lagMs, source, operations } = event;
 
     if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(byType, type)) {
       byType[type] += 1;
@@ -583,6 +737,14 @@ export function summarize(events) {
         }
       }
     }
+    // Per-operation aggregate (WARDEN-1435): fold this window's `operations[]`
+    // into the bounded per-name accumulators. Skip-robust — a malformed or
+    // partial entry is skipped inside _foldOperations and never poisons an
+    // aggregate, while the EVENT is already counted in byType above (the two
+    // are independent, exactly like a crash's reason and its byType count).
+    if (type === 'operational-metrics') {
+      _foldOperations(operations, operationsByName);
+    }
     // Failure signature (WARDEN-707): rank DISTINCT failures across ALL base
     // types in one list. `signatureOf` is skip-robust (returns null for an
     // unknown type or a type-specific field gap) — null yields no bucket, never
@@ -649,6 +811,14 @@ export function summarize(events) {
     ),
   };
 
+  // Per-operation snapshot (WARDEN-1435): insertion order = the order names first
+  // appeared (mirrors stalls.bySource; deepEqual is order-insensitive, so tests
+  // are stable). Bounded at OPERATIONS_SUMMARY_CAP + 1 keys no matter what any
+  // client sent.
+  const operations = Object.fromEntries(
+    [...operationsByName.entries()].map(([name, acc]) => [name, _operationSnapshot(acc)])
+  );
+
   return {
     total,
     byType,
@@ -660,6 +830,7 @@ export function summarize(events) {
     byRuntime: byRuntime.snapshot(),
     crashReasons: crashReasons.snapshot(),
     stalls,
+    operations,
     firstSeen,
     lastSeen,
   };
