@@ -738,7 +738,7 @@ test('GET /summary liveness.acceptedSinceBoot is FALSE when the newest event pre
   assert.equal(body.total, 2, 'the corpus still reads non-zero — a clean tally is NOT evidence of liveness');
   assert.equal(body.startedAt, 10_000, 'boot instant');
   assert.equal(body.liveness.lastAcceptedAt, 4_500, 'the last-accepted instant is RESTATED inside the block (self-contained)');
-  assert.equal(body.liveness.lastAcceptedAt, body.lastSeen, 'and it equals the top-level lastSeen — the two can never disagree');
+  assert.equal(body.liveness.lastAcceptedAt, body.lastSeen, 'and on this UNFILTERED read it equals the top-level lastSeen (a filtered read scopes lastSeen but not this — see the unscoped test below)');
   assert.equal(body.liveness.ageSinceLastAcceptedMs, 5_500, 'age is readAt - lastAcceptedAt, computable with NO external clock');
   assert.equal(body.liveness.acceptedSinceBoot, false, 'lastAcceptedAt < startedAt → this process has accepted NOTHING since boot');
 });

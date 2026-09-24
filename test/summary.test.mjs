@@ -1495,7 +1495,9 @@ test('summarizeStallsTimeline bySource is bounded too (same class of client key)
 // event landed. PURE, single-arg, no clock, exactly like summarize(). It backs
 // the `/summary` `liveness` verdict, which RESTATES that instant so the verdict
 // is self-contained; the equal-to-lastSeen test below is the contract that keeps
-// the two from ever disagreeing inside one response body.
+// the two from ever disagreeing FOR THE SAME ARRAY. (The /summary handler calls
+// this on the UNSCOPED array, so on a filtered read the top-level `lastSeen` is
+// scoped and this instant is not — they may legitimately differ there.)
 
 test('lastAcceptedInstant returns the NEWEST effective instant across the batch', () => {
   const events = [

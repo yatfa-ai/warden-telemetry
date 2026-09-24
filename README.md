@@ -113,7 +113,7 @@ curl http://localhost:7421/summary
 #   "startedAt": 1719980000000,                 # epoch-ms this receiver (re)booted — the observation window for the tallies below
 #   "readAt": 1720000400000,                    # epoch-ms THIS response was produced — the read's own clock; subtract it from any timestamp above to get an age
 #   "liveness": {                               # is the channel RECEIVING? the twin of startedAt for the ACCEPTED-event stream (WARDEN-1428)
-#     "lastAcceptedAt": 1720000000000,          # when the newest ACCEPTED event landed (= top-level lastSeen, restated so the verdict is self-contained); null on an empty store
+#     "lastAcceptedAt": 1720000000000,          # when the newest ACCEPTED event landed (equal to top-level lastSeen on an UNFILTERED read — on a filtered read lastSeen is scoped and this is not, see the unscoped note below — restated so the verdict is self-contained); null on an empty store
 #     "ageSinceLastAcceptedMs": 400000,         # readAt - lastAcceptedAt; null when there is no anchor (NEVER 0)
 #     "acceptedSinceBoot": true,                # lastAcceptedAt >= startedAt. FALSE = this process has accepted ZERO events in its entire uptime
 #     "lastRejectionAt": 1720000099000,         # cumulative last rejection instant (from rejections.lastSeen, NOT the 24h timeline); null = nothing arriving at all
@@ -238,7 +238,8 @@ that erased the incident.
 The six fields let you answer four questions with no external clock:
 
 - **How long since the last accepted event?** `lastAcceptedAt` (the same instant as the top-level `lastSeen`
-  — restated inside the block so the verdict is self-contained) and `ageSinceLastAcceptedMs` against
+  **on an unfiltered read** — on a filtered read `lastSeen` is scoped and this is not, see the unscoped note
+  below — restated inside the block so the verdict is self-contained) and `ageSinceLastAcceptedMs` against
   `readAt`. The age is `null` on an empty store — an absent measurement reads as **absent**, never as `0`,
   which would say "an event just arrived". It is deliberately **unclamped**: a negative age means the
   receiver's own clock moved backwards (a restart onto a rewound clock, an NTP step), which is a real signal
