@@ -2,11 +2,17 @@
 // dependencies `{ SCHEMA_VERSION, validateEvent, store }`. This is the slice's
 // observation point (WARDEN-547): the handler trace lives here —
 //
-//   1. SCHEMA HANDSHAKE  — read x-telemetry-schema; reject unknown version
+//   1. SCHEMA HANDSHAKE  — read x-telemetry-schema; reject a version OUTSIDE
+//                          the accepted window (the current version plus the
+//                          prior versions proven additive subsets, WARDEN-1445)
 //                          WITHOUT parsing the body.
 //   2. PARSE             — the { schemaVersion, events } JSON body.
 //   3. VALIDATE          — run the shared validateEvent on EVERY event; hard-
-//                          reject the whole batch if ANY is out-of-schema.
+//                          reject the whole batch if ANY is out-of-schema. A
+//                          declared PRIOR version validates by NORMALIZATION
+//                          (own schemaVersion === declared, then the unmodified
+//                          current validator over a schemaVersion-substituted
+//                          copy) and persists the ORIGINAL event.
 //   4. IDEMPOTENCY DEDUP — (opt-in via seenKeys, WARDEN-666) a request whose
 //                          idempotency-key was already accepted returns 202
 //                          {accepted:0, deduped:true} WITHOUT re-persisting, so a
@@ -56,11 +62,71 @@ function reject(status, error, extra) {
   return { ok: false, status, body: { error, ...extra } };
 }
 
+// ── SCHEMA VERSION WINDOW (WARDEN-1445) ──────────────────────────────────────
+// The prior schema versions this receiver accepts alongside its own, each PROVEN
+// a pure subset of the current schema: the diff from that version's vendored
+// schema.ts to the current one removes ONLY the `SCHEMA_VERSION` literal and
+// WIDENS `BASE_EVENT_TYPES` / the `BaseEvent` union — never a field, a shape
+// validator, or a boundary. A v6/v7 event is therefore a valid v8 event in
+// everything but its own `schemaVersion` stamp, so the receiver can validate it
+// by NORMALIZATION (see step 3) without relaxing a single shape check.
+//
+// Provenance per entry (the additive diff each was proven by):
+//   6 — `git diff 7c63d82 <v8> -- schema.ts`: 3 removed lines (SCHEMA_VERSION
+//       literal, widened BASE_EVENT_TYPES, widened BaseEvent union).
+//   7 — `git diff 9cdb0e3 <v8> -- schema.ts`: the same 3-line shape.
+//   8 — the current schema itself (d586e33 vendored v8).
+//
+// RECEIVER-LOCAL BY CONSTRUCTION — deliberately NOT in schema.ts: that file is
+// vendored verbatim from the client and pinned byte-identical by
+// test/drift.test.mjs. A receiver-side compatibility policy must never leak into
+// the vendored copy. v5 stays OUT of the window: v5→v6 removed boundary
+// validation (NOT additive), so a v5 event is NOT provably a v8 subset.
+//
+// A future bump must RE-PROVE the window: run the same 3-line diff check against
+// the new version, then extend this array (and a non-additive bump has to
+// consciously REMOVE the versions it no longer covers — the window-guard test
+// in test/ingest.test.mjs makes that shrink a deliberate act).
+export const COMPATIBLE_SCHEMA_VERSIONS = [6, 7, 8];
+
+/**
+ * The accepted `x-telemetry-schema` header values as an ASCENDING string array:
+ * the injected window plus ALWAYS the current version (the current version is
+ * accepted even if a caller hands a window that omits it — ingest could not
+ * function otherwise). Header comparison is EXACT-STRING, mirroring the
+ * pre-window handshake discipline: `8` (number) and `"06"` never matched, and
+ * they still don't — a Set built from this array keeps that strictness. When
+ * `compatibleSchemaVersions` is absent (or not an array) the window collapses to
+ * the current version alone — byte-identical to the pre-WARDEN-1445 handshake —
+ * so every caller that doesn't thread the window keeps today's behavior.
+ *
+ * @param {unknown} compatibleSchemaVersions the injected window (or absent)
+ * @param {number} schemaVersion the receiver's own SCHEMA_VERSION
+ * @returns {string[]} ascending accepted header values
+ */
+export function acceptedSchemaVersionStrings(compatibleSchemaVersions, schemaVersion) {
+  const window = Array.isArray(compatibleSchemaVersions) ? compatibleSchemaVersions : [schemaVersion];
+  return [...new Set([...window.map(String), String(schemaVersion)])].sort((a, b) => Number(a) - Number(b));
+}
+
+// The 415 reason text, shared by BOTH handshake sites (ingest's canonical check
+// and server.mjs's pre-read defense-in-depth copy) so the two sites cannot drift
+// on wording. Names the accepted set (WARDEN-1445) instead of a single expected
+// version, so a maintainer reading a drift diagnostic can see the window too.
+function unsupportedSchemaVersionReason(acceptedStrings, declared) {
+  return `unsupported telemetry schema version: expected one of [${acceptedStrings.map((v) => JSON.stringify(v)).join(',')}], got ${JSON.stringify(declared)}`;
+}
+
 /**
  * Ingest one telemetry batch.
  *
  * @param {{ headers: Record<string, string>, body: string }} request
- * @param {{ SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean, store: { appendEvents: (e: unknown[]) => Promise<void> }, seenKeys?: { has(key: string): boolean, record(key: string): void }, now?: () => number }} deps
+ * @param {{ SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean, store: { appendEvents: (e: unknown[]) => Promise<void> }, seenKeys?: { has(key: string): boolean, record(key: string): void }, now?: () => number, compatibleSchemaVersions?: number[] }} deps
+ *   `compatibleSchemaVersions` (optional, WARDEN-1445): the prior schema versions
+ *   accepted alongside `SCHEMA_VERSION` (see COMPATIBLE_SCHEMA_VERSIONS). Absent
+ *   → current-version-only, byte-identical to the pre-window handshake. The
+ *   server threads it via the `{...schema}` dep spread, so production and the
+ *   pre-read seam read ONE definition.
  * @returns {Promise<{ ok: boolean, status: number, body: object }>}
  *   - success: `{ ok: true, status: 202, body: { accepted: <n> } }`
  *   - dedup:   `{ ok: true, status: 202, body: { accepted: 0, deduped: true } }` (nothing persisted — a retried batch whose 2xx was lost; WARDEN-666)
@@ -69,7 +135,7 @@ function reject(status, error, extra) {
  *     version structurally as `body.declaredVersion` (WARDEN-761) — the raw
  *     `x-telemetry-schema` header value, or `undefined` when the header is missing.
  */
-export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent, store, seenKeys, now = Date.now } = {}) {
+export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent, store, seenKeys, now = Date.now, compatibleSchemaVersions } = {}) {
   if (typeof SCHEMA_VERSION !== 'number') {
     throw new TypeError('ingest: `SCHEMA_VERSION` dependency is required (number)');
   }
@@ -82,12 +148,18 @@ export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent,
 
   // 1. SCHEMA HANDSHAKE — the header exists precisely so the receiver can
   //    reject/coordinate on drift WITHOUT parsing the body (telemetry-send.js).
-  //    An unknown/missing version → reject before we ever look at the body.
+  //    A version OUTSIDE the accepted window (WARDEN-1445) → reject before we
+  //    ever look at the body. The window is the current version plus the prior
+  //    versions proven additive subsets (COMPATIBLE_SCHEMA_VERSIONS above);
+  //    absent window dep → current-only, byte-identical to the pre-window gate.
+  //    Comparison is EXACT-STRING over the accepted set: a number-typed 8, an
+  //    `"06"`, `"abc"`, or a missing header never matched, and still don't.
   const declared = readHeader(headers, 'x-telemetry-schema');
-  if (declared !== String(SCHEMA_VERSION)) {
+  const acceptedStrings = acceptedSchemaVersionStrings(compatibleSchemaVersions, SCHEMA_VERSION);
+  if (!new Set(acceptedStrings).has(declared)) {
     return reject(
       415,
-      `unsupported telemetry schema version: expected "${SCHEMA_VERSION}", got ${JSON.stringify(declared)}`,
+      unsupportedSchemaVersionReason(acceptedStrings, declared),
       // Carry the DECLARED version structurally (WARDEN-761) so the receiver can
       // bucket 415 drift by declared version without parsing the reason string.
       // `declared` is the raw header value (string, or undefined when the header
@@ -95,6 +167,9 @@ export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent,
       { declaredVersion: declared }
     );
   }
+  // A declared PRIOR version (inside the window, not the current one) switches
+  // step 3 to NORMALIZATION validation; the current version keeps today's path.
+  const priorVersion = declared !== String(SCHEMA_VERSION) ? Number(declared) : null;
 
   // IDEMPOTENCY KEY (WARDEN-666) — read ONCE here, after the handshake (a wrong
   // version is still 415'd first; dedup never relaxes the handshake). It is used
@@ -124,8 +199,31 @@ export async function ingest({ headers, body }, { SCHEMA_VERSION, validateEvent,
   //    data never lands — mirrors the client's own redact→validate pipeline).
   //    Note: validateBaseEvent also checks each event's own `schemaVersion`
   //    field, so a body whose events carry a different version is caught here.
+  //
+  //    WARDEN-1445 — a declared PRIOR version (inside the window) validates by
+  //    NORMALIZATION, never by relaxing a check: each event must (a) carry its
+  //    OWN `schemaVersion` equal to the DECLARED batch version — a v8 event
+  //    smuggled into a v6-declared batch is a 422, the whole batch, atomically —
+  //    and (b) pass the UNMODIFIED current `validateEvent` with only the
+  //    schemaVersion stamp normalized to the current version. (a) is checked
+  //    here explicitly because (b)'s normalization would otherwise paper over
+  //    the very mismatch it guards: substituting SCHEMA_VERSION makes an
+  //    8-stamped event validate inside a 6-declared batch. Persistence (step
+  //    4c) keeps the ORIGINAL event — its own stamp intact — so the /summary
+  //    `schemaVersions` histogram stays truthful about what the fleet emits.
   for (const event of events) {
-    if (!validateEvent(event)) {
+    if (priorVersion !== null) {
+      const ownVersion = event && typeof event === 'object' ? event.schemaVersion : undefined;
+      if (ownVersion !== priorVersion) {
+        return reject(
+          422,
+          `one or more events carry schemaVersion ${JSON.stringify(ownVersion)}, not the declared ${priorVersion}; batch rejected`
+        );
+      }
+      if (!validateEvent({ ...event, schemaVersion: SCHEMA_VERSION })) {
+        return reject(422, 'one or more events failed schema validation; batch rejected');
+      }
+    } else if (!validateEvent(event)) {
       return reject(422, 'one or more events failed schema validation; batch rejected');
     }
   }
