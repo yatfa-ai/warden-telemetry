@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createDedupTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, DEFAULT_DEDUP_MAX_KEYS, DEFAULT_DEDUP_TTL_MS, readBody } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createDedupTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, DEFAULT_DEDUP_MAX_KEYS, DEFAULT_DEDUP_TTL_MS, DEFAULT_SCHEMA, readBody } from '../server.mjs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 import { EVENTS_LIMIT_DEFAULT, EVENTS_LIMIT_MAX } from '../events.mjs';
@@ -4526,4 +4526,233 @@ test('createSeenKeys: a non-string/empty key is a no-op (an absent header never 
   assert.equal(keys.has(''), false);
   assert.equal(keys.has(undefined), false);
   assert.equal(keys.snapshot().size, 0);
+});
+
+// ── SCHEMA VERSION WINDOW (WARDEN-1445) — handler-level wiring ───────────────
+// The receiver accepts a bounded window of prior schema versions proven additive
+// subsets of the current one (COMPATIBLE_SCHEMA_VERSIONS), so an additive producer
+// bump stops 415-stranding the owner's installed build. These tests drive
+// createRequestHandler directly (the same fake req/res seam as the rest of this
+// file) and cover the success criteria end-to-end: the accept path lands the rows
+// on /summary under their OWN version, out-of-window versions still 415 at the
+// PRE-READ seam with their drift tally, and /capabilities advertises the window.
+
+import { COMPATIBLE_SCHEMA_VERSIONS } from '../ingest.mjs';
+
+// v6-shaped fixtures — the production rows the stranded v6 build actually emits
+// (WARDEN-1445 criterion 1 names exactly these three types).
+const v6Metrics = {
+  schemaVersion: 6,
+  type: 'operational-metrics',
+  runtime: 'main',
+  timestamp: 4,
+  windowStartedAt: 1,
+  windowEndedAt: 4,
+  boundaries: [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+  operations: [
+    { operation: 'file-exists-local', count: 2, okCount: 1, failCount: 1, min: 0.5, avg: 1, max: 1.5, buckets: [2, 0, 0, 0, 0, 0, 0, 0, 0] },
+    { operation: 'file-exists-remote', count: 1, okCount: 1, failCount: 0, min: 300, avg: 300, max: 300, buckets: [0, 0, 1, 0, 0, 0, 0, 0, 0] },
+    { operation: 'file-exists-cache-hit', count: 3, okCount: 3, failCount: 0, min: 0, avg: 0, max: 0, buckets: [3, 0, 0, 0, 0, 0, 0, 0, 0] },
+  ],
+  rejected: 0,
+};
+const v6Stall = {
+  schemaVersion: 6,
+  type: 'performance-stall',
+  runtime: 'main',
+  timestamp: 3,
+  lagMs: 750,
+  source: 'event-loop',
+};
+const v6ServerStall = {
+  schemaVersion: 6,
+  type: 'server-stall',
+  runtime: 'server',
+  timestamp: 5,
+  windowStartedAt: 1,
+  windowEndedAt: 5,
+  count: 2,
+  totalMs: 7400,
+  maxMs: 6000,
+  boundaries: [1000, 2000, 5000, 10000, 30000],
+  buckets: [0, 1, 0, 1, 0, 0],
+  culprits: [
+    { culprit: 'get-api-claude-sessions', count: 2, totalOverlapMs: 7300 },
+    { culprit: 'fs-read-file-sync', count: 1, totalOverlapMs: 5800 },
+  ],
+};
+const v6BatchBody = JSON.stringify({ schemaVersion: 6, events: [v6Metrics, v6Stall, v6ServerStall] });
+
+// The WINDOWED wiring: the schema bundle carries the receiver-local window (the
+// same shape DEFAULT_SCHEMA threads in production), and the store ROUND-TRIPS —
+// appended lines are readable back — so a POST can be followed by the /summary
+// read that must reflect it.
+function windowedWiring() {
+  const lines = [];
+  const store = createNdjsonStore({
+    sink: async (line) => void lines.push(line),
+    source: () => lines.map((l) => JSON.parse(l)),
+  });
+  const rejections = createRejectionTally();
+  const handler = createRequestHandler({
+    store,
+    schema: { SCHEMA_VERSION, validateEvent, COMPATIBLE_SCHEMA_VERSIONS },
+    rejections,
+  });
+  return { handler, rejections };
+}
+
+// A request whose BODY STREAM ERRORS: readBody rejects on 'error' and the handler
+// maps a plain read error to 400. This is the deterministic PRE-READ seam probe —
+// an out-of-window declared version that still answers 415 on a poisoned stream
+// was rejected BEFORE the body was ever read (had the seam let it through, the
+// poisoned stream would have surfaced as the control's 400 instead). The no-op
+// `error` catcher mirrors a real IncomingMessage (whose socket absorbs the error):
+// when the seam rejects pre-read, readBody never attaches its listener and the
+// bare EventEmitter would otherwise throw the emission as an uncaughtException.
+function erroringReq({ method = 'POST', url = '/ingest', headers = {} } = {}) {
+  const req = new EventEmitter();
+  req.method = method;
+  req.url = url;
+  req.headers = headers;
+  req.on('error', () => {}); // absorbed when the seam fired pre-read (no readBody listener yet)
+  process.nextTick(() => req.emit('error', new Error('stream exploded')));
+  return req;
+}
+
+test('WINDOW: a v6-declared batch of real-production-shaped rows → 202, and /summary shows them under schemaVersions["6"] with liveness GREEN (WARDEN-1445 criterion 1)', async () => {
+  // THIS TEST FAILS ON PRE-WARDEN-1445 ORIGIN/MAIN: the strict handshake 415s the
+  // batch at the pre-read seam, so the 202 assertion is the first thing to break —
+  // that flip (415 → 202) is the ticket's whole point.
+  const { handler } = windowedWiring();
+  const post = fakeRes();
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '6' }, body: v6BatchBody }), post);
+  assert.equal(post.statusCode, 202, `a proven-additive prior version is accepted through the FULL handler (got ${post.statusCode}: ${post.body})`);
+  assert.deepEqual(JSON.parse(post.body), { accepted: 3 });
+
+  // The persisted rows keep their OWN v6 stamp (persist-as-sent), and /summary's
+  // histogram reads them back under "6" — truthful about what the fleet emits.
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.schemaVersions['6'], 3, 'the histogram buckets under the DECLARED (v6) stamp, not the receiver version');
+  assert.equal(body.schemaVersions[String(SCHEMA_VERSION)], undefined, 'nothing was rewritten to the current version');
+  assert.equal(Number.isFinite(body.lastSeen), true, 'lastSeen advanced — the accepted batch is the newest instant');
+  assert.equal(body.liveness.acceptedSinceBoot, true, 'THE SUCCESS-PATH CHANNEL IS GREEN: acceptedSinceBoot flips true');
+  assert.deepEqual(body.liveness.mismatchedDeclaredVersions, [], 'a window version is no longer a declared-version disagreement');
+});
+
+test('WINDOW: declared 5 / 9 / abc / MISSING still 415 at the PRE-READ seam (poisoned-stream probe) and still tally their drift (criterion 2)', async () => {
+  const { handler, rejections } = windowedWiring();
+
+  // The control: the CURRENT version on a poisoned stream passes the seam and
+  // surfaces as the read-error 400 — proving a stream error past the seam is a
+  // 400, and therefore that a 415 below really was pre-read.
+  const control = fakeRes();
+  await handler(erroringReq({ headers: schemaHeaders }), control);
+  assert.equal(control.statusCode, 400, 'control: a poisoned stream past the seam is the read-error 400');
+  assert.match(JSON.parse(control.body).error, /could not read request body/);
+
+  for (const declared of ['5', String(SCHEMA_VERSION + 1), 'abc']) {
+    const res = fakeRes();
+    await handler(erroringReq({ headers: { 'x-telemetry-schema': declared } }), res);
+    assert.equal(res.statusCode, 415, `declared ${JSON.stringify(declared)} is 415'd at the PRE-READ seam (a post-seam poisoned stream would be 400)`);
+    assert.match(JSON.parse(res.body).error, /expected one of \["6","7","8"\]/, 'the reason names the accepted set');
+  }
+
+  // And the MISSING header — same pre-read seam, same 415.
+  const missing = fakeRes();
+  await handler(erroringReq({ headers: {} }), missing);
+  assert.equal(missing.statusCode, 415, 'a missing header is still 415 at the pre-read seam');
+
+  // The drift tally is unchanged: every out-of-window 415 buckets its declared
+  // version; the missing header records the 415 but (per the WARDEN-761 contract)
+  // buckets nothing.
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const rej = JSON.parse(res.body).rejections;
+  assert.equal(rej.byStatus['415'], 4, 'all four out-of-window requests are tallied');
+  assert.deepEqual(rej.byDeclaredVersion, { '5': 1, [String(SCHEMA_VERSION + 1)]: 1, abc: 1 }, 'each declared version buckets on the drift axis');
+});
+
+test('WINDOW: a v6-declared batch with one malformed event → 422 through the handler, nothing persisted (criterion 3)', async () => {
+  const { handler } = windowedWiring();
+  const res = fakeRes();
+  const bad = JSON.stringify({ schemaVersion: 6, events: [v6Metrics, { ...v6ServerStall, maxMs: 'huge' }] });
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '6' }, body: bad }), res);
+  assert.equal(res.statusCode, 422);
+  const summary = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), summary);
+  assert.equal(JSON.parse(summary.body).total, 0, 'nothing persisted');
+});
+
+test('WINDOW: a v6-declared batch carrying an 8-stamped event → 422 through the handler (criterion 4)', async () => {
+  const { handler } = windowedWiring();
+  const res = fakeRes();
+  const smuggled = JSON.stringify({
+    schemaVersion: 6,
+    events: [v6Metrics, { ...validError, schemaVersion: SCHEMA_VERSION }], // valid TODAY, wrong inside a v6 batch
+  });
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '6' }, body: smuggled }), res);
+  assert.equal(res.statusCode, 422, 'normalization must not paper over a version-stamp mismatch');
+});
+
+test('WINDOW: GET /capabilities advertises acceptedSchemaVersions ascending beside the UNCHANGED schemaVersion + authRequired (criterion 7)', async () => {
+  const { handler } = windowedWiring();
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.deepEqual(body.acceptedSchemaVersions, [6, 7, 8], 'the full accepted window, ascending NUMBERS');
+  assert.equal(body.schemaVersion, SCHEMA_VERSION, 'schemaVersion is unchanged — the client Test-connection check is untouched');
+  assert.equal(body.authRequired, false, 'authRequired is unchanged');
+});
+
+test('WINDOW: a schema override WITHOUT the window serves acceptedSchemaVersions [current] (additive fallback, key always present)', async () => {
+  // The pre-existing test/handler shape (schema: { SCHEMA_VERSION, validateEvent })
+  // keeps the strict handshake AND still advertises the key — the accepted set
+  // degrades to the current version alone, never to a missing field.
+  const store = createNdjsonStore({ sink: async () => {} });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
+  const body = JSON.parse(res.body);
+  assert.deepEqual(body.acceptedSchemaVersions, [SCHEMA_VERSION], 'absent window → current-only, key present');
+  assert.deepEqual(Object.keys(body).sort(), ['acceptedSchemaVersions', 'authRequired', 'schemaVersion'], 'the capabilities key set is stable');
+});
+
+test('WINDOW: liveness.mismatchedDeclaredVersions does NOT exclude window versions — a pre-window 6 bucket is still listed (deliberate decision, pinned)', async () => {
+  // DECISION (WARDEN-1445): the drift filter excludes ONLY the receiver's own
+  // version. The rejection tally is in-memory per boot, so once the window ships
+  // a window version can never be 415'd again — but if a '6' bucket DOES exist
+  // (a tally that predates the window deploy), it is genuine history a
+  // maintainer should still see. The window must not silently rewrite the drift
+  // story, so the filter is unchanged and this test holds it in place.
+  const rejections = createRejectionTally({ now: () => 0 });
+  rejections.record({ status: 415, reason: 'pre-window drift history', declaredVersion: '6' });
+  rejections.record({ status: 415, reason: 'genuine ahead-of-receiver drift', declaredVersion: String(SCHEMA_VERSION + 1) });
+  const handler = createRequestHandler({
+    store: readableStore([]),
+    rejections,
+    schema: { SCHEMA_VERSION, validateEvent, COMPATIBLE_SCHEMA_VERSIONS },
+    now: () => 10_000,
+  });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const { mismatchedDeclaredVersions } = JSON.parse(res.body).liveness;
+  assert.deepEqual(mismatchedDeclaredVersions, ['6', String(SCHEMA_VERSION + 1)], 'window versions are NOT filtered from the drift list — only the own version is');
+});
+
+test('WINDOW: the accepted set is ONE definition — DEFAULT_SCHEMA carries the receiver-local constant (both handshake sites read it via the schema bundle)', async () => {
+  // The window must never fork into parallel literals: the canonical check inside
+  // ingest() and the pre-read copy both read it through the injected schema
+  // bundle, and DEFAULT_SCHEMA is the single production wiring point.
+  assert.ok(Array.isArray(DEFAULT_SCHEMA.COMPATIBLE_SCHEMA_VERSIONS), 'DEFAULT_SCHEMA carries the window');
+  assert.deepEqual(DEFAULT_SCHEMA.COMPATIBLE_SCHEMA_VERSIONS, COMPATIBLE_SCHEMA_VERSIONS, 'no second copy of the constant');
+  assert.ok(DEFAULT_SCHEMA.COMPATIBLE_SCHEMA_VERSIONS.includes(DEFAULT_SCHEMA.SCHEMA_VERSION), 'the window includes the current version');
+  // Ascending, integers, current LAST — the advertised shape /capabilities serves.
+  const nums = DEFAULT_SCHEMA.COMPATIBLE_SCHEMA_VERSIONS;
+  assert.deepEqual(nums, [...nums].sort((a, b) => a - b), 'the window is stored ascending');
+  assert.ok(nums.every((n) => Number.isInteger(n)), 'every window member is an integer version');
 });

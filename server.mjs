@@ -64,7 +64,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { SCHEMA_VERSION, validateEvent } from './schema.ts';
 import { createNdjsonStore, fileSink, fileSource, fileRewrite, fileSeenKeysSource, fileSeenKeysSink } from './store.mjs';
-import { ingest } from './ingest.mjs';
+import { ingest, COMPATIBLE_SCHEMA_VERSIONS, acceptedSchemaVersionStrings } from './ingest.mjs';
 import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, DEFAULT_TIMELINE_MAX_BUCKETS, DEFAULT_TIMELINE_WINDOW_MS } from './summary.mjs';
 import { selectEvents, filterEvents, resolveLimit, resolveOffset } from './events.mjs';
 
@@ -173,7 +173,15 @@ function envRetentionInt(name, fallback) {
 
 // The default shared-schema deps — the vendored schema.ts, loaded once at module
 // init via Node's native type-stripping. Overridable per-handler for tests.
-export const DEFAULT_SCHEMA = { SCHEMA_VERSION, validateEvent };
+// `COMPATIBLE_SCHEMA_VERSIONS` (WARDEN-1445) is receiver-LOCAL — defined in
+// ingest.mjs, never in the vendored schema.ts (pinned byte-identical by
+// test/drift.test.mjs) — and rides this bundle so ONE `{...schema}` spread
+// threads the window to BOTH handshake sites: the canonical check inside
+// ingest() (via the ingest call's dep spread) and the pre-read defense-in-depth
+// copy below. An override schema that omits it (the pre-existing test shape)
+// collapses the window to that schema's own version — the strict pre-window
+// handshake — which is exactly what those tests assert.
+export const DEFAULT_SCHEMA = { SCHEMA_VERSION, validateEvent, COMPATIBLE_SCHEMA_VERSIONS };
 
 /**
  * Read a request body fully into a string. Telemetry batches are small, bounded,
@@ -1471,6 +1479,16 @@ function _composeLiveness({ readAt, startedAt, lastAcceptedAt, rejectionSnapshot
   // A non-numeric scanner value ("abc", "") is a genuine disagreement and IS listed:
   // the tally deliberately buckets it verbatim, and silently dropping it here would
   // re-open the "real signal silently dropped" hole the tally closed.
+  //
+  // DELIBERATELY NOT excluded (WARDEN-1445): the accepted prior-window versions
+  // (6, 7). The rejection tally is in-memory per process boot, so once this
+  // receiver ships the window, a window version can NEVER be 415'd again — a '6'
+  // bucket can only exist as genuine PRE-window history on a tally that has not
+  // been restarted, and that history is exactly what a maintainer should still
+  // see ("v6 clients WERE being rejected here"). Threading the window into this
+  // composer to filter an unoccurring population would be dead code with a
+  // second window copy; pinning this decision is the window-decision test in
+  // test/server.test.mjs (the WARDEN-1445 liveness block).
   const ownVersion = String(schemaVersion);
   const histogram = rejectionSnapshot.byDeclaredVersion;
   const mismatchedDeclaredVersions =
@@ -1947,6 +1965,16 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // on-demand probe, never a cached "connected" that could go stale (receiver
     // down, token rotated) and become a false trust signal.
     //
+    // `acceptedSchemaVersions` (WARDEN-1445, ADDITIVE): the full ascending set of
+    // declared versions the ingest handshake accepts — the current version plus
+    // the prior versions proven additive subsets. `schemaVersion` itself is
+    // UNCHANGED, so the client's existing Test-connection equality check (its
+    // vendored copy vs this field) is untouched: a client ON the current version
+    // sees no difference; an OLDER client can now read the window and learn its
+    // own version is accepted instead of discovering it via a 415. Ascending
+    // NUMBERS — the same shape as the receiver-local constant, derived from the
+    // SAME accepted-set helper both handshake sites read (never a parallel list).
+    //
     // Gated by the auth block above like every other route — DO NOT bypass the
     // gate for this route. The gate is what makes the auth verdict meaningful: a
     // receiver with AUTH_TOKEN set 401s an unauthenticated probe BEFORE this body
@@ -1958,6 +1986,7 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     if (req.method === 'GET' && pathname === CAPABILITIES_PATH) {
       return sendJson(res, 200, {
         schemaVersion: schema.SCHEMA_VERSION,
+        acceptedSchemaVersions: acceptedSchemaVersionStrings(schema.COMPATIBLE_SCHEMA_VERSIONS, schema.SCHEMA_VERSION).map(Number),
         authRequired: Boolean(authToken),
       });
     }
@@ -2073,9 +2102,21 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // WITHOUT buffering its body — the drift case (WARDEN-591's chief-risk
     // symptom: a flood of 415s under a schema mismatch) collapses to ZERO memory
     // cost instead of paying for its whole body before ingest() rejects it.
+    //
+    // WARDEN-1445: BOTH sites share ONE accepted set — the current version plus
+    // the prior versions proven additive subsets (COMPATIBLE_SCHEMA_VERSIONS,
+    // threaded through the schema bundle) — so this copy and the canonical check
+    // inside ingest() cannot disagree about who gets in. An exact-string Set
+    // (never a Number() coercion) keeps the pre-window strictness: a numeric 8,
+    // an "06", an "abc", or a missing header never matched, and still don't. A
+    // declared version outside the window still 415s here EXACTLY as before,
+    // still recorded at the rejection seam with its declaredVersion, and is
+    // still tallied in rejections.byDeclaredVersion — the drift population is
+    // unchanged; only the window's members stopped being part of it.
+    const acceptedSchemaStrings = acceptedSchemaVersionStrings(schema.COMPATIBLE_SCHEMA_VERSIONS, schema.SCHEMA_VERSION);
     const declaredSchema = readHeader(req.headers, 'x-telemetry-schema');
-    if (declaredSchema !== String(schema.SCHEMA_VERSION)) {
-      const reason = `unsupported telemetry schema version: expected "${schema.SCHEMA_VERSION}", got ${JSON.stringify(declaredSchema)}`;
+    if (!new Set(acceptedSchemaStrings).has(declaredSchema)) {
+      const reason = `unsupported telemetry schema version: expected one of [${acceptedSchemaStrings.map((v) => JSON.stringify(v)).join(',')}], got ${JSON.stringify(declaredSchema)}`;
       recordRejection(415, reason, declaredSchema);
       return sendJson(res, 415, { error: reason });
     }
@@ -2134,7 +2175,18 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // non-retryable "drop the batch" verdicts, and the client fails fast on those.
     let result;
     try {
-      result = await ingest({ headers: req.headers, body }, { ...schema, store, seenKeys, now });
+      result = await ingest({ headers: req.headers, body }, {
+        ...schema,
+        // WARDEN-1445: the window rides the schema bundle under its
+        // receiver-local constant name (COMPATIBLE_SCHEMA_VERSIONS) but ingest's
+        // dep is the descriptive `compatibleSchemaVersions` — mapped HERE, at the
+        // one call site, so the canonical check inside ingest() and the pre-read
+        // seam above read the SAME definition. An override schema without the
+        // constant maps undefined → ingest's current-only default (the strict
+        // pre-window handshake those overrides assert).
+        compatibleSchemaVersions: schema.COMPATIBLE_SCHEMA_VERSIONS,
+        store, seenKeys, now,
+      });
     } catch (e) {
       // The recorded reason is the store/sink's OWN diagnostic — an OS errno
       // (ENOSPC / EACCES / EISDIR) or a sink error — NEVER a raw client payload:
