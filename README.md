@@ -94,8 +94,19 @@ npm test                   # node --test (zero real network, zero real filesyste
 
 Point a Warden client at it by setting its telemetry `endpointUrl` to `http://<host>:7421/ingest` and
 opting in (base tier). A `schemaVersion: 1` batch of valid events returns `202 Accepted` and is appended to
-the NDJSON store; an unknown `x-telemetry-schema` version or any out-of-schema event is hard-rejected with
-a **non-retryable 4xx** (the client drops the batch rather than retrying it forever).
+the NDJSON store; a declared `x-telemetry-schema` version outside the accepted window (see
+`COMPATIBLE_SCHEMA_VERSIONS` in `ingest.mjs` — the current version plus the prior versions proven additive
+subsets of it) or any out-of-schema event is hard-rejected with a **non-retryable 4xx** (the client drops
+the batch rather than retrying it forever).
+
+#### The schema-version window (WARDEN-1445)
+
+An **additive** schema bump (new event types only — no field or validator change) no longer strands older
+installed builds: a batch declaring a version inside the accepted window is validated by **normalization**
+(each event's own `schemaVersion` must equal the declared batch version, then the unmodified current
+validator over a copy with the stamp substituted) and is persisted **as sent**, so `/summary`'s
+`schemaVersions` histogram stays truthful about what the fleet emits. No shape check is relaxed; a version
+outside the window still `415`s exactly as before and still feeds `rejections.byDeclaredVersion`.
 
 ### Reading the signal back — `GET /summary`
 
@@ -451,12 +462,17 @@ cross-repo schema drift:
 
 ```bash
 curl http://localhost:7421/capabilities
-# { "schemaVersion": 1, "authRequired": false }
+# { "schemaVersion": 1, "acceptedSchemaVersions": [1], "authRequired": false }
 ```
 
 - **`schemaVersion`** — the receiver's own `SCHEMA_VERSION` (sourced from the vendored `schema.ts`, never a
   parallel literal). The client compares it against its own vendored copy: a mismatch means client and
   receiver are on different schema versions — events would be hard-rejected at `/ingest` (the `415`).
+- **`acceptedSchemaVersions`** — the full ascending set of declared versions the ingest handshake accepts
+  (the current version plus the prior versions proven additive subsets; WARDEN-1445). ADDITIVE: the
+  `schemaVersion` check above is unchanged, so an existing client's Test-connection logic is untouched —
+  but an OLDER client can now read this field and learn its own version is already accepted, instead of
+  discovering it via a `415`.
 - **`authRequired`** — `true` when `AUTH_TOKEN` is set, `false` when the receiver is open.
 
 Like every other route, `/capabilities` is **gated behind `AUTH_TOKEN`** — checked before routing, so the gate
