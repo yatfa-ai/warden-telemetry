@@ -64,7 +64,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { SCHEMA_VERSION, validateEvent } from './schema.ts';
 import { createNdjsonStore, fileSink, fileSource, fileRewrite, fileSeenKeysSource, fileSeenKeysSink } from './store.mjs';
-import { ingest, COMPATIBLE_SCHEMA_VERSIONS, acceptedSchemaVersionStrings } from './ingest.mjs';
+import { ingest, COMPATIBLE_SCHEMA_VERSIONS, acceptedSchemaVersionStrings, unsupportedSchemaVersionReason } from './ingest.mjs';
 import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, DEFAULT_TIMELINE_MAX_BUCKETS, DEFAULT_TIMELINE_WINDOW_MS } from './summary.mjs';
 import { selectEvents, filterEvents, resolveLimit, resolveOffset } from './events.mjs';
 
@@ -2116,7 +2116,10 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     const acceptedSchemaStrings = acceptedSchemaVersionStrings(schema.COMPATIBLE_SCHEMA_VERSIONS, schema.SCHEMA_VERSION);
     const declaredSchema = readHeader(req.headers, 'x-telemetry-schema');
     if (!new Set(acceptedSchemaStrings).has(declaredSchema)) {
-      const reason = `unsupported telemetry schema version: expected one of [${acceptedSchemaStrings.map((v) => JSON.stringify(v)).join(',')}], got ${JSON.stringify(declaredSchema)}`;
+      // ONE reason text, imported from ingest.mjs — the same template literal the
+      // canonical check uses, so the two sites cannot drift on wording (a handler
+      // test pins the two 415 error texts equal for the same declared value).
+      const reason = unsupportedSchemaVersionReason(acceptedSchemaStrings, declaredSchema);
       recordRejection(415, reason, declaredSchema);
       return sendJson(res, 415, { error: reason });
     }

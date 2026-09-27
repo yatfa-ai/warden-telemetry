@@ -4537,7 +4537,7 @@ test('createSeenKeys: a non-string/empty key is a no-op (an absent header never 
 // on /summary under their OWN version, out-of-window versions still 415 at the
 // PRE-READ seam with their drift tally, and /capabilities advertises the window.
 
-import { COMPATIBLE_SCHEMA_VERSIONS } from '../ingest.mjs';
+import { COMPATIBLE_SCHEMA_VERSIONS, ingest } from '../ingest.mjs';
 
 // v6-shaped fixtures — the production rows the stranded v6 build actually emits
 // (WARDEN-1445 criterion 1 names exactly these three types).
@@ -4659,12 +4659,32 @@ test('WINDOW: declared 5 / 9 / abc / MISSING still 415 at the PRE-READ seam (poi
     await handler(erroringReq({ headers: { 'x-telemetry-schema': declared } }), res);
     assert.equal(res.statusCode, 415, `declared ${JSON.stringify(declared)} is 415'd at the PRE-READ seam (a post-seam poisoned stream would be 400)`);
     assert.match(JSON.parse(res.body).error, /expected one of \["6","7","8"\]/, 'the reason names the accepted set');
+    // PIN the no-drift claim: the seam's 415 error text must equal the canonical
+    // check's, because both sites call the ONE imported reason builder
+    // unsupportedSchemaVersionReason. Compares the `error` TEXT, not the whole
+    // body — the canonical path additionally carries `declaredVersion`
+    // structurally on its body (WARDEN-761, pre-existing shape), which the seam's
+    // tally carries instead. The direct ingest() call threads the SAME window the
+    // handler got (COMPATIBLE_SCHEMA_VERSIONS), so the two texts describe the
+    // same accepted set.
+    const canonical = await ingest(
+      { headers: { 'x-telemetry-schema': declared }, body: '' },
+      { SCHEMA_VERSION, validateEvent, compatibleSchemaVersions: COMPATIBLE_SCHEMA_VERSIONS, store: { appendEvents: async () => {} } }
+    );
+    assert.equal(canonical.status, 415);
+    assert.equal(JSON.parse(res.body).error, canonical.body.error, `seam and ingest() share ONE reason text for declared ${JSON.stringify(declared)} — they cannot drift on wording`);
   }
 
-  // And the MISSING header — same pre-read seam, same 415.
+  // And the MISSING header — same pre-read seam, same 415, same ONE reason text.
   const missing = fakeRes();
   await handler(erroringReq({ headers: {} }), missing);
   assert.equal(missing.statusCode, 415, 'a missing header is still 415 at the pre-read seam');
+  const canonicalMissing = await ingest(
+    { headers: {}, body: '' },
+    { SCHEMA_VERSION, validateEvent, compatibleSchemaVersions: COMPATIBLE_SCHEMA_VERSIONS, store: { appendEvents: async () => {} } }
+  );
+  assert.equal(canonicalMissing.status, 415);
+  assert.equal(JSON.parse(missing.body).error, canonicalMissing.body.error, 'seam and ingest() share ONE reason text for the missing header too');
 
   // The drift tally is unchanged: every out-of-window 415 buckets its declared
   // version; the missing header records the 415 but (per the WARDEN-761 contract)

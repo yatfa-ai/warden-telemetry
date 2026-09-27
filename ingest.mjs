@@ -111,9 +111,13 @@ export function acceptedSchemaVersionStrings(compatibleSchemaVersions, schemaVer
 
 // The 415 reason text, shared by BOTH handshake sites (ingest's canonical check
 // and server.mjs's pre-read defense-in-depth copy) so the two sites cannot drift
-// on wording. Names the accepted set (WARDEN-1445) instead of a single expected
-// version, so a maintainer reading a drift diagnostic can see the window too.
-function unsupportedSchemaVersionReason(acceptedStrings, declared) {
+// on wording: ingest calls it at its canonical check, and server.mjs imports and
+// calls it at the pre-read seam — ONE template literal, no inline re-typing.
+// A handler test pins the two 415 ERROR TEXTS equal for the same declared value,
+// so the "cannot drift" claim is enforced, not prose. Names the accepted set
+// (WARDEN-1445) instead of a single expected version, so a maintainer reading a
+// drift diagnostic can see the window too.
+export function unsupportedSchemaVersionReason(acceptedStrings, declared) {
   return `unsupported telemetry schema version: expected one of [${acceptedStrings.map((v) => JSON.stringify(v)).join(',')}], got ${JSON.stringify(declared)}`;
 }
 
