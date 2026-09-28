@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP } from '../summary.mjs';
+import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP, WORKSPACE_NAMES_SUMMARY_CAP } from '../summary.mjs';
 // Canonical valid events (verbatim shapes ingest persists — one per base type).
 const validError = {
   schemaVersion: 1,
@@ -49,6 +49,30 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.deepEqual(s.byRuntime, {});
   assert.deepEqual(s.crashReasons, {});
   assert.deepEqual(s.operations, {});
+  // WARDEN-1473 — the workspace axes read a STABLE zeroed shape on an empty
+  // store: every schema count is present with `windowsSeen: 0` and `null`
+  // min/max, never a fabricated `0` (a `0` panesOpen is a REAL measurement).
+  assert.deepEqual(s.workspaceShape, {
+    windowsSeen: 0,
+    lastSnapshotAt: null,
+    counts: {
+      workspaces: { windowsSeen: 0, min: null, avg: 0, max: null },
+      panesOpen: { windowsSeen: 0, min: null, avg: 0, max: null },
+      panesActive: { windowsSeen: 0, min: null, avg: 0, max: null },
+      chats: { windowsSeen: 0, min: null, avg: 0, max: null },
+      peakPanesOpen: { windowsSeen: 0, min: null, avg: 0, max: null },
+      peakChats: { windowsSeen: 0, min: null, avg: 0, max: null },
+    },
+  });
+  assert.deepEqual(s.workspaceNames, {
+    windowsSeen: 0,
+    names: {},
+    distinctCount: 0,
+    maxChatCount: null,
+    lastChatCount: null,
+    truncatedEver: false,
+    lastSnapshotAt: null,
+  });
   assert.equal(s.firstSeen, null);
   assert.equal(s.lastSeen, null);
 });
@@ -1794,4 +1818,299 @@ test('lastAcceptedInstant returns exactly summarize().lastSeen for the SAME arra
   ];
   assert.equal(lastAcceptedInstant(events), summarize(events).lastSeen, 'identical by construction');
   assert.equal(lastAcceptedInstant(events), 880, 'and the value is the honest maximum');
+});
+
+// ── WORKSPACE AGGREGATES (WARDEN-1473) ────────────────────────────────────────
+// The read-side completion of the vein `stalls` (WARDEN-854) and `operations`
+// (WARDEN-1435) cut: both workspace event types reduced to a bare `byType`
+// integer, which made roadmap WARDEN-1265's founding defect ILLEGIBLE on the
+// read surface — "twenty-five chats and twenty-five identically-named chats are
+// the same number". `workspaceShape` projects the count snapshot's min/avg/max
+// per axis; `workspaceNames` projects the bounded distinct-name set beside the
+// TRUE catalog size, so `distinctCount < maxChatCount` IS the collision verdict.
+
+// Copyable fixtures — the verbatim shapes the validator accepts (schema.ts
+// isWorkspaceShapeShape / isWorkspaceNamesShape).
+const shapeWindow = (overrides = {}) => ({
+  schemaVersion: 8,
+  type: 'workspace-shape',
+  runtime: 'renderer',
+  timestamp: 1735689600000,
+  windowStartedAt: 1735689300000,
+  windowEndedAt: 1735689600000,
+  workspaces: 1,
+  panesOpen: 2,
+  panesActive: 2,
+  chats: 3,
+  peakPanesOpen: 2,
+  peakChats: 3,
+  ...overrides,
+});
+const namesWindow = (overrides = {}) => ({
+  schemaVersion: 8,
+  type: 'workspace-names',
+  runtime: 'server',
+  timestamp: 1735689600000,
+  windowStartedAt: 1735689300000,
+  windowEndedAt: 1735689600000,
+  chats: ['demo'],
+  chatCount: 1,
+  truncated: false,
+  ...overrides,
+});
+
+// The empty (never-populated) per-count snapshot, for the stable-shape asserts.
+const EMPTY_COUNT = { windowsSeen: 0, min: null, avg: 0, max: null };
+
+test('workspaceShape/workspaceNames are stable zeroed shapes on a workspace-free store (no false alarm)', () => {
+  // Non-workspace events contribute nothing — each axis reads only its own type.
+  const s = summarize([validError, validCrash, validStall, validServerStall]);
+  assert.equal(s.workspaceShape.windowsSeen, 0);
+  assert.equal(s.workspaceShape.lastSnapshotAt, null);
+  assert.deepEqual(s.workspaceShape.counts, {
+    workspaces: EMPTY_COUNT, panesOpen: EMPTY_COUNT, panesActive: EMPTY_COUNT,
+    chats: EMPTY_COUNT, peakPanesOpen: EMPTY_COUNT, peakChats: EMPTY_COUNT,
+  });
+  assert.deepEqual(s.workspaceNames, {
+    windowsSeen: 0, names: {}, distinctCount: 0, maxChatCount: null,
+    lastChatCount: null, truncatedEver: false, lastSnapshotAt: null,
+  });
+});
+
+test('workspaceShape.counts key set is STABLE — every schema count is present even when never populated', () => {
+  // The `byType` zeroed-shape posture one level down: a maintainer always reads
+  // every count axis, and an axis nothing carried says so with windowsSeen 0 +
+  // null extrema rather than vanishing from the response.
+  const s = summarize([shapeWindow()]);
+  assert.deepEqual(
+    Object.keys(s.workspaceShape.counts).sort(),
+    ['chats', 'panesActive', 'panesOpen', 'peakChats', 'peakPanesOpen', 'workspaces'],
+  );
+});
+
+test('workspaceShape.windowsSeen equals byType[workspace-shape] and max is the true max per count', () => {
+  // Criterion 2's seeded-store equality: for each count, windowsSeen == number
+  // of seeded shape events and max == the true max across them.
+  const windows = [
+    shapeWindow({ workspaces: 1, panesOpen: 2, panesActive: 1, chats: 4, peakPanesOpen: 3, peakChats: 5 }),
+    shapeWindow({ workspaces: 3, panesOpen: 8, panesActive: 6, chats: 4, peakPanesOpen: 9, peakChats: 7 }),
+    shapeWindow({ workspaces: 2, panesOpen: 5, panesActive: 2, chats: 1, peakPanesOpen: 5, peakChats: 4 }),
+  ];
+  const s = summarize(windows);
+  assert.equal(s.workspaceShape.windowsSeen, 3);
+  assert.equal(s.workspaceShape.windowsSeen, s.byType['workspace-shape'], 'the payload and count axes agree');
+  for (const key of ['workspaces', 'panesOpen', 'panesActive', 'chats', 'peakPanesOpen', 'peakChats']) {
+    const snap = s.workspaceShape.counts[key];
+    assert.equal(snap.windowsSeen, windows.length, `${key}: every window contributed`);
+    assert.equal(snap.max, Math.max(...windows.map((w) => w[key])), `${key}: max is the true max`);
+    assert.equal(snap.min, Math.min(...windows.map((w) => w[key])), `${key}: min is the true min`);
+    const mean = windows.reduce((a, w) => a + w[key], 0) / windows.length;
+    assert.equal(snap.avg, mean, `${key}: avg is the PLAIN mean — each window is one equal-weight snapshot`);
+  }
+});
+
+test('a 9-panes-then-1-pane window surfaces max.peakPanesOpen 9 without touching /events (WARDEN-1473 criterion 2)', () => {
+  // The per-window peak is exactly the open-then-close burst the shape event
+  // exists to keep visible: the window CLOSED on 1 pane, and the burst is still
+  // readable off the summary alone. The validator guarantees peak >= closing
+  // INSIDE each event, so the peaks compose under `max` with no special case.
+  const s = summarize([shapeWindow({ panesOpen: 1, peakPanesOpen: 9 })]);
+  assert.equal(s.workspaceShape.counts.peakPanesOpen.max, 9, 'the burst is visible');
+  assert.equal(s.workspaceShape.counts.panesOpen.max, 1, 'and the closing count still reads its own value');
+});
+
+test('workspaceShape.lastSnapshotAt is the newest windowEndedAt — the PRODUCER clock, not arrival order', () => {
+  // Persisted out of order on purpose: freshness must key off the window's own
+  // close instant, so a late-persisted old window cannot make the axis look stale.
+  const s = summarize([
+    shapeWindow({ windowEndedAt: 5_000 }),
+    shapeWindow({ windowEndedAt: 9_000 }),
+    shapeWindow({ windowEndedAt: 7_000 }),
+  ]);
+  assert.equal(s.workspaceShape.lastSnapshotAt, 9_000);
+});
+
+test('workspaceShape counts a 0 as a REAL measurement, never as the empty sentinel', () => {
+  // A workspace with no panes open is a genuine observation; `null` is reserved
+  // for "nothing finite was folded" (the _stallSnapshot honesty posture).
+  const s = summarize([shapeWindow({ panesOpen: 0, panesActive: 0, peakPanesOpen: 0 })]);
+  assert.deepEqual(s.workspaceShape.counts.panesOpen, { windowsSeen: 1, min: 0, avg: 0, max: 0 });
+});
+
+test('workspaceShape is skip-robust: a malformed count degrades ONLY its own axis, never to NaN', () => {
+  // Criterion 5, per-field grain: the event still counts in byType AND in
+  // windowsSeen (parity), the good counts fold normally, and the bad ones read
+  // the honest empty snapshot instead of NaN.
+  const s = summarize([
+    shapeWindow({ panesOpen: NaN, panesActive: 'three', chats: -1, peakChats: undefined, workspaces: 4, peakPanesOpen: 6 }),
+  ]);
+  assert.equal(s.byType['workspace-shape'], 1, 'still counted on the count axis');
+  assert.equal(s.workspaceShape.windowsSeen, 1, 'and still counted as a window seen (byType parity)');
+  assert.deepEqual(s.workspaceShape.counts.workspaces, { windowsSeen: 1, min: 4, avg: 4, max: 4 });
+  assert.deepEqual(s.workspaceShape.counts.peakPanesOpen, { windowsSeen: 1, min: 6, avg: 6, max: 6 });
+  for (const key of ['panesOpen', 'panesActive', 'chats', 'peakChats']) {
+    assert.deepEqual(s.workspaceShape.counts[key], EMPTY_COUNT, `${key}: unusable → honest empty, not NaN`);
+    assert.ok(!Number.isNaN(s.workspaceShape.counts[key].avg), `${key}: avg is never NaN`);
+  }
+});
+
+test('workspaceShape skips a wholly-malformed entry without poisoning the aggregate', () => {
+  const s = summarize([null, 'garbage', 42, shapeWindow({ panesOpen: 7, peakPanesOpen: 7 })]);
+  assert.equal(s.workspaceShape.windowsSeen, 1, 'only the real window counted');
+  assert.equal(s.workspaceShape.counts.panesOpen.max, 7);
+});
+
+// ── workspaceNames — the identically-named-chats verdict ──────────────────────
+
+test('workspaceNames makes the collision legible: distinctCount 5 vs maxChatCount 25 (WARDEN-1473 criterion 3)', () => {
+  // The founding defect, readable in ONE query: a 25-chat catalog carrying only
+  // 5 DISTINCT names. `distinctCount < maxChatCount` is the verdict.
+  const five = ['Untitled', 'demo', 'Refactor auth', 'scratch', 'test'];
+  const s = summarize([
+    namesWindow({ chats: five, chatCount: 25, truncated: true, windowEndedAt: 10_000 }),
+    namesWindow({ chats: five, chatCount: 25, truncated: true, windowEndedAt: 20_000 }),
+  ]);
+  assert.equal(s.workspaceNames.windowsSeen, 2);
+  assert.equal(s.workspaceNames.distinctCount, 5, 'the catalog holds 5 distinct names');
+  assert.equal(s.workspaceNames.maxChatCount, 25, 'against a TRUE catalog size of 25');
+  assert.ok(
+    s.workspaceNames.distinctCount < s.workspaceNames.maxChatCount,
+    'the identically-named-chats verdict is readable off /summary alone',
+  );
+  assert.deepEqual(s.workspaceNames.names, {
+    Untitled: 2, demo: 2, 'Refactor auth': 2, scratch: 2, test: 2,
+  }, 'each name is counted once per window it appeared in');
+});
+
+test('workspaceNames.truncatedEver flips on a seeded truncated window (and is false otherwise)', () => {
+  assert.equal(summarize([namesWindow()]).workspaceNames.truncatedEver, false, 'an honest full list');
+  const s = summarize([namesWindow(), namesWindow({ truncated: true })]);
+  assert.equal(s.workspaceNames.truncatedEver, true, 'ANY truncated window flips it');
+});
+
+test('workspaceNames.windowsSeen equals byType[workspace-names]', () => {
+  const s = summarize([validError, namesWindow(), namesWindow(), namesWindow()]);
+  assert.equal(s.workspaceNames.windowsSeen, 3);
+  assert.equal(s.workspaceNames.windowsSeen, s.byType['workspace-names'], 'the payload and count axes agree');
+});
+
+test('workspaceNames.maxChatCount is the largest TRUE catalog size; lastChatCount is the most RECENT window', () => {
+  // Persisted out of order on purpose: "most recent" keys off the producer's own
+  // windowEndedAt, so a late-persisted old window cannot rewrite the latest size.
+  const s = summarize([
+    namesWindow({ chatCount: 40, chats: ['a'], truncated: true, windowEndedAt: 5_000 }),
+    namesWindow({ chatCount: 7, chats: ['a'], truncated: true, windowEndedAt: 9_000 }),
+    namesWindow({ chatCount: 12, chats: ['a'], truncated: true, windowEndedAt: 7_000 }),
+  ]);
+  assert.equal(s.workspaceNames.maxChatCount, 40, 'the peak catalog size across every window');
+  assert.equal(s.workspaceNames.lastChatCount, 7, 'the NEWEST window by windowEndedAt, not by array order');
+  assert.equal(s.workspaceNames.lastSnapshotAt, 9_000);
+});
+
+test('workspaceNames treats chatCount 0 as a REAL size, never as the empty sentinel', () => {
+  const s = summarize([namesWindow({ chats: [], chatCount: 0 })]);
+  assert.equal(s.workspaceNames.maxChatCount, 0, 'a measured empty catalog');
+  assert.equal(s.workspaceNames.lastChatCount, 0);
+  assert.deepEqual(s.workspaceNames.names, {});
+  assert.equal(s.workspaceNames.distinctCount, 0);
+});
+
+test('workspaceNames is skip-robust: a malformed entry is skipped, still counted, never NaN (criterion 5)', () => {
+  const s = summarize([
+    namesWindow({ chats: 'not-an-array', chatCount: NaN, truncated: 'yes', windowEndedAt: 'soon' }),
+    namesWindow({ chats: [null, 42, '', 'real'], chatCount: 9, windowEndedAt: 1_000 }),
+  ]);
+  assert.equal(s.byType['workspace-names'], 2, 'both events counted on the count axis');
+  assert.equal(s.workspaceNames.windowsSeen, 2, 'and both counted as windows seen (byType parity)');
+  assert.deepEqual(s.workspaceNames.names, { real: 1 }, 'only the usable name bucketed');
+  assert.equal(s.workspaceNames.distinctCount, 1);
+  assert.equal(s.workspaceNames.maxChatCount, 9, 'the non-finite chatCount contributed nothing');
+  assert.ok(!Number.isNaN(s.workspaceNames.maxChatCount));
+  assert.equal(s.workspaceNames.truncatedEver, false, 'a non-boolean `truncated` is not a truncation claim');
+  assert.equal(s.workspaceNames.lastSnapshotAt, 1_000, 'the non-finite windowEndedAt contributed nothing');
+});
+
+test('workspaceNames records a last-known chatCount even when every windowEndedAt is unusable', () => {
+  // The degradation is deliberate: a window whose producer clock is unreadable
+  // still contributes a last-known catalog size (arrival order) rather than
+  // leaving lastChatCount null while maxChatCount plainly reports a number.
+  const s = summarize([namesWindow({ chatCount: 3, chats: ['a'], truncated: true, windowEndedAt: NaN })]);
+  assert.equal(s.workspaceNames.maxChatCount, 3);
+  assert.equal(s.workspaceNames.lastChatCount, 3);
+  assert.equal(s.workspaceNames.lastSnapshotAt, null, 'freshness stays honestly absent');
+});
+
+// ── BOUNDING (criterion 4, WARDEN-1246 posture) ───────────────────────────────
+
+test('workspaceNames truncates a name longer than CLIENT_KEY_MAX_LENGTH', () => {
+  // Chat names are FREE client strings (the validator carries no name-pattern
+  // constraint by design), so one multi-KB name must never be reproduced in full
+  // inside EVERY subsequent /summary response.
+  const long = 'n'.repeat(CLIENT_KEY_MAX_LENGTH + 500);
+  const s = summarize([namesWindow({ chats: [long], chatCount: 1 })]);
+  const keys = Object.keys(s.workspaceNames.names);
+  assert.equal(keys.length, 1);
+  assert.equal(keys[0].length, CLIENT_KEY_MAX_LENGTH, 'the key is bounded at the shared cap');
+  assert.equal(keys[0], 'n'.repeat(CLIENT_KEY_MAX_LENGTH));
+});
+
+test('workspaceNames folds past-cap distinct names into ONE counted __overflow__ bucket', () => {
+  // Bounded cardinality, no count loss — the createRejectionTally / operations
+  // shape. The cap is anchored to the PRODUCER's own per-window cap so a
+  // realistic catalog keeps every name readable; only a hostile / runaway
+  // cardinality reaches the fold.
+  const N = WORKSPACE_NAMES_SUMMARY_CAP;
+  const overflowing = Array.from({ length: N + 25 }, (_, i) => `chat-${i}`);
+  const s = summarize([namesWindow({ chats: overflowing, chatCount: overflowing.length })]);
+  const names = s.workspaceNames.names;
+  assert.equal(Object.keys(names).length, N + 1, `collapses to ${N} + 1 keys regardless of input cardinality`);
+  assert.equal(names.__overflow__, 25, 'and the folded count is STATED, never dropped');
+  assert.equal(
+    Object.values(names).reduce((a, b) => a + b, 0),
+    overflowing.length,
+    'Σ counts == Σ seeded names (no count loss)',
+  );
+  assert.equal(s.workspaceNames.distinctCount, N + 1, 'distinctCount counts the overflow bucket — the cap is LOUD');
+});
+
+test('a realistic catalog well under the cap keeps every name in its own readable bucket', () => {
+  // The reason the cap is NOT CLIENT_HISTOGRAM_CAP (10): folding a 25-name
+  // catalog into __overflow__ would answer "which chats exist?" with
+  // `__overflow__` and destroy the capability this axis adds.
+  const twentyFive = Array.from({ length: 25 }, (_, i) => `chat-${i}`);
+  const s = summarize([namesWindow({ chats: twentyFive, chatCount: 25 })]);
+  assert.equal(Object.keys(s.workspaceNames.names).length, 25);
+  assert.equal(s.workspaceNames.names.__overflow__, undefined, 'no overflow at realistic cardinality');
+  assert.ok(WORKSPACE_NAMES_SUMMARY_CAP > CLIENT_HISTOGRAM_CAP, 'the name axis is deliberately wider than the free-text axes');
+});
+
+// ── CROSS-AXIS ISOLATION ──────────────────────────────────────────────────────
+
+test('the two workspace axes never cross-contaminate: a shape window is not a names window', () => {
+  // `chats` is a COUNT on the shape event and a LIST on the names event — the
+  // one field name the two types share, and the obvious place to get it wrong.
+  const s = summarize([shapeWindow({ chats: 7, peakChats: 7 }), namesWindow({ chats: ['a', 'b'], chatCount: 2 })]);
+  assert.equal(s.workspaceShape.counts.chats.max, 7, 'the shape axis read the COUNT');
+  assert.deepEqual(s.workspaceNames.names, { a: 1, b: 1 }, 'the names axis read the LIST');
+  assert.equal(s.workspaceShape.windowsSeen, 1);
+  assert.equal(s.workspaceNames.windowsSeen, 1);
+});
+
+test('a workspace window does NOT enter the operations or stall axes', () => {
+  const s = summarize([shapeWindow(), namesWindow(), { ...validStall, lagMs: 400 }]);
+  assert.equal(s.stalls.count, 1, 'only the per-stall event is in the magnitude axis');
+  assert.deepEqual(s.operations, {}, 'and neither workspace type folds into the per-operation axis');
+});
+
+test('summarize() stays a PURE single-arg function over the workspace axes (scoping lives in the handler)', () => {
+  // Criterion 7's pure half: the same array in yields the same aggregate out,
+  // twice, with no second parameter — which is what lets the /summary handler
+  // pre-filter via the SHARED filterEvents (WARDEN-727) and get scoped workspace
+  // aggregates for free.
+  const events = [shapeWindow({ panesOpen: 4, peakPanesOpen: 6 }), namesWindow({ chats: ['a'], chatCount: 3, truncated: true })];
+  assert.equal(summarize.length, 1, 'one declared parameter');
+  assert.deepEqual(summarize(events), summarize(events), 'deterministic — no hidden state across calls');
+  const scopedToShape = summarize(events.filter((e) => e.type === 'workspace-shape'));
+  assert.equal(scopedToShape.workspaceNames.windowsSeen, 0, 'a pre-filtered array scopes the OTHER axis to its zeroed shape');
+  assert.equal(scopedToShape.workspaceShape.counts.peakPanesOpen.max, 6);
 });

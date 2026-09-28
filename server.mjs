@@ -1733,7 +1733,13 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
     // GET /summary — the maintainer read surface (WARDEN-567). Returns AGGREGATES
     // of the already-validated, already-redacted events persisted by POST /ingest
     // (counts / per-type / top error names / schema-version histogram only —
-    // never raw events, never extended-tier names). No request body is read.
+    // never raw events; and never the extended-tier DECORATION fields
+    // `chatName`/`sessionName`. The ONE identifier-bearing aggregate is
+    // `workspaceShape`'s sibling `workspaceNames.names` — the bounded distinct
+    // chat-name set from the `workspace-names` event type, which exists to carry
+    // exactly those names behind its own consent category; see summary.mjs's
+    // trust-model header for why that is a deliberate exception rather than an
+    // erosion). No request body is read.
     //
     // The aggregates are SCOPEABLE (WARDEN-727) via the SAME conjunctive filters
     // /events takes — ?type= / ?platform= / ?appVersion= / ?since= — applied
