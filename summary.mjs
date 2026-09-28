@@ -4,7 +4,8 @@
 // self-hosting maintainer can act on (counts / histograms only):
 //   - `summarize(events)`        → flat aggregates (total / byType / topErrorNames
 //                                  / topSignatures / schemaVersions / appVersions
-//                                  / platforms / crashReasons / stalls / firstSeen
+//                                  / platforms / crashReasons / stalls / operations
+//                                  / workspaceShape / workspaceNames / firstSeen
 //                                  / lastSeen).
 //   - `lastAcceptedInstant(events)` → the newest effective instant across the batch
 //                                  (WARDEN-1428) — i.e. WHEN the newest ACCEPTED
@@ -39,10 +40,25 @@
 // failure `signature` histogram (error name + top stack frame / crash reason /
 // stall source), a schema-version histogram, an app-release `appVersion`
 // histogram, an OS `platform` histogram, and a counts-only time distribution.
-// NEVER echo raw events or extended-tier
-// names (chatName /
-// sessionName) — those are the only identifiers ever present, and a summary has
-// no need of them.
+// NEVER echo raw events. NEVER echo the extended-tier decoration fields
+// (`chatName` / `sessionName`) that other categories hang on incidents events —
+// a summary has no need of them.
+//
+// ONE EXCEPTION, and it is a deliberate one, not an erosion (WARDEN-1473):
+// `workspaceNames.names` reproduces the bounded DISTINCT chat-name set. It is an
+// exception because the `workspace-names` event type EXISTS to carry those names
+// (WARDEN-1416 — it is the `names` category's own carrying event, not a
+// decoration on something else), so an aggregate over that type that refused to
+// name anything could not answer the question the type was added for:
+// `distinctCount` vs `maxChatCount` — whether a 25-chat catalog holds 25
+// identically-named chats, roadmap WARDEN-1265's founding defect. The names
+// arrive only behind the `names` consent category (the client's redactor drops
+// them otherwise), only inside an event the user opted into, already redacted
+// pre-collection; and the aggregate bounds them exactly like every other
+// client-keyed axis (key truncation + cardinality cap + `__overflow__` fold), so
+// one oversized or runaway catalog can never inflate every response. No OTHER
+// aggregate here carries an identifier, and `workspace-shape` — despite its name
+// — carries COUNTS ONLY, guaranteed by the closed key set the schema enforces.
 //
 // `appVersions` (WARDEN-665) buckets event counts by the client's non-identifying
 // `appVersion` release label — a value identical for every user on a release (not
@@ -100,9 +116,11 @@
 // `source`. It is a counts-only histogram of those bucket keys, identical in
 // posture to `topErrorNames`/`appVersions`/`platforms`: it incorporates NO free
 // text and NO extended-tier identifier. It MUST NOT read `message` (redacted free
-// text — the field most likely to carry residual identifying fragments) nor
-// `chatName`/`sessionName` (the only identifiers ever present); an error whose
-// frames are empty / lack the location fields degrades to the bare `name` (exactly
+// text — the field most likely to carry residual identifying fragments) nor any
+// name field — neither the extended-tier decorations `chatName`/`sessionName` nor
+// the `workspace-names` catalog's `chats[]` (WARDEN-1416), which only
+// `workspaceNames` aggregates; an error whose frames are empty / lack the
+// location fields degrades to the bare `name` (exactly
 // the `topErrorNames` bucket), so nothing regresses.
 //
 // `stalls` (WARDEN-854) is the MAGNITUDE axis the stall COUNT (`byType` /
@@ -166,11 +184,14 @@ const TOP_SIGNATURES_CAP = 10;
 //   1. KEY LENGTH — a longer client value is TRUNCATED to CLIENT_KEY_MAX_LENGTH
 //      chars before bucketing (two distinct long values sharing a prefix
 //      collide into one bucket: acceptable, and honest — the response is bounded).
-//   2. CARDINALITY — the first CLIENT_HISTOGRAM_CAP distinct keys get their own
-//      bucket; every FURTHER distinct key folds into ONE counted `__overflow__`
-//      bucket, reusing the exact top-N + overflow shape createRejectionTally
-//      established on the ingest side (WARDEN-829) so the two surfaces stay
-//      consistent. Overflow is REPRESENTED, never dropped.
+//   2. CARDINALITY — the first `cap` distinct keys (CLIENT_HISTOGRAM_CAP by
+//      default) get their own bucket; every FURTHER distinct key folds into ONE
+//      counted `__overflow__` bucket, reusing the exact top-N + overflow shape
+//      createRejectionTally established on the ingest side (WARDEN-829) so the
+//      two surfaces stay consistent. Overflow is REPRESENTED, never dropped. The
+//      cap is a parameter because one axis legitimately needs a wider one — see
+//      WORKSPACE_NAMES_SUMMARY_CAP (WARDEN-1473) and the same reasoning
+//      OPERATIONS_SUMMARY_CAP records; every free-text axis here uses the default.
 export const CLIENT_KEY_MAX_LENGTH = 128;
 export const CLIENT_HISTOGRAM_CAP = 10; // mirrors TOP_ERROR_NAMES_CAP / TOP_SIGNATURES_CAP
 
@@ -197,14 +218,24 @@ function _boundClientKey(key) {
  * (WARDEN-1246): key-length truncation (via _boundClientKey) + top-N +
  * `__overflow__` cardinality cap, the same shape as createRejectionTally's
  * `byDeclaredVersion` (server.mjs, WARDEN-829). `snapshot()` returns a plain
- * `{ [key]: count }` object holding ≤ CLIENT_HISTOGRAM_CAP + 1 keys no matter
- * what any client sent. hasOwnProperty (not `in`) keeps attacker keys like
- * "toString" / "constructor" bucketing as ordinary own keys.
+ * `{ [key]: count }` object holding ≤ `cap` + 1 keys no matter what any client
+ * sent. hasOwnProperty (not `in`) keeps attacker keys like "toString" /
+ * "constructor" bucketing as ordinary own keys.
  *
+ * `cap` defaults to CLIENT_HISTOGRAM_CAP — the bound every free-text client
+ * histogram here uses. It is a PARAMETER only because one axis legitimately
+ * needs a wider one: chat names (WARDEN-1473) are a per-window CATALOG whose
+ * realistic cardinality is an order of magnitude past 10, so folding it at 10
+ * would answer "which chats exist?" with `__overflow__` and destroy the exact
+ * capability that axis adds — the same reasoning OPERATIONS_SUMMARY_CAP records
+ * for operation names. Every pre-existing call site passes nothing and is
+ * bounded exactly as before.
+ *
+ * @param {number} [cap] max distinct keys before the `__overflow__` fold
  * @returns {{ record(value: string): void, snapshot(): Record<string, number> }}
  * @private
  */
-function _createBoundedClientHistogram() {
+function _createBoundedClientHistogram(cap = CLIENT_HISTOGRAM_CAP) {
   const counts = {};
   let distinct = 0;
   return {
@@ -212,7 +243,7 @@ function _createBoundedClientHistogram() {
       const key = _boundClientKey(value);
       if (Object.prototype.hasOwnProperty.call(counts, key)) {
         counts[key] += 1; // an already-tracked distinct key bumps its own bucket
-      } else if (distinct < CLIENT_HISTOGRAM_CAP) {
+      } else if (distinct < cap) {
         counts[key] = 1; // new distinct key under the cap → its own bucket
         distinct += 1;
       } else {
@@ -260,6 +291,44 @@ function _createBoundedClientHistogram() {
 // per-window histograms stay readable on /events.
 export const OPERATIONS_SUMMARY_CAP = 129; // anchored to schema.ts's MAX_OPERATIONS_PER_EVENT
 
+// ── WORKSPACE AGGREGATES (WARDEN-1473) ────────────────────────────────────────
+// The two workspace event types (`workspace-shape`, WARDEN-1424; and
+// `workspace-names`, WARDEN-1416) reduced to a bare `byType` integer until this
+// axis existed — the "count for free, payload discarded" mechanism. That made
+// roadmap WARDEN-1265's founding defect ILLEGIBLE on the read surface: "twenty-
+// five chats and twenty-five identically-named chats are the same number".
+// `workspaceShape` + `workspaceNames` (below) are the read-side completion of
+// the vein `stalls` (WARDEN-854) and `operations` (WARDEN-1435) already cut.
+//
+// The COUNT axes a `workspace-shape` window carries. Fixed and closed — the
+// schema enforces a CLOSED KEY SET on that event (schema.ts
+// WORKSPACE_SHAPE_KEYS), so this list is the payload, not a sample of it, and a
+// per-count snapshot is produced for every entry here whether or not any window
+// ever carried one (the stable-zeroed-shape posture `byType` established).
+// Each name is a literal from the schema's own field set; the two `peak*`
+// entries are per-window maxima, so they compose under `max` for free — the
+// validator guarantees `peak >= closing` INSIDE each event.
+const WORKSPACE_SHAPE_COUNTS = Object.freeze([
+  'workspaces', 'panesOpen', 'panesActive', 'chats', 'peakPanesOpen', 'peakChats',
+]);
+
+// The distinct-chat-name bound. Anchored to the PRODUCER's own per-window cap
+// (the warden client's NAMES_MAX = 200, recorded in schema.ts's
+// MAX_CHATS_PER_EVENT note) for exactly the reason OPERATIONS_SUMMARY_CAP is
+// anchored to MAX_OPERATIONS_PER_EVENT rather than borrowing
+// CLIENT_HISTOGRAM_CAP (10): a chat catalog's realistic cardinality is an order
+// of magnitude past 10, so a cap of 10 would fold ~95% of the key space into
+// `__overflow__` and "which names does the catalog hold?" would answer
+// `__overflow__` — destroying the exact capability this axis exists to add. At
+// this cap ONE full window's catalog keeps every name in its own readable
+// bucket, and the response stays bounded by the same constant the producer is
+// already bounded by (≤ 201 keys × CLIENT_KEY_MAX_LENGTH chars).
+//
+// It is NOT imported from schema.ts: MAX_CHATS_PER_EVENT is module-private
+// there and schema.ts is vendored byte-identical to the client (it must never
+// be edited to widen an export), the same posture the operations cap records.
+export const WORKSPACE_NAMES_SUMMARY_CAP = 200;
+
 // ── TEMPORAL DISTRIBUTION config (WARDEN-603) ────────────────────────────────
 // The rolling recent window a maintainer reads to spot a RECENT volume spike
 // (a regression / deploy event) apart from long-running baseline. Events older
@@ -285,8 +354,11 @@ export const DEFAULT_TIMELINE_MAX_BUCKETS = 48;
  * TRUST MODEL (load-bearing for roadmap WARDEN-446 — do not erode): built ONLY
  * from schema-deemed-non-identifying structured fields. It MUST NOT incorporate
  * `message` (redacted free text — the field most likely to carry residual
- * identifying fragments, schema.ts) nor any extended-tier identifier
- * (`chatName` / `sessionName`). It reads at most: error `name` + the FIRST stack
+ * identifying fragments, schema.ts) nor any name field — neither the
+ * extended-tier decorations `chatName` / `sessionName` nor the
+ * `workspace-names` catalog's `chats[]` (a workspace event yields NO signature
+ * at all; only `workspaceNames` aggregates that list). It reads at most: error
+ * `name` + the FIRST stack
  * frame's `function`/`file`/`line` (frames[0] — the top of the stack, closest to
  * where it threw; there is no "in-app" marker in `StackFrame`); crash `reason`
  * (in practice Electron's small enum — `oom`/`crashed`/`killed`… — not
@@ -499,6 +571,186 @@ function _foldOperations(operations, accs) {
 }
 
 /**
+ * Render ONE workspace-shape count accumulator as the public
+ * `{ windowsSeen, min, avg, max }` snapshot (WARDEN-1473) — the per-count
+ * sibling of `_stallSnapshot` / `_operationSnapshot`.
+ *
+ * `windowsSeen` is the number of windows that contributed a FINITE value to
+ * THIS count (never the event total — that is `workspaceShape.windowsSeen`,
+ * which keeps byType parity), so a producer that ships one malformed field in
+ * one window degrades that ONE count's sample size and nothing else.
+ *
+ * `avg` is a PLAIN mean, deliberately NOT `_operationSnapshot`'s weighted one:
+ * a shape event IS one window's snapshot and carries no observation count to
+ * weight by, so every window gets equal weight (5 windows of 2 panes and 1
+ * window of 20 panes read ≈5, which is the honest "typical window" figure).
+ *
+ * With no finite value folded, `min`/`max` are `null` (the `_stallSnapshot`
+ * honesty posture — `0` is a REAL measured count here, e.g. a workspace with no
+ * panes open, so it cannot double as the empty sentinel) and `avg` is `0` (the
+ * guarded empty case can never read `NaN`).
+ *
+ * @param {{ windowsSeen: number, sum: number, min: number | null, max: number | null }} acc
+ * @returns {{ windowsSeen: number, min: number | null, avg: number, max: number | null }}
+ * @private
+ */
+function _workspaceCountSnapshot({ windowsSeen, sum, min, max }) {
+  return {
+    windowsSeen,
+    min,
+    avg: windowsSeen > 0 ? sum / windowsSeen : 0,
+    max,
+  };
+}
+
+// An empty per-count accumulator (the exact key set _workspaceCountSnapshot reads).
+function _newWorkspaceCountAccumulator() {
+  return { windowsSeen: 0, sum: 0, min: null, max: null };
+}
+
+/**
+ * Fold ONE `workspace-shape` event's counts into the per-count accumulator map
+ * `accs` (WARDEN-1473). Skip-robust per `summarize()`'s stated discipline: a
+ * malformed or partial field is SKIPPED — it can never throw and never poison
+ * an aggregate to `NaN` — while its EVENT still counts in `byType` AND in
+ * `workspaceShape.windowsSeen` (counting is independent of this fold, exactly
+ * as `stalls.count` counts a stall whose `lagMs` was unusable).
+ *
+ * Admission: a count folds only when it is a finite non-negative number. The
+ * validator already enforces non-negative integers on every one of them
+ * (schema.ts isWorkspaceShapeShape), so this guard is defence-in-depth over a
+ * NON-validated store row (a partial read or a hand-written line) — the same
+ * posture `_foldOperations` records for `_boundClientKey` on operation names.
+ *
+ * The two `peak*` fields need NO special handling: they are per-window maxima
+ * whose own accumulators compose under `max` for free, and the validator
+ * guarantees `peak >= closing` INSIDE each event — so a window that opened nine
+ * panes and closed on one surfaces `peakPanesOpen.max === 9` while
+ * `panesOpen.max` reads the closing `1`, which is precisely the open-then-close
+ * burst the peaks exist to keep visible.
+ *
+ * @param {object} event a `workspace-shape` event (already known to be an object)
+ * @param {Map<string, object>} accs count name → accumulator (mutated in place)
+ * @private
+ */
+function _foldWorkspaceShape(event, accs) {
+  for (const key of WORKSPACE_SHAPE_COUNTS) {
+    const value = event[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) continue;
+    let acc = accs.get(key);
+    if (acc === undefined) {
+      // The key space is the schema's own CLOSED set (WORKSPACE_SHAPE_COUNTS),
+      // so it is bounded by construction — no cardinality cap is needed or
+      // meaningful here, unlike the free-text / free-name axes.
+      acc = _newWorkspaceCountAccumulator();
+      accs.set(key, acc);
+    }
+    acc.windowsSeen += 1;
+    acc.sum += value;
+    if (acc.min === null || value < acc.min) acc.min = value;
+    if (acc.max === null || value > acc.max) acc.max = value;
+  }
+}
+
+/**
+ * Create the `workspace-names` accumulator (WARDEN-1473) — the fold that makes
+ * roadmap WARDEN-1265's founding defect legible in ONE query.
+ *
+ * WHAT IT ANSWERS, and what nothing else can: a `workspace-names` window carries
+ * the catalog's de-duplicated NAMES alongside `chatCount`, the TRUE catalog size
+ * before any cap. Comparing the two is the whole capability — a catalog holding
+ * 25 chats under 5 distinct names reads `distinctCount: 5` against
+ * `maxChatCount: 25`, so `distinctCount < maxChatCount` IS the identically-named-
+ * chats verdict, readable without paging `/events` and hand-folding windows.
+ *
+ * The distinct set is BOUNDED exactly like every other client-keyed axis
+ * (WARDEN-1246): each name is truncated at CLIENT_KEY_MAX_LENGTH and the
+ * cardinality is capped at WORKSPACE_NAMES_SUMMARY_CAP distinct names, past
+ * which every FURTHER new name folds into ONE counted `__overflow__` bucket —
+ * represented, never dropped. `distinctCount` counts the SNAPSHOT's keys, so the
+ * `__overflow__` bucket counts as one: the cap is LOUD on the surface rather
+ * than silently shrinking the number (a reader seeing `__overflow__` in `names`
+ * knows `distinctCount` is a floor, and `truncatedEver` is the separate
+ * producer-side cap bit).
+ *
+ * Honesty posture: `maxChatCount` / `lastChatCount` are `null` until a window
+ * reported a finite one (`0` is a REAL catalog size — the `_stallSnapshot` rule),
+ * and `lastSnapshotAt` is `null` on an empty store. `lastChatCount` tracks the
+ * window with the greatest `windowEndedAt` (the producer's own window clock, not
+ * arrival order) so a batch persisted out of order still reports the LATEST
+ * catalog size — degrading to arrival order ONLY when no usable `windowEndedAt`
+ * has been seen at all, so a window with an unreadable producer clock still
+ * contributes a last-known size rather than leaving `lastChatCount` null beside
+ * a `maxChatCount` that plainly reports a number. `lastSnapshotAt` takes NO such
+ * fallback: freshness with no readable clock stays honestly absent.
+ *
+ * @returns {{ fold(event: object): void, snapshot(): object }}
+ * @private
+ */
+function _createWorkspaceNamesAccumulator() {
+  const names = _createBoundedClientHistogram(WORKSPACE_NAMES_SUMMARY_CAP);
+  let windowsSeen = 0;
+  let maxChatCount = null;
+  let lastChatCount = null;
+  let lastChatCountAt = null;
+  let truncatedEver = false;
+  let lastSnapshotAt = null;
+  return {
+    fold(event) {
+      // The EVENT counts as a window seen whatever its payload turns out to be —
+      // parity with `byType['workspace-names']`, exactly as `stalls.count`
+      // counts a stall whose `lagMs` was unusable. Every field below is then
+      // folded only when individually usable (skip-robust, never NaN).
+      windowsSeen += 1;
+      const { chats, chatCount, truncated, windowEndedAt } = event;
+      if (Array.isArray(chats)) {
+        for (const name of chats) {
+          // A non-string / empty name yields no bucket (the skip-robust rule the
+          // client-keyed histograms use); the window is still counted above.
+          if (typeof name !== 'string' || name.length === 0) continue;
+          names.record(name);
+        }
+      }
+      const finiteWindowEnd = typeof windowEndedAt === 'number' && Number.isFinite(windowEndedAt);
+      if (finiteWindowEnd && (lastSnapshotAt === null || windowEndedAt > lastSnapshotAt)) {
+        lastSnapshotAt = windowEndedAt;
+      }
+      if (typeof chatCount === 'number' && Number.isFinite(chatCount) && chatCount >= 0) {
+        if (maxChatCount === null || chatCount > maxChatCount) maxChatCount = chatCount;
+        // "Most recent" keys off the producer's window clock when it is usable,
+        // and degrades to arrival order when it is not — so a window with a
+        // malformed `windowEndedAt` still contributes a last-known catalog size
+        // rather than silently leaving `lastChatCount` null.
+        if (finiteWindowEnd) {
+          if (lastChatCountAt === null || windowEndedAt >= lastChatCountAt) {
+            lastChatCount = chatCount;
+            lastChatCountAt = windowEndedAt;
+          }
+        } else if (lastChatCountAt === null) {
+          lastChatCount = chatCount;
+        }
+      }
+      // The producer's own cap bit: ANY window reporting a partial list flips it,
+      // so a reader knows at least one `chats` list was already capped upstream
+      // (and therefore that the distinct set is a floor for that window too).
+      if (truncated === true) truncatedEver = true;
+    },
+    snapshot() {
+      const nameCounts = names.snapshot();
+      return {
+        windowsSeen,
+        names: nameCounts,
+        distinctCount: Object.keys(nameCounts).length,
+        maxChatCount,
+        lastChatCount,
+        truncatedEver,
+        lastSnapshotAt,
+      };
+    },
+  };
+}
+
+/**
  * Resolve an event's EFFECTIVE observation instant — the single shared rule every
  * time-axis in this module keys off (WARDEN-1428 extracted it; the expression
  * predates it and was previously written out three times).
@@ -580,6 +832,13 @@ export function lastAcceptedInstant(events) {
  *             bySource: Record<string, { count: number, min: number | null, avg: number, max: number | null }> },
  *   operations: Record<string, { count: number, okCount: number, failCount: number,
  *                                min: number | null, avg: number, max: number | null }>,
+ *   workspaceShape: { windowsSeen: number, lastSnapshotAt: number | null,
+ *                     counts: Record<string, { windowsSeen: number, min: number | null,
+ *                                              avg: number, max: number | null }> },
+ *   workspaceNames: { windowsSeen: number, names: Record<string, number>,
+ *                     distinctCount: number, maxChatCount: number | null,
+ *                     lastChatCount: number | null, truncatedEver: boolean,
+ *                     lastSnapshotAt: number | null },
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
@@ -618,6 +877,17 @@ export function summarize(events) {
   // bounded buckets (see _foldOperations + OPERATIONS_SUMMARY_CAP). Populated
   // in the event loop below, snapshotted into the `operations` return key.
   const operationsByName = new Map();
+  // Workspace aggregates (WARDEN-1473): the two workspace event types' payloads
+  // that the COUNT (byType) discards. `workspaceShapeCounts` folds every
+  // `workspace-shape` window's counts per count NAME (see _foldWorkspaceShape);
+  // `workspaceNames` folds every `workspace-names` window's catalog into the
+  // bounded distinct-name set + the TRUE catalog sizes, which is what makes
+  // `distinctCount < maxChatCount` — the identically-named-chats verdict —
+  // readable in one query. Both snapshotted into their return keys below.
+  const workspaceShapeCounts = new Map();
+  let workspaceShapeWindows = 0;
+  let workspaceShapeLastAt = null;
+  const workspaceNamesAcc = _createWorkspaceNamesAccumulator();
   // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
   // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
   // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
@@ -745,6 +1015,27 @@ export function summarize(events) {
     if (type === 'operational-metrics') {
       _foldOperations(operations, operationsByName);
     }
+    // Workspace aggregates (WARDEN-1473): fold this window's payload into the
+    // shape / names accumulators. Skip-robust on exactly the `_foldOperations`
+    // terms — a malformed or partial field is skipped inside the fold and never
+    // poisons an aggregate, while the EVENT is already counted in byType above
+    // (the two are independent, exactly like a crash's reason and its byType
+    // count). `windowsSeen` here counts EVERY event of the type, so it keeps
+    // parity with `byType` no matter how unusable one window's payload was.
+    if (type === 'workspace-shape') {
+      workspaceShapeWindows += 1;
+      _foldWorkspaceShape(event, workspaceShapeCounts);
+      // Freshness: the greatest window-close instant seen, read from the
+      // PRODUCER's own window clock (not the receiver's arrival time), so a
+      // batch persisted out of order still reports the LATEST snapshot.
+      const endedAt = event.windowEndedAt;
+      if (typeof endedAt === 'number' && Number.isFinite(endedAt) && (workspaceShapeLastAt === null || endedAt > workspaceShapeLastAt)) {
+        workspaceShapeLastAt = endedAt;
+      }
+    }
+    if (type === 'workspace-names') {
+      workspaceNamesAcc.fold(event);
+    }
     // Failure signature (WARDEN-707): rank DISTINCT failures across ALL base
     // types in one list. `signatureOf` is skip-robust (returns null for an
     // unknown type or a type-specific field gap) — null yields no bucket, never
@@ -819,6 +1110,31 @@ export function summarize(events) {
     [...operationsByName.entries()].map(([name, acc]) => [name, _operationSnapshot(acc)])
   );
 
+  // Workspace-shape rollup (WARDEN-1473): `windowsSeen` is EVERY shape event (it
+  // MUST equal byType['workspace-shape'] so the count and payload surfaces
+  // agree), `lastSnapshotAt` is the newest window-close instant, and `counts`
+  // carries one min/avg/max snapshot per schema count. The `counts` key set is
+  // STABLE over WORKSPACE_SHAPE_COUNTS — every count is present even when no
+  // window ever carried a usable value for it (the `byType` zeroed-shape
+  // posture), in which case its own `windowsSeen` is 0 and min/max are `null`
+  // rather than fabricated zeros.
+  const workspaceShape = {
+    windowsSeen: workspaceShapeWindows,
+    lastSnapshotAt: workspaceShapeLastAt,
+    counts: Object.fromEntries(
+      WORKSPACE_SHAPE_COUNTS.map((key) => [
+        key,
+        _workspaceCountSnapshot(workspaceShapeCounts.get(key) ?? _newWorkspaceCountAccumulator()),
+      ])
+    ),
+  };
+
+  // Workspace-names rollup (WARDEN-1473): `windowsSeen` is EVERY names event (it
+  // MUST equal byType['workspace-names']); `names` is the bounded distinct set in
+  // first-seen insertion order (mirrors stalls.bySource / operations; deepEqual
+  // is order-insensitive, so tests are stable).
+  const workspaceNames = workspaceNamesAcc.snapshot();
+
   return {
     total,
     byType,
@@ -831,6 +1147,8 @@ export function summarize(events) {
     crashReasons: crashReasons.snapshot(),
     stalls,
     operations,
+    workspaceShape,
+    workspaceNames,
     firstSeen,
     lastSeen,
   };
@@ -923,10 +1241,12 @@ function _assignTimelineBuckets(events, { now, maxBuckets, windowMs }) {
  * JSON-validated first, but a partial read or shape drift is defended against
  * here so one bad record can never blank the whole distribution.
  *
- * TRUST MODEL: identical to `summarize()` — this reads ONLY `event.receivedAt`
- * / `event.timestamp` (both epoch-ms) and emits COUNTS. It never echoes raw
- * events or extended-tier names (`chatName` / `sessionName`); it touches no other
- * field, so there is no path by which an identifier could reach the distribution.
+ * TRUST MODEL: the same posture as `summarize()`, and STRICTER on one point —
+ * this reads ONLY `event.receivedAt` / `event.timestamp` (both epoch-ms) and
+ * emits COUNTS. It never echoes raw events and never touches ANY name field
+ * (neither the extended-tier decorations `chatName` / `sessionName` nor the
+ * `workspace-names` catalog `summarize()` deliberately aggregates), so there is
+ * no path by which an identifier could reach the distribution.
  *
  * @param {object[]} [events]
  * @param {{ now?: () => number, maxBuckets?: number, windowMs?: number }} [opts]
@@ -1012,8 +1332,10 @@ export function summarizeTimeline(
  * non-identifying magnitude (an epoch-ms-free integer ≥ 0) and `source` is a fixed
  * enum, both already enumerated in the consent / verifiability surface. This reads
  * ONLY `receivedAt` / `timestamp` / `lagMs` / `source` and emits per-bucket counts +
- * maxes; it never echoes raw events or extended-tier names (`chatName` /
- * `sessionName`), so there is no path by which an identifier could reach a bucket.
+ * maxes; it never echoes raw events and never touches ANY name field (neither the
+ * extended-tier decorations `chatName` / `sessionName` nor the `workspace-names`
+ * catalog `summarize()` deliberately aggregates), so there is no path by which an
+ * identifier could reach a bucket.
  *
  * @param {object[]} [events]
  * @param {{ now?: () => number, maxBuckets?: number, windowMs?: number }} [opts]

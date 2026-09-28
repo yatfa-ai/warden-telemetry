@@ -193,17 +193,48 @@ curl http://localhost:7421/summary
 #     "get-api-claude-sessions": { "count": 288, "okCount": 284, "failCount": 4, "min": 80, "avg": 141, "max": 4000 },  # folded across every retained window; avg is WEIGHTED (Σ avg×count / Σ count), max is the worst single observation
 #     "pane-echo-e2e":           { "count": 96, "okCount": 96, "failCount": 0, "min": 250, "avg": 302, "max": 800 },   # a renderer operation reading 100% ok is correct — that producer only ever counts successes
 #     "__overflow__":            { "count": 12, "okCount": 12, "failCount": 0, "min": 1, "avg": 3, "max": 9 }          # past the 129-name cap, further distinct names fold here — represented, never dropped
+#   },
+#   "workspaceShape": {                                                            # the COUNT axis the workspace-shape event's byType integer hides (WARDEN-1473): how big is the workspace people actually run?
+#     "windowsSeen": 288,                                                          # EVERY workspace-shape window (=== byType['workspace-shape'])
+#     "lastSnapshotAt": 1720000000000,                                             # newest windowEndedAt — the PRODUCER's own clock, so out-of-order persistence cannot fake staleness
+#     "counts": {                                                                  # one min/avg/max per schema count; avg is a PLAIN mean (each window is one equal-weight snapshot)
+#       "workspaces":    { "windowsSeen": 288, "min": 1, "avg": 2.4, "max": 6 },
+#       "panesOpen":     { "windowsSeen": 288, "min": 0, "avg": 3.1, "max": 12 },   # `0` is a REAL measurement here (a workspace with nothing open)
+#       "panesActive":   { "windowsSeen": 288, "min": 0, "avg": 2.2, "max": 9 },
+#       "chats":         { "windowsSeen": 288, "min": 4, "avg": 21, "max": 25 },    # the sidebar row COUNT — never names (those ride workspaceNames)
+#       "peakPanesOpen": { "windowsSeen": 288, "min": 1, "avg": 4.0, "max": 19 },   # the per-window peak: a window that opened 19 panes and closed on 1 is STILL visible here
+#       "peakChats":     { "windowsSeen": 288, "min": 4, "avg": 21, "max": 25 }
+#     }
+#   },
+#   "workspaceNames": {                                                            # the identically-named-chats verdict (WARDEN-1473) — readable in ONE query
+#     "windowsSeen": 288,                                                          # EVERY workspace-names window (=== byType['workspace-names'])
+#     "names": { "Untitled": 288, "demo": 288, "Refactor auth": 120, "scratch": 288, "test": 288 },  # the bounded DISTINCT set across windows (count = windows the name appeared in)
+#     "distinctCount": 5,                                                          # 5 distinct names …
+#     "maxChatCount": 25,                                                          # … against a TRUE catalog of 25 → distinctCount < maxChatCount IS the collision
+#     "lastChatCount": 25,                                                         # the most recent window's TRUE catalog size (by windowEndedAt, not array order)
+#     "truncatedEver": true,                                                       # at least one window's `chats` list was already capped by the producer
+#     "lastSnapshotAt": 1720000000000
 #   }
 # }
 ```
 
-The response carries **counts and histograms only** — it never echoes raw events or extended-tier
-identifiers (chat/session names). `total` is the record count; `byType` is always the full
-`{ error, crash, performance-stall, operational-metrics, server-stall }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
+The response carries **counts and histograms only**, with ONE deliberate exception named below — it never
+echoes raw events. `total` is the record count; `byType` is always the full
+`{ error, crash, performance-stall, operational-metrics, server-stall, workspace-names, workspace-shape }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
 error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen`/`lastSeen` bound the
 observed time window (`null` on an empty store); `startedAt` is the epoch-ms at which **this receiver
 (re)booted**; `readAt` is the epoch-ms at which **this response was produced**. A fresh receiver with no
 traffic returns `total: 0` with zeroed counters.
+
+**The one exception to "counts and histograms only": `workspaceNames.names`.** Chat names are the
+extended tier's only retained identifiers, and the `workspace-names` event type's entire purpose
+(WARDEN-1416) is to carry them — so the aggregate over that type necessarily reproduces the bounded
+distinct name SET, not a count of it. Everything the exception is bounded by is stated on
+`workspaceNames` below: names arrive only behind the `names` consent category (the client's redactor drops
+them otherwise), only through an event the user opted into, already redacted pre-collection, and each key
+is truncated at 128 chars with the cardinality capped and overflow folded. No other aggregate on this
+response carries an identifier, and `workspace-shape` — despite its name — carries counts ONLY, by a
+closed key set the schema itself enforces.
 
 `startedAt` is the key that makes the **restart-wiped** tallies below (`rejections`, `persistErrors`,
 `retention`, `deduped`) interpretable. All four are in-memory and zeroed on every restart BY DESIGN — a
@@ -410,6 +441,54 @@ no count loss), and the keys are safe by construction: an operation name is a co
 the schema (`OPERATION_NAME_RE`), so a path or hostname can never ride the aggregate key. It is purely
 additive — a pure read over already-accepted, already-redacted events, computed on read; no new collection,
 wire field, schema bump, or identifier, and no change to `/events`.
+
+`workspaceShape` is the COUNT axis the `workspace-shape` event's `byType` integer hides (WARDEN-1473).
+A day of 5-minute window snapshots carrying how many workspaces, panes and sidebar rows a real install
+holds reduces on `byType` to one integer — `"workspace-shape": 288` — so "how big is the workspace people
+actually run?" was answerable only by paging `/events` and re-folding every window by hand. It folds every
+retained window's counts into one `{ windowsSeen, min, avg, max }` snapshot per schema count
+(`workspaces` / `panesOpen` / `panesActive` / `chats` / `peakPanesOpen` / `peakChats`), plus
+`lastSnapshotAt` (the newest `windowEndedAt`) for freshness. `windowsSeen` at the top level is EVERY shape
+event — it equals `byType['workspace-shape']`, so the count and payload surfaces agree — while each
+count's own `windowsSeen` is the number of windows that contributed a *usable* value to that one axis, so
+a single malformed field degrades one axis' sample size and nothing else. `avg` is a **plain** mean, not
+`operations`' weighted one: a shape event IS one window's snapshot and carries no observation count to
+weight by, so every window gets equal weight (5 windows of 2 panes and 1 window of 20 read ≈5 — the honest
+"typical window" figure). The two `peak*` counts are per-window maxima and compose under `max` for free
+(the validator guarantees `peak >= closing` *inside* each event), which is what keeps an open-then-close
+burst visible: a window that opened 9 panes and closed on 1 reads `peakPanesOpen.max: 9` beside
+`panesOpen.max: 1`. `min`/`max` read `null` (never `0`) when no finite value was folded — `0` is a REAL
+measured count here (a workspace with nothing open), so it cannot double as the empty sentinel — and the
+`counts` key set is STABLE over the schema's own closed field set, so an axis nothing ever carried says so
+with `windowsSeen: 0` and `null` extrema rather than vanishing. No cardinality cap is needed or meaningful:
+the key space is the schema's CLOSED key set, bounded by construction. It is purely additive — a pure read
+over already-accepted, already-redacted, counts-only events; no new collection, wire field, schema bump, or
+identifier, and no change to `/events`.
+
+`workspaceNames` is the axis that makes **the identically-named-chats defect legible in one query**
+(WARDEN-1473) — the founding sentence of the workspace-signal direction: *"twenty-five chats and
+twenty-five identically-named chats are the same number"*. A `workspace-names` window carries the chat
+catalog's de-duplicated NAMES alongside `chatCount`, the TRUE catalog size before any cap; comparing the
+two is the whole capability. `distinctCount: 5` against `maxChatCount: 25` says the catalog holds
+identically-named chats — **`distinctCount < maxChatCount` IS the verdict** — and until this axis existed
+that comparison required paging `/events` and hand-folding windows. It folds every retained window into
+`windowsSeen` (EVERY names event — it equals `byType['workspace-names']`), `names` (the bounded distinct
+set, each name's count being the number of windows it appeared in), `distinctCount`, `maxChatCount` (the
+largest TRUE catalog size observed), `lastChatCount` (the most recent window's, keyed off the producer's
+own `windowEndedAt` rather than array order, so out-of-order persistence cannot rewrite "latest"),
+`truncatedEver` (any window reported a producer-capped list), and `lastSnapshotAt`. The name space is
+bounded like every other client-keyed axis: each name is truncated at 128 chars and the cardinality is
+capped at the first 200 distinct names — the producer's own per-window cap, for the same reason
+`operations` uses 129 rather than 10: a chat catalog's realistic cardinality is an order of magnitude past
+10, so a cap of 10 would answer "which names does the catalog hold?" with `__overflow__` and destroy the
+capability. Past the cap, every further distinct name folds into ONE counted `__overflow__` bucket (no
+count loss), and `distinctCount` counts that bucket — so the cap is **loud** on the surface rather than
+silently shrinking the number. `maxChatCount`/`lastChatCount` read `null` (never `0`) until a window
+reported a finite one — `0` is a REAL catalog size. Chat names are extended-tier identifiers and ride
+ONLY the `names` consent category, so this axis is populated only where that opt-in is on, and it is
+purely additive — a pure read over already-accepted, already-redacted events; no new collection, wire
+field, schema bump, or identifier, and no change to `/events` (where the raw per-window list stays
+readable for the drill-down after the aggregate points at a collision).
 
 #### Scoping the aggregates — `?type=` / `?platform=` / `?appVersion=` / `?since=`
 

@@ -290,6 +290,138 @@ test('GET /summary serves the per-operation aggregate for operational-metrics ev
   }, 'the per-operation payload rides the same response, additively');
 });
 
+// WARDEN-1473 — the two workspace axes, end-to-end through the real handler.
+// Fixtures live here (this file drives createRequestHandler, not summarize()).
+const shapeEvent = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'workspace-shape',
+  runtime: 'renderer',
+  timestamp: 12,
+  windowStartedAt: 1,
+  windowEndedAt: 12,
+  workspaces: 2,
+  panesOpen: 1,
+  panesActive: 1,
+  chats: 25,
+  peakPanesOpen: 9,
+  peakChats: 25,
+};
+const namesEvent = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'workspace-names',
+  runtime: 'server',
+  timestamp: 13,
+  windowStartedAt: 1,
+  windowEndedAt: 13,
+  chats: ['Untitled', 'demo', 'Refactor auth', 'scratch', 'test'],
+  chatCount: 25,
+  truncated: true,
+};
+
+test('GET /summary serves workspaceShape + workspaceNames for the workspace event types (WARDEN-1473)', async () => {
+  // End-to-end pin for the additive keys: the /summary handler spreads
+  // `...summarize(filtered)` (no route change), so the workspace folds the count
+  // axis (byType) discards ride the SAME response body — and the
+  // identically-named-chats verdict is readable in ONE query.
+  const store = readableStore([errorEvent, shapeEvent, namesEvent]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.byType['workspace-shape'], 1, 'the count axis is unchanged');
+  assert.equal(body.byType['workspace-names'], 1, 'the count axis is unchanged');
+  assert.equal(body.workspaceShape.windowsSeen, 1);
+  assert.equal(body.workspaceShape.lastSnapshotAt, 12);
+  assert.equal(body.workspaceShape.counts.peakPanesOpen.max, 9, 'the open-then-close burst survives the wire');
+  assert.equal(body.workspaceShape.counts.panesOpen.max, 1, 'and the closing count reads its own value');
+  assert.equal(body.workspaceNames.distinctCount, 5);
+  assert.equal(body.workspaceNames.maxChatCount, 25);
+  assert.equal(body.workspaceNames.truncatedEver, true);
+  assert.ok(
+    body.workspaceNames.distinctCount < body.workspaceNames.maxChatCount,
+    'twenty-five chats under five names no longer read as the same number',
+  );
+});
+
+test('GET /summary?type=workspace-shape / ?type=workspace-names scope the workspace axes (WARDEN-1473)', async () => {
+  // The shared filterEvents path (WARDEN-727) pre-filters BEFORE the pure
+  // summarize(), so the new keys compose with scoping with no handler change:
+  // scoping to one workspace type collapses the OTHER axis to its zeroed shape.
+  const store = readableStore([errorEvent, shapeEvent, namesEvent]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+
+  const shapeRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?type=workspace-shape' }), shapeRes);
+  const shapeBody = JSON.parse(shapeRes.body);
+  assert.equal(shapeBody.total, 3, 'total is always the full persisted count');
+  assert.equal(shapeBody.matched, 1, 'only the shape window was aggregated');
+  assert.equal(shapeBody.workspaceShape.windowsSeen, 1);
+  assert.equal(shapeBody.workspaceNames.windowsSeen, 0, 'the names axis reads its zeroed shape');
+  assert.deepEqual(shapeBody.workspaceNames.names, {});
+  assert.equal(shapeBody.workspaceNames.maxChatCount, null, 'null, never a fabricated 0');
+
+  const namesRes = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?type=workspace-names' }), namesRes);
+  const namesBody = JSON.parse(namesRes.body);
+  assert.equal(namesBody.matched, 1, 'only the names window was aggregated');
+  assert.equal(namesBody.workspaceNames.windowsSeen, 1);
+  assert.equal(namesBody.workspaceNames.distinctCount, 5);
+  assert.equal(namesBody.workspaceShape.windowsSeen, 0, 'the shape axis reads its zeroed shape');
+  assert.equal(namesBody.workspaceShape.lastSnapshotAt, null);
+  assert.equal(namesBody.workspaceShape.counts.panesOpen.max, null, 'null, never a fabricated 0');
+});
+
+test('GET /summary on a workspace-free store serves the stable zeroed workspace shapes (no false alarm)', async () => {
+  const store = readableStore([errorEvent]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  const body = JSON.parse(res.body);
+  assert.deepEqual(body.workspaceShape, {
+    windowsSeen: 0,
+    lastSnapshotAt: null,
+    counts: {
+      workspaces: { windowsSeen: 0, min: null, avg: 0, max: null },
+      panesOpen: { windowsSeen: 0, min: null, avg: 0, max: null },
+      panesActive: { windowsSeen: 0, min: null, avg: 0, max: null },
+      chats: { windowsSeen: 0, min: null, avg: 0, max: null },
+      peakPanesOpen: { windowsSeen: 0, min: null, avg: 0, max: null },
+      peakChats: { windowsSeen: 0, min: null, avg: 0, max: null },
+    },
+  }, 'every count is present with null extrema — never fabricated zeros');
+  assert.deepEqual(body.workspaceNames, {
+    windowsSeen: 0,
+    names: {},
+    distinctCount: 0,
+    maxChatCount: null,
+    lastChatCount: null,
+    truncatedEver: false,
+    lastSnapshotAt: null,
+  });
+});
+
+test('GET /events is unchanged by the workspace summary keys — raw windows still serve verbatim (WARDEN-1473)', async () => {
+  // Criterion 1's other half: the read-side fold is /summary-only. /events keeps
+  // returning the raw per-window payloads (the list AND the counts), which is
+  // where a maintainer drills in after the aggregate points at a collision.
+  const store = readableStore([shapeEvent, namesEvent]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  const served = body.events ?? body;
+  assert.equal(served.length, 2);
+  const names = served.find((e) => e.type === 'workspace-names');
+  const shape = served.find((e) => e.type === 'workspace-shape');
+  assert.deepEqual(names.chats, namesEvent.chats, 'the raw name LIST still serves');
+  assert.equal(names.chatCount, 25);
+  assert.equal(shape.chats, 25, 'and the raw shape COUNT still serves');
+  assert.equal(shape.peakPanesOpen, 9);
+  assert.equal(served.some((e) => 'workspaceShape' in e || 'workspaceNames' in e), false, 'no summary key leaked onto an event');
+});
+
 test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an error)', async () => {
   const store = readableStore([]);
   const handler = createRequestHandler({ store });
