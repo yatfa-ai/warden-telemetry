@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP, WORKSPACE_NAMES_SUMMARY_CAP } from '../summary.mjs';
+import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP, WORKSPACE_NAMES_SUMMARY_CAP, FEATURE_USAGE_SUMMARY_CAP } from '../summary.mjs';
 // Canonical valid events (verbatim shapes ingest persists — one per base type).
 const validError = {
   schemaVersion: 1,
@@ -74,6 +74,8 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
     truncatedEver: false,
     lastSnapshotAt: null,
   });
+  // WARDEN-1488 — the feature-usage axis reads a STABLE zeroed shape too.
+  assert.deepEqual(s.featureUsage, { windowsSeen: 0, lastWindowAt: null, features: {}, distinctCount: 0 });
   assert.equal(s.firstSeen, null);
   assert.equal(s.lastSeen, null);
 });
@@ -2121,4 +2123,96 @@ test('summarize() stays a PURE single-arg function over the workspace axes (scop
   const scopedToShape = summarize(events.filter((e) => e.type === 'workspace-shape'));
   assert.equal(scopedToShape.workspaceNames.windowsSeen, 0, 'a pre-filtered array scopes the OTHER axis to its zeroed shape');
   assert.equal(scopedToShape.workspaceShape.counts.peakPanesOpen.max, 6);
+});
+
+// ── FEATURE USAGE (WARDEN-1488) ───────────────────────────────────────────────
+
+const featureWindow = (features, overrides = {}) => ({
+  schemaVersion: 9,
+  type: 'feature-usage',
+  runtime: 'renderer',
+  timestamp: 1735689600000,
+  windowStartedAt: 1735689300000,
+  windowEndedAt: 1735689600000,
+  features,
+  ...overrides,
+});
+
+test('featureUsage is a stable zeroed shape on a feature-free store (no false alarm)', () => {
+  const s = summarize([validError, validCrash, validStall, validServerStall]);
+  assert.deepEqual(s.featureUsage, { windowsSeen: 0, lastWindowAt: null, features: {}, distinctCount: 0 });
+});
+
+test('positive control: without the fold, the capability names are invisible on the summary', () => {
+  // Pre-change, summarize() reduced the event to byType's bare integer. Model the
+  // pre-change surface as the summary MINUS the new key: the name must appear
+  // nowhere else, and must appear with the key (so the probe can fire).
+  const s = summarize([featureWindow([{ name: 'global-search', count: 7 }])]);
+  assert.equal(s.byType['feature-usage'], 1);
+  const { featureUsage, ...preChange } = s;
+  assert.equal(JSON.stringify(preChange).includes('global-search'), false, 'names discarded by every pre-existing key');
+  assert.equal(JSON.stringify(s).includes('global-search'), true, 'and present once featureUsage exists');
+  assert.equal(featureUsage.features['global-search'].count, 7);
+});
+
+test('featureUsage folds count as a SUM of uses and windowsSeen as windows-per-capability', () => {
+  const s = summarize([
+    featureWindow([{ name: 'global-search', count: 7 }, { name: 'chat-create', count: 3 }], { windowEndedAt: 100 }),
+    featureWindow([{ name: 'global-search', count: 2 }], { windowEndedAt: 300 }),
+  ]);
+  assert.deepEqual(s.featureUsage.features, {
+    'global-search': { count: 9, windowsSeen: 2 },
+    'chat-create': { count: 3, windowsSeen: 1 },
+  });
+  assert.equal(s.featureUsage.windowsSeen, 2);
+  assert.equal(s.featureUsage.windowsSeen, s.byType['feature-usage'], 'parity with the count axis');
+  assert.equal(s.featureUsage.distinctCount, 2);
+});
+
+test('featureUsage.lastWindowAt is the newest windowEndedAt — producer clock, not arrival order', () => {
+  const s = summarize([
+    featureWindow([{ name: 'a-b', count: 1 }], { windowEndedAt: 500 }),
+    featureWindow([{ name: 'a-b', count: 1 }], { windowEndedAt: 200 }),
+  ]);
+  assert.equal(s.featureUsage.lastWindowAt, 500);
+});
+
+test('featureUsage is skip-robust: malformed rows are skipped, the event still counts, never NaN', () => {
+  const s = summarize([
+    featureWindow([
+      null, 'x', { name: '', count: 1 }, { name: 7, count: 1 }, { name: 'ok-name', count: 'many' },
+      { name: 'nan-name', count: NaN }, { name: 'zero-name', count: 0 }, { name: 'neg-name', count: -2 },
+      { name: 'good-one', count: 4 },
+    ]),
+    featureWindow('not-an-array', { windowEndedAt: 'nope' }),
+    featureWindow(undefined),
+  ]);
+  assert.equal(s.featureUsage.windowsSeen, 3, 'every event counts, however unusable its payload');
+  assert.equal(s.featureUsage.windowsSeen, s.byType['feature-usage']);
+  assert.deepEqual(s.featureUsage.features, { 'good-one': { count: 4, windowsSeen: 1 } });
+  assert.equal(s.featureUsage.lastWindowAt, 1735689600000, 'an unreadable clock is skipped, not folded');
+  assert.equal(JSON.stringify(s.featureUsage).includes('NaN'), false);
+});
+
+test('featureUsage truncates a name longer than CLIENT_KEY_MAX_LENGTH', () => {
+  const long = 'a'.repeat(CLIENT_KEY_MAX_LENGTH + 40);
+  const s = summarize([featureWindow([{ name: long, count: 2 }])]);
+  assert.deepEqual(Object.keys(s.featureUsage.features), ['a'.repeat(CLIENT_KEY_MAX_LENGTH)]);
+});
+
+test('featureUsage folds past-cap distinct names into ONE counted __overflow__ bucket', () => {
+  const N = FEATURE_USAGE_SUMMARY_CAP;
+  assert.equal(N, 64, 'anchored by comment to schema.ts MAX_FEATURES_PER_EVENT');
+  const rows = Array.from({ length: N + 10 }, (_, i) => ({ name: `feat-${i}`, count: 2 }));
+  const s = summarize([featureWindow(rows.slice(0, N)), featureWindow(rows.slice(N))]);
+  const f = s.featureUsage.features;
+  assert.equal(Object.keys(f).length, N + 1, `collapses to ${N} + 1 keys`);
+  assert.deepEqual(f.__overflow__, { count: 20, windowsSeen: 1 }, 'the folded uses are STATED, never dropped');
+  assert.equal(Object.values(f).reduce((a, b) => a + b.count, 0), rows.length * 2, 'no count loss');
+  assert.equal(s.featureUsage.distinctCount, N + 1, 'distinctCount counts the overflow bucket — the cap is LOUD');
+});
+
+test('featureUsage treats hostile keys as ordinary own keys', () => {
+  const s = summarize([featureWindow([{ name: 'constructor', count: 1 }, { name: 'toString', count: 2 }])]);
+  assert.deepEqual(s.featureUsage.features, { constructor: { count: 1, windowsSeen: 1 }, toString: { count: 2, windowsSeen: 1 } });
 });

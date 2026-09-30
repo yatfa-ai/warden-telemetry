@@ -5,7 +5,8 @@
 //   - `summarize(events)`        → flat aggregates (total / byType / topErrorNames
 //                                  / topSignatures / schemaVersions / appVersions
 //                                  / platforms / crashReasons / stalls / operations
-//                                  / workspaceShape / workspaceNames / firstSeen
+//                                  / workspaceShape / workspaceNames / featureUsage
+//                                  / firstSeen
 //                                  / lastSeen).
 //   - `lastAcceptedInstant(events)` → the newest effective instant across the batch
 //                                  (WARDEN-1428) — i.e. WHEN the newest ACCEPTED
@@ -328,6 +329,107 @@ const WORKSPACE_SHAPE_COUNTS = Object.freeze([
 // there and schema.ts is vendored byte-identical to the client (it must never
 // be edited to widen an export), the same posture the operations cap records.
 export const WORKSPACE_NAMES_SUMMARY_CAP = 200;
+
+// ── FEATURE USAGE aggregate (WARDEN-1488) ─────────────────────────────────────
+// Schema v9 (WARDEN-1479) made the feature-adoption category carry a
+// `feature-usage` event, and until this axis existed `summarize()` reduced it to
+// the bare `byType['feature-usage']` integer — capability names and counts were
+// discarded ("producer landed, read surface lagging", the same mechanism as
+// WARDEN-1473 / WARDEN-1435). `featureUsage` is the read-side completion.
+//
+// TRUST / HONESTY (stated here so the diff carries it):
+//  - COUNTS + CLOSED-SET KEBAB-CASE NAMES ONLY. The schema's structural
+//    guarantees on this event (closed row keys `{name, count}`, the kebab-case
+//    name regex, positive-integer counts, the renderer-runtime pin) already
+//    prevent an identifier riding this channel, so no new exception to
+//    "counts and histograms only" is needed — unlike `workspaceNames.names`.
+//  - `feature-usage` is NOT a liveness signal. It is COUNT-driven: an idle
+//    window sends NOTHING, so silence here means "no capability was used", never
+//    "the client is down". `lastWindowAt` is therefore the producer-clock close of
+//    the newest window that DID report usage — it must not be read as liveness;
+//    the `channel` liveness verdict remains the liveness surface.
+//
+// The distinct-capability-name bound. Anchored BY COMMENT to schema.ts's
+// MAX_FEATURES_PER_EVENT (64) plus one for the `__overflow__` bucket — so ONE
+// full window's names each keep their own readable bucket (a cap of 10 would
+// fold most of the vocabulary into `__overflow__`). It is NOT imported:
+// MAX_FEATURES_PER_EVENT is module-private there and schema.ts is vendored
+// byte-identical to the client, the same posture the operations cap records.
+export const FEATURE_USAGE_SUMMARY_CAP = 64;
+
+/**
+ * Create the `feature-usage` accumulator (WARDEN-1488).
+ *
+ * Per capability NAME it folds `count` (the SUM of uses across windows) and
+ * `windowsSeen` (the number of windows in which that capability appeared). Names
+ * are truncated via `_boundClientKey`, capped at FEATURE_USAGE_SUMMARY_CAP
+ * distinct names, and every FURTHER new name folds into one counted
+ * `__overflow__` bucket — represented, never dropped. `distinctCount` counts the
+ * snapshot's keys, so `__overflow__` counts as one (a floor, LOUD on the surface,
+ * exactly as `workspaceNames.distinctCount`).
+ *
+ * Skip-robust (the `_foldWorkspaceShape` discipline): a malformed row (non-object,
+ * non-string / empty name, non-finite or non-positive count) is SKIPPED and can
+ * never throw or poison a sum to `NaN`; the EVENT still counts in `windowsSeen`
+ * (parity with `byType['feature-usage']`). A name repeated inside one event
+ * counts its uses but contributes ONE window to that name's `windowsSeen`.
+ *
+ * @returns {{ fold(event: object): void, snapshot(): object }}
+ * @private
+ */
+function _createFeatureUsageAccumulator() {
+  const features = new Map(); // bounded name → { count, windowsSeen }
+  let windowsSeen = 0;
+  let lastWindowAt = null;
+  return {
+    fold(event) {
+      windowsSeen += 1; // the EVENT counts whatever its payload turns out to be
+      const { features: rows, windowEndedAt } = event;
+      if (typeof windowEndedAt === 'number' && Number.isFinite(windowEndedAt) && (lastWindowAt === null || windowEndedAt > lastWindowAt)) {
+        lastWindowAt = windowEndedAt;
+      }
+      if (!Array.isArray(rows)) return;
+      const touched = new Set(); // keys already credited a window by THIS event
+      for (const row of rows) {
+        if (!row || typeof row !== 'object') continue;
+        const { name, count } = row;
+        if (typeof name !== 'string' || name.length === 0) continue;
+        if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0) continue;
+        let key = _boundClientKey(name);
+        let acc = features.get(key);
+        if (acc === undefined) {
+          if (features.size < FEATURE_USAGE_SUMMARY_CAP) {
+            acc = { count: 0, windowsSeen: 0 };
+            features.set(key, acc);
+          } else {
+            // Cap reached → fold every further NEW name into the one overflow bucket.
+            key = OVERFLOW_KEY;
+            acc = features.get(key);
+            if (acc === undefined) {
+              acc = { count: 0, windowsSeen: 0 };
+              features.set(key, acc);
+            }
+          }
+        }
+        acc.count += count;
+        if (!touched.has(key)) {
+          touched.add(key);
+          acc.windowsSeen += 1;
+        }
+      }
+    },
+    snapshot() {
+      const out = {};
+      for (const [key, acc] of features) out[key] = { count: acc.count, windowsSeen: acc.windowsSeen };
+      return {
+        windowsSeen,
+        lastWindowAt,
+        features: out,
+        distinctCount: features.size,
+      };
+    },
+  };
+}
 
 // ── TEMPORAL DISTRIBUTION config (WARDEN-603) ────────────────────────────────
 // The rolling recent window a maintainer reads to spot a RECENT volume spike
@@ -839,6 +941,9 @@ export function lastAcceptedInstant(events) {
  *                     distinctCount: number, maxChatCount: number | null,
  *                     lastChatCount: number | null, truncatedEver: boolean,
  *                     lastSnapshotAt: number | null },
+ *   featureUsage: { windowsSeen: number, lastWindowAt: number | null,
+ *                   features: Record<string, { count: number, windowsSeen: number }>,
+ *                   distinctCount: number },
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
@@ -888,6 +993,8 @@ export function summarize(events) {
   let workspaceShapeWindows = 0;
   let workspaceShapeLastAt = null;
   const workspaceNamesAcc = _createWorkspaceNamesAccumulator();
+  // Feature-usage aggregate (WARDEN-1488): per-capability count + windowsSeen.
+  const featureUsageAcc = _createFeatureUsageAccumulator();
   // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
   // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
   // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
@@ -1036,6 +1143,9 @@ export function summarize(events) {
     if (type === 'workspace-names') {
       workspaceNamesAcc.fold(event);
     }
+    if (type === 'feature-usage') {
+      featureUsageAcc.fold(event); // skip-robust; the event still counts in windowsSeen
+    }
     // Failure signature (WARDEN-707): rank DISTINCT failures across ALL base
     // types in one list. `signatureOf` is skip-robust (returns null for an
     // unknown type or a type-specific field gap) — null yields no bucket, never
@@ -1149,6 +1259,7 @@ export function summarize(events) {
     operations,
     workspaceShape,
     workspaceNames,
+    featureUsage: featureUsageAcc.snapshot(),
     firstSeen,
     lastSeen,
   };

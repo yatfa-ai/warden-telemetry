@@ -422,6 +422,48 @@ test('GET /events is unchanged by the workspace summary keys — raw windows sti
   assert.equal(served.some((e) => 'workspaceShape' in e || 'workspaceNames' in e), false, 'no summary key leaked onto an event');
 });
 
+// WARDEN-1488 — the feature-usage aggregate, end-to-end through the real handler.
+const featureUsageEvent = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'feature-usage',
+  runtime: 'renderer',
+  timestamp: 14,
+  windowStartedAt: 1,
+  windowEndedAt: 14,
+  features: [{ name: 'global-search', count: 7 }, { name: 'chat-create', count: 3 }],
+};
+
+test('GET /summary serves featureUsage for the feature-usage event type (WARDEN-1488)', async () => {
+  const store = readableStore([errorEvent, featureUsageEvent, { ...featureUsageEvent, timestamp: 20, windowEndedAt: 20, features: [{ name: 'global-search', count: 2 }] }]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.byType['feature-usage'], 2, 'the count axis is unchanged');
+  assert.equal(body.featureUsage.windowsSeen, 2);
+  assert.equal(body.featureUsage.lastWindowAt, 20);
+  assert.deepEqual(body.featureUsage.features['global-search'], { count: 9, windowsSeen: 2 });
+  assert.deepEqual(body.featureUsage.features['chat-create'], { count: 3, windowsSeen: 1 });
+  assert.equal(body.featureUsage.distinctCount, 2);
+});
+
+test('GET /summary?type=feature-usage scopes the feature axis; other scopes read the zeroed shape (WARDEN-1488)', async () => {
+  const store = readableStore([errorEvent, featureUsageEvent]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+
+  const scoped = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?type=feature-usage' }), scoped);
+  const scopedBody = JSON.parse(scoped.body);
+  assert.equal(scopedBody.matched, 1);
+  assert.equal(scopedBody.featureUsage.windowsSeen, 1);
+  assert.equal(scopedBody.featureUsage.features['global-search'].count, 7);
+
+  const other = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?type=error' }), other);
+  assert.deepEqual(JSON.parse(other.body).featureUsage, { windowsSeen: 0, lastWindowAt: null, features: {}, distinctCount: 0 });
+});
+
 test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an error)', async () => {
   const store = readableStore([]);
   const handler = createRequestHandler({ store });
