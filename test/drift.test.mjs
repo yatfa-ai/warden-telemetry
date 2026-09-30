@@ -35,8 +35,8 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 8,
-  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall', 'workspace-names', 'workspace-shape'],
+  SCHEMA_VERSION: 9,
+  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall', 'workspace-names', 'workspace-shape', 'feature-usage'],
   // v6 (WARDEN-1278) added SERVER — warden's backend is a FORKED CHILD of the
   // Electron main process, a third real OS process the wire could not name, so
   // nothing it observed could ever be reported under any consent.
@@ -261,6 +261,82 @@ test('the vendored validator is the REAL one — it still rejects out-of-schema 
     validateEvent({ ...crashFixture, reason: 7 }),
     false,
     'a crash with a non-string reason is still rejected'
+  );
+});
+
+
+// WARDEN-1479 — the `feature-adoption` category's OWN carrying event (schema
+// v9). The receiver must accept the exact shape the client's producer emits,
+// and reject every shape that would let the closed-set boundary regress: a
+// wrong runtime, a non-kebab name, a zero/negative/non-integer count, a
+// duplicate name, an empty window, and ANY injected extra key (top-level or
+// row-borne).
+const featureUsageFixture = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'feature-usage',
+  runtime: RUNTIME.RENDERER,
+  timestamp: 99,
+  windowStartedAt: 60_000,
+  windowEndedAt: 90_000,
+  features: [
+    { name: 'global-search', count: 3 },
+    { name: 'settings', count: 1 },
+  ],
+};
+
+test('vendored validateEvent accepts the feature-usage fixture (schema v9)', () => {
+  assert.equal(validateEvent(featureUsageFixture), true, 'feature-usage fixture validates');
+  assert.equal(validateEvent({ ...featureUsageFixture, appVersion: '0.1.83', platform: 'linux' }), true, 'optional labels still attach');
+  assert.equal(validateBaseEvent(featureUsageFixture), true, 'validateBaseEvent accepts it too (the ingest path)');
+});
+
+test('feature-usage is PINNED to the renderer runtime', () => {
+  assert.equal(validateEvent({ ...featureUsageFixture, runtime: 'main' }), false, 'main runtime rejected');
+  assert.equal(validateEvent({ ...featureUsageFixture, runtime: 'server' }), false, 'server runtime rejected');
+});
+
+test('feature-usage carries a CLOSED-SET name map — hostile names / counts / keys are rejected', () => {
+  // Name pattern: the same kebab discipline as operation/culprit keys — this is
+  // the structural hard-exclusion proof for the name axis.
+  for (const name of ['Global-Search', 'global_search', 'a'.repeat(65), '../etc/passwd', 'prod.internal', 'refactor auth']) {
+    assert.equal(
+      validateEvent({ ...featureUsageFixture, features: [{ name, count: 1 }] }),
+      false,
+      `hostile name ${JSON.stringify(name.slice(0, 20))} rejected`,
+    );
+  }
+  // Counts are POSITIVE integers.
+  for (const count of [0, -1, 2.5, 'two', NaN]) {
+    assert.equal(
+      validateEvent({ ...featureUsageFixture, features: [{ name: 'global-search', count }] }),
+      false,
+      `count ${JSON.stringify(count)} rejected`,
+    );
+  }
+  // A folded map: one row per name.
+  assert.equal(
+    validateEvent({ ...featureUsageFixture, features: [{ name: 'global-search', count: 1 }, { name: 'global-search', count: 2 }] }),
+    false,
+    'duplicate names rejected',
+  );
+  // COUNT-DRIVEN SILENCE is structural: an empty window is a shape violation —
+  // an idle window sends nothing at all.
+  assert.equal(validateEvent({ ...featureUsageFixture, features: [] }), false, 'empty features rejected');
+  // The schema footprint bound.
+  assert.equal(
+    validateEvent({ ...featureUsageFixture, features: Array.from({ length: 65 }, (_, i) => ({ name: `cap-${i}`, count: 1 })) }),
+    false,
+    '65 rows exceed the 64 cap',
+  );
+  // The closed key sets — top level AND row level: no identifier can ride the
+  // feature-usage channel even from a hostile caller.
+  assert.equal(validateEvent({ ...featureUsageFixture, chatName: 'Refactor auth' }), false, 'injected chatName key rejected');
+  assert.equal(validateEvent({ ...featureUsageFixture, path: '/home/alice/secret' }), false, 'injected path key rejected');
+  assert.equal(validateEvent({ ...featureUsageFixture, host: 'deploy@prod.internal' }), false, 'injected host key rejected');
+  assert.equal(
+    validateEvent({ ...featureUsageFixture, features: [{ name: 'global-search', count: 1, chatName: 'Refactor auth' }] }),
+    false,
+    'a ROW-borne identifier key is rejected too (closed row set)',
   );
 });
 

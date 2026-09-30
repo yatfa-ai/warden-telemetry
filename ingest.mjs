@@ -67,27 +67,37 @@ function reject(status, error, extra) {
 // a pure subset of the current schema: the diff from that version's vendored
 // schema.ts to the current one removes ONLY the `SCHEMA_VERSION` literal and
 // WIDENS `BASE_EVENT_TYPES` / the `BaseEvent` union — never a field, a shape
-// validator, or a boundary. A v6/v7 event is therefore a valid v8 event in
+// validator, or a boundary. A v7/v8 event is therefore a valid v9 event in
 // everything but its own `schemaVersion` stamp, so the receiver can validate it
 // by NORMALIZATION (see step 3) without relaxing a single shape check.
 //
-// Provenance per entry (the additive diff each was proven by):
-//   6 — `git diff 7c63d82 <v8> -- schema.ts`: 3 removed lines (SCHEMA_VERSION
-//       literal, widened BASE_EVENT_TYPES, widened BaseEvent union).
-//   7 — `git diff 9cdb0e3 <v8> -- schema.ts`: the same 3-line shape.
-//   8 — the current schema itself (d586e33 vendored v8).
+// Provenance per entry (the additive diff each was proven by — the shape is
+// ALWAYS the same 3 removed lines: the SCHEMA_VERSION literal, the widened
+// BASE_EVENT_TYPES, the widened BaseEvent union; everything else is pure
+// addition, which cannot break an old event):
+//   7 — `git diff 9cdb0e3 <v9> -- schema.ts`: the 3-line shape.
+//   8 — the v8→v9 diff, verified on the WARDEN-1479 change: the same 3-line
+//       shape (removed exactly `export const SCHEMA_VERSION = 8;`, the
+//       seven-entry BASE_EVENT_TYPES line, and the seven-member BaseEvent
+//       union).
+//   9 — the current schema itself (2b47cdf9 vendored v9).
+//
+// v6 left the window in WARDEN-1479: the window stays BOUNDED at three
+// versions as it rolls forward (v5 left when v6 landed, v6 leaves when v9
+// lands) — never a monotonic growth. v6 remains additive (nothing a v6 build
+// emits is invalid under v9); it simply ages out of the bounded window, and
+// a v6 build is drift again, exactly as pre-window.
 //
 // RECEIVER-LOCAL BY CONSTRUCTION — deliberately NOT in schema.ts: that file is
 // vendored verbatim from the client and pinned byte-identical by
 // test/drift.test.mjs. A receiver-side compatibility policy must never leak into
-// the vendored copy. v5 stays OUT of the window: v5→v6 removed boundary
-// validation (NOT additive), so a v5 event is NOT provably a v8 subset.
+// the vendored copy.
 //
 // A future bump must RE-PROVE the window: run the same 3-line diff check against
 // the new version, then extend this array (and a non-additive bump has to
 // consciously REMOVE the versions it no longer covers — the window-guard test
 // in test/ingest.test.mjs makes that shrink a deliberate act).
-export const COMPATIBLE_SCHEMA_VERSIONS = [6, 7, 8];
+export const COMPATIBLE_SCHEMA_VERSIONS = [7, 8, 9];
 
 /**
  * The accepted `x-telemetry-schema` header values as an ASCENDING string array:

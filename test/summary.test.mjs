@@ -33,7 +33,8 @@ const validStall = {
   source: 'event-loop',
 };
 
-const ZEROED_BY_TYPE = { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0 };
+const ZEROED_BY_TYPE = { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0,
+    'feature-usage': 0, 'feature-usage': 0 };
 
 // ── EMPTY / ZEROED ────────────────────────────────────────────────────────────
 
@@ -88,18 +89,21 @@ test('non-array input is treated as empty (defensive — never throws)', () => {
 test('counts total + per-type across a mixed batch', () => {
   const s = summarize([validError, validCrash, validStall]);
   assert.equal(s.total, 3);
-  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 1, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0 });
+  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 1, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0,
+    'feature-usage': 0, 'feature-usage': 0 });
 });
 
 test('byType shape is stable — every base-type key is present even at 0', () => {
   const s = summarize([validError, validError]);
-  assert.deepEqual(s.byType, { error: 2, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0 });
+  assert.deepEqual(s.byType, { error: 2, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0,
+    'feature-usage': 0, 'feature-usage': 0 });
 });
 
 test('repeats accumulate per type', () => {
   const s = summarize([validCrash, validCrash, validStall]);
   assert.equal(s.total, 3);
-  assert.deepEqual(s.byType, { error: 0, crash: 2, 'performance-stall': 1, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0 });
+  assert.deepEqual(s.byType, { error: 0, crash: 2, 'performance-stall': 1, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0,
+    'feature-usage': 0, 'feature-usage': 0 });
 });
 
 // WARDEN-1278 — the SERVER child's folded stall window is a first-class base
@@ -129,6 +133,7 @@ test('byType counts server-stall — the backend child is visible in the aggrega
     error: 1, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 2,
     'workspace-names': 0,
     'workspace-shape': 0,
+    'feature-usage': 0,
   });
 });
 
@@ -155,6 +160,7 @@ test('byType counts workspace-names — the names category is visible in the agg
     error: 1, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0,
     'workspace-names': 2,
     'workspace-shape': 0,
+    'feature-usage': 0,
   });
 });
 
@@ -192,6 +198,7 @@ test('byType counts workspace-shape — the shape snapshot is visible in the agg
     error: 1, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0,
     'workspace-names': 0,
     'workspace-shape': 2,
+    'feature-usage': 0,
   });
 });
 
@@ -1069,7 +1076,8 @@ test('the summary never echoes raw events or extended-tier identifiers (aggregat
 test('malformed entries (null / primitives / non-objects) are skipped, not fatal', () => {
   const s = summarize([null, 'not-an-object', 42, undefined, validError, validCrash]);
   assert.equal(s.total, 2);
-  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0 });
+  assert.deepEqual(s.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0,
+    'feature-usage': 0, 'feature-usage': 0 });
   assert.equal(s.topErrorNames.length, 1);
 });
 
