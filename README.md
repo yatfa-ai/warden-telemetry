@@ -214,13 +214,22 @@ curl http://localhost:7421/summary
 #     "lastChatCount": 25,                                                         # the most recent window's TRUE catalog size (by windowEndedAt, not array order)
 #     "truncatedEver": true,                                                       # at least one window's `chats` list was already capped by the producer
 #     "lastSnapshotAt": 1720000000000
+#   },
+#   "featureUsage": {                                                              # the per-capability axis the feature-usage COUNT hides (WARDEN-1488): which capabilities are adopted, and how heavily?
+#     "windowsSeen": 288,                                                          # EVERY feature-usage window (=== byType['feature-usage']) — NOT a liveness signal: an idle window sends nothing
+#     "lastWindowAt": 1720000000000,                                               # newest windowEndedAt of a window that reported usage (producer clock) — NOT liveness; the `channel` verdict is the liveness surface
+#     "features": {                                                                # closed-set kebab-case capability names only (schema-enforced); bounded to 64 names + `__overflow__`
+#       "global-search": { "count": 1340, "windowsSeen": 210 },                    # count = SUM of uses across windows; windowsSeen = windows in which this capability appeared
+#       "chat-create":   { "count": 96,   "windowsSeen": 71 }
+#     },
+#     "distinctCount": 2                                                           # keys in `features` (the `__overflow__` bucket, when present, counts as one)
 #   }
 # }
 ```
 
 The response carries **counts and histograms only**, with ONE deliberate exception named below — it never
 echoes raw events. `total` is the record count; `byType` is always the full
-`{ error, crash, performance-stall, operational-metrics, server-stall, workspace-names, workspace-shape }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
+`{ error, crash, performance-stall, operational-metrics, server-stall, workspace-names, workspace-shape, feature-usage }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
 error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen`/`lastSeen` bound the
 observed time window (`null` on an empty store); `startedAt` is the epoch-ms at which **this receiver
 (re)booted**; `readAt` is the epoch-ms at which **this response was produced**. A fresh receiver with no
@@ -464,6 +473,28 @@ with `windowsSeen: 0` and `null` extrema rather than vanishing. No cardinality c
 the key space is the schema's CLOSED key set, bounded by construction. It is purely additive — a pure read
 over already-accepted, already-redacted, counts-only events; no new collection, wire field, schema bump, or
 identifier, and no change to `/events`.
+
+`featureUsage` is the per-capability axis the `feature-usage` event's `byType` integer hides (WARDEN-1488).
+Schema v9 made the feature-adoption category carry a `feature-usage` window — a bounded list of
+`{ name, count }` capability rows — and `byType` reduced a day of them to one integer. `featureUsage` folds
+every retained window per capability name: `count` is the SUM of uses, `windowsSeen` the number of windows in
+which that capability appeared (a name repeated inside one window credits that window once), so
+`global-search: { count: 9, windowsSeen: 2 }` reads "used nine times across two windows". Top-level
+`windowsSeen` is EVERY feature-usage event (it equals `byType['feature-usage']`, even when a window's rows
+were unusable — a malformed row is skipped, never poisoning a sum), `lastWindowAt` is the newest
+`windowEndedAt` on the PRODUCER's clock, and `distinctCount` is the number of keys in `features`. The name
+space is bounded like every client-keyed axis: names are truncated at 128 chars and capped at 64 distinct names
+(anchored to the schema's per-event ceiling), past which further new names fold into one counted
+`__overflow__` bucket — represented, never dropped, and counted in `distinctCount`. The shape is a STABLE zeroed
+`{ windowsSeen: 0, lastWindowAt: null, features: {}, distinctCount: 0 }` on a store with no feature-usage events.
+It is **counts and closed-set names only** — the schema already enforces closed row keys, a kebab-case name
+regex, positive-integer counts and a renderer-runtime pin, so no identifier can ride this channel and it needs
+no exception to "counts and histograms only". **It is NOT a liveness signal**: `feature-usage` is
+count-driven — an idle window sends nothing — so silence means "no capability was used", not "the client is
+down", and `lastWindowAt` is the time of the newest window that reported usage, never a heartbeat; the
+`channel` liveness verdict remains the liveness surface. Purely additive: a pure read over already-accepted
+events, scoped by `?type=` / `?platform=` / `?appVersion=` / `?since=` like every other key; no new collection,
+wire field, schema bump, or change to `/events`.
 
 `workspaceNames` is the axis that makes **the identically-named-chats defect legible in one query**
 (WARDEN-1473) — the founding sentence of the workspace-signal direction: *"twenty-five chats and
