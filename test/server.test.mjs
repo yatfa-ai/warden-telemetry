@@ -464,6 +464,53 @@ test('GET /summary?type=feature-usage scopes the feature axis; other scopes read
   assert.deepEqual(JSON.parse(other.body).featureUsage, { windowsSeen: 0, lastWindowAt: null, features: {}, distinctCount: 0 });
 });
 
+// WARDEN-1500 — operationLatency, end-to-end: POST a real window through /ingest,
+// read it back through GET /summary (the handler spreads summarize(filtered), so
+// the sibling key rides the response and inherits the scoping).
+test('POST /ingest an operational-metrics window → GET /summary serves operationLatency, scoped by ?type= and ?appVersion= (WARDEN-1500)', async () => {
+  const file = inMemoryFile();
+  const store = createNdjsonStore({ sink: file.sink, source: file.source });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const window = (appVersion, buckets) => ({
+    schemaVersion: SCHEMA_VERSION,
+    type: 'operational-metrics',
+    runtime: 'server',
+    timestamp: 11,
+    appVersion,
+    windowStartedAt: 1,
+    windowEndedAt: 11,
+    boundaries: [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+    operations: [{ operation: 'get-api-agent-states', count: buckets.reduce((a, b) => a + b, 0), okCount: buckets.reduce((a, b) => a + b, 0), failCount: 0, min: 1, avg: 100, max: 8000, buckets }],
+    rejected: 0,
+  });
+  const batch = { schemaVersion: SCHEMA_VERSION, events: [window('0.1.18', [90, 0, 0, 0, 0, 0, 0, 10, 0]), window('0.1.19', [10, 0, 0, 0, 0, 0, 0, 0, 0]), validError] };
+  const post = fakeRes();
+  await handler(fakeReq({ headers: schemaHeaders, body: JSON.stringify(batch) }), post);
+  assert.equal(post.statusCode, 202);
+
+  const get = async (url) => {
+    const res = fakeRes();
+    await handler(fakeReq({ method: 'GET', url }), res);
+    assert.equal(res.statusCode, 200);
+    return JSON.parse(res.body);
+  };
+
+  const all = await get('/summary');
+  assert.equal(all.operationLatency['get-api-agent-states'].histogramCount, 110);
+  assert.equal(all.operationLatency['get-api-agent-states'].p95, 10000);
+  assert.equal(all.operationLatency['get-api-agent-states'].p50, 50);
+
+  const byType = await get('/summary?type=operational-metrics');
+  assert.equal(byType.operationLatency['get-api-agent-states'].p95, 10000);
+  const errorOnly = await get('/summary?type=error');
+  assert.deepEqual(errorOnly.operationLatency, {});
+
+  const v19 = await get('/summary?appVersion=0.1.19');
+  assert.equal(v19.operationLatency['get-api-agent-states'].histogramCount, 10);
+  assert.equal(v19.operationLatency['get-api-agent-states'].p95, 50);
+  assert.equal(v19.operations['get-api-agent-states'].count, 10);
+});
+
 test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an error)', async () => {
   const store = readableStore([]);
   const handler = createRequestHandler({ store });
