@@ -67,7 +67,7 @@ function reject(status, error, extra) {
 // a pure subset of the current schema: the diff from that version's vendored
 // schema.ts to the current one removes ONLY the `SCHEMA_VERSION` literal and
 // WIDENS `BASE_EVENT_TYPES` / the `BaseEvent` union — never a field, a shape
-// validator, or a boundary. A v7/v8 event is therefore a valid v9 event in
+// validator, or a boundary. A v8/v9 event is therefore a valid v10 event in
 // everything but its own `schemaVersion` stamp, so the receiver can validate it
 // by NORMALIZATION (see step 3) without relaxing a single shape check.
 //
@@ -75,18 +75,21 @@ function reject(status, error, extra) {
 // ALWAYS the same 3 removed lines: the SCHEMA_VERSION literal, the widened
 // BASE_EVENT_TYPES, the widened BaseEvent union; everything else is pure
 // addition, which cannot break an old event):
-//   7 — `git diff 9cdb0e3 <v9> -- schema.ts`: the 3-line shape.
 //   8 — the v8→v9 diff, verified on the WARDEN-1479 change: the same 3-line
 //       shape (removed exactly `export const SCHEMA_VERSION = 8;`, the
 //       seven-entry BASE_EVENT_TYPES line, and the seven-member BaseEvent
 //       union).
-//   9 — the current schema itself (2b47cdf9 vendored v9).
+//   9 — the v9→v10 diff, verified on the WARDEN-1508 change: the same 3-line
+//       shape (removed exactly `export const SCHEMA_VERSION = 9;`, the
+//       eight-entry BASE_EVENT_TYPES line, and the eight-member BaseEvent
+//       union; `process-memory` and its validator are pure addition).
+//   10 — the current schema itself (WARDEN-1508 vendored v10).
 //
-// v6 left the window in WARDEN-1479: the window stays BOUNDED at three
-// versions as it rolls forward (v5 left when v6 landed, v6 leaves when v9
-// lands) — never a monotonic growth. v6 remains additive (nothing a v6 build
-// emits is invalid under v9); it simply ages out of the bounded window, and
-// a v6 build is drift again, exactly as pre-window.
+// v7 left the window in WARDEN-1508: the window stays BOUNDED at three
+// versions as it rolls forward (v6 left when v9 landed, v7 leaves when v10
+// lands) — never a monotonic growth. v7 remains additive (nothing a v7
+// build emits is invalid under v10); it simply ages out of the bounded window,
+// and a v7 build is drift again, exactly as pre-window.
 //
 // RECEIVER-LOCAL BY CONSTRUCTION — deliberately NOT in schema.ts: that file is
 // vendored verbatim from the client and pinned byte-identical by
@@ -97,7 +100,7 @@ function reject(status, error, extra) {
 // the new version, then extend this array (and a non-additive bump has to
 // consciously REMOVE the versions it no longer covers — the window-guard test
 // in test/ingest.test.mjs makes that shrink a deliberate act).
-export const COMPATIBLE_SCHEMA_VERSIONS = [7, 8, 9];
+export const COMPATIBLE_SCHEMA_VERSIONS = [8, 9, 10];
 
 /**
  * The accepted `x-telemetry-schema` header values as an ASCENDING string array:

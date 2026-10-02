@@ -244,7 +244,7 @@ test('GET /summary returns the aggregate over a pre-populated store → 200 + JS
   assert.equal(res.headers['content-type'], 'application/json');
   const body = JSON.parse(res.body);
   assert.equal(body.total, 2);
-  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'feature-usage': 0 });
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
   // The new failure-signature aggregate (WARDEN-707) flows through the
   // `...summarize(events)` spread at the /summary handler. errorEvent has empty
@@ -519,7 +519,7 @@ test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an 
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
   assert.equal(body.total, 0);
-  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'feature-usage': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   assert.deepEqual(body.topErrorNames, []);
   assert.deepEqual(body.schemaVersions, {});
   assert.equal(body.firstSeen, null);
@@ -1257,7 +1257,7 @@ test('GET /summary?platform=win32 scopes byType / topErrorNames / topSignatures 
   assert.equal(body.matched, 2, 'matched is the win32 subset');
   assert.ok(body.matched <= body.total, 'matched never exceeds total');
   // byType reflects ONLY the win32 events: one error + one crash.
-  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'feature-usage': 0 });
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   // topErrorNames is win32-only: RangeError (darwin) is gone.
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
   // topSignatures is win32-only: the darwin RangeError signature is gone.
@@ -1455,7 +1455,7 @@ test('GET /summary?type=crash scopes the aggregates to a single base type', asyn
   const body = JSON.parse(res.body);
   assert.equal(body.total, 3);
   assert.equal(body.matched, 2);
-  assert.deepEqual(body.byType, { error: 0, crash: 2, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'feature-usage': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 2, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   assert.deepEqual(body.topErrorNames, [], 'no error names — errors were filtered out');
 });
 
@@ -1492,7 +1492,7 @@ test('GET /summary?appVersion=0.1.18&platform=darwin&type=crash intersects all f
   const body = JSON.parse(res.body);
   assert.equal(body.total, 4, 'total is the full set');
   assert.equal(body.matched, 1, 'only the one darwin/0.1.18/crash event survives');
-  assert.deepEqual(body.byType, { error: 0, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'feature-usage': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   assert.deepEqual(body.topSignatures, [{ signature: 'crash:mac-oom', type: 'crash', count: 1 }]);
   assert.deepEqual(body.platforms, { darwin: 1 });
   assert.deepEqual(body.appVersions, { '0.1.18': 1 });
@@ -1509,7 +1509,7 @@ test('GET /summary with NO filters is backward compatible — matched === total,
   const body = JSON.parse(res.body);
   assert.equal(body.total, 2);
   assert.equal(body.matched, 2, 'unfiltered → matched === total');
-  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'feature-usage': 0 });
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }]);
   assert.deepEqual(body.topSignatures, [
     { signature: 'TypeError', type: 'error', count: 1 },
@@ -1532,7 +1532,7 @@ test('GET /summary?platform=win32 on a store with NO win32 events → matched 0,
   const body = JSON.parse(res.body);
   assert.equal(body.total, 2, 'total still the full persisted count');
   assert.equal(body.matched, 0, 'nothing matched the win32 filter');
-  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'feature-usage': 0 });
+  assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   assert.deepEqual(body.topErrorNames, []);
   assert.deepEqual(body.platforms, {});
   assert.deepEqual(body.timeline.buckets, []);
@@ -2191,7 +2191,7 @@ test('retention: /summary stays self-consistent over a pruned store — aggregat
 
   // Retained = the last 2 appended: error@300 (TypeError) + crash@400.
   assert.equal(body.total, 2);
-  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'feature-usage': 0 });
+  assert.deepEqual(body.byType, { error: 1, crash: 1, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   assert.deepEqual(body.topErrorNames, [{ name: 'TypeError', count: 1 }], 'RangeError was pruned');
   // topSignatures reflects ONLY the retained set: RangeError was pruned, so the
   // sole error signature is the name-only `TypeError`; crash@400 → `crash:oom`.
@@ -4885,7 +4885,7 @@ test('WINDOW: a v8-declared batch of real-production-shaped rows → 202, and /s
   assert.deepEqual(body.liveness.mismatchedDeclaredVersions, [], 'a window version is no longer a declared-version disagreement');
 });
 
-test('WINDOW: declared 6 / 10 / abc / MISSING still 415 at the PRE-READ seam (poisoned-stream probe) and still tally their drift (criterion 2; 6 aged out when the window rolled to [7,8,9])', async () => {
+test('WINDOW: declared 6 / 10 / abc / MISSING still 415 at the PRE-READ seam (poisoned-stream probe) and still tally their drift (criterion 2; 6 aged out when the window rolled past it, now [8,9,10])', async () => {
   const { handler, rejections } = windowedWiring();
 
   // The control: the CURRENT version on a poisoned stream passes the seam and
@@ -4900,7 +4900,7 @@ test('WINDOW: declared 6 / 10 / abc / MISSING still 415 at the PRE-READ seam (po
     const res = fakeRes();
     await handler(erroringReq({ headers: { 'x-telemetry-schema': declared } }), res);
     assert.equal(res.statusCode, 415, `declared ${JSON.stringify(declared)} is 415'd at the PRE-READ seam (a post-seam poisoned stream would be 400)`);
-    assert.match(JSON.parse(res.body).error, /expected one of \["7","8","9"\]/, 'the reason names the accepted set');
+    assert.match(JSON.parse(res.body).error, /expected one of \["8","9","10"\]/, 'the reason names the accepted set');
     // PIN the no-drift claim: the seam's 415 error text must equal the canonical
     // check's, because both sites call the ONE imported reason builder
     // unsupportedSchemaVersionReason. Compares the `error` TEXT, not the whole
@@ -4966,7 +4966,7 @@ test('WINDOW: GET /capabilities advertises acceptedSchemaVersions ascending besi
   await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
-  assert.deepEqual(body.acceptedSchemaVersions, [7, 8, 9], 'the full accepted window, ascending NUMBERS (rolled in WARDEN-1479)');
+  assert.deepEqual(body.acceptedSchemaVersions, [8, 9, 10], 'the full accepted window, ascending NUMBERS (rolled in WARDEN-1508)');
   assert.equal(body.schemaVersion, SCHEMA_VERSION, 'schemaVersion is unchanged — the client Test-connection check is untouched');
   assert.equal(body.authRequired, false, 'authRequired is unchanged');
 });
@@ -4988,8 +4988,8 @@ test('WINDOW: liveness.mismatchedDeclaredVersions does NOT exclude window versio
   // DECISION (WARDEN-1445): the drift filter excludes ONLY the receiver's own
   // version. The rejection tally is in-memory per boot, so while a version is
   // IN the window it can never be 415'd again — but if a '6' bucket DOES exist
-  // (a tally from before the window deploy, or — since WARDEN-1479 rolled the
-  // window to [7,8,9] — a live v6 build drift again), it is genuine history a
+  // (a tally from before the window deploy, or — since WARDEN-1508 rolled the
+  // window to [8,9,10] — a live v6 build drift again), it is genuine history a
   // maintainer should still see. The window must not silently rewrite the drift
   // story, so the filter is unchanged and this test holds it in place.
   const rejections = createRejectionTally({ now: () => 0 });
@@ -5005,7 +5005,7 @@ test('WINDOW: liveness.mismatchedDeclaredVersions does NOT exclude window versio
   await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
   const { mismatchedDeclaredVersions } = JSON.parse(res.body).liveness;
   // The composer's sort() is LEXICOGRAPHIC (pre-existing, deterministic): with
-  // v9 current, SCHEMA_VERSION+1 is '10', which sorts BEFORE '6' as strings —
+  // v10 current, SCHEMA_VERSION+1 is '11', which sorts BEFORE '6' as strings —
   // the order is the composer's contract, and this pin holds it, not a
   // numeric reading of the versions.
   assert.deepEqual(mismatchedDeclaredVersions, [String(SCHEMA_VERSION + 1), '6'], 'window versions are NOT filtered from the drift list — only the own version is');

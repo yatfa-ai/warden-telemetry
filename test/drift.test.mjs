@@ -35,8 +35,8 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 9,
-  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall', 'workspace-names', 'workspace-shape', 'feature-usage'],
+  SCHEMA_VERSION: 10,
+  BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall', 'workspace-names', 'workspace-shape', 'feature-usage', 'process-memory'],
   // v6 (WARDEN-1278) added SERVER — warden's backend is a FORKED CHILD of the
   // Electron main process, a third real OS process the wire could not name, so
   // nothing it observed could ever be reported under any consent.
@@ -338,6 +338,51 @@ test('feature-usage carries a CLOSED-SET name map — hostile names / counts / k
     false,
     'a ROW-borne identifier key is rejected too (closed row set)',
   );
+});
+
+// WARDEN-1508 — the `process-memory` event (schema v10): one bounded memory
+// window per runtime, riding the client's operational-metrics category. The
+// receiver must accept the exact shape the client producer emits for ALL THREE
+// runtimes and reject every shape that would let the numbers-only boundary
+// regress: an extra key, a string-valued field, a negative / non-integer byte
+// count, and an out-of-order min/avg/max.
+const processMemoryFixture = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'process-memory',
+  runtime: RUNTIME.MAIN,
+  timestamp: 99,
+  windowStartedAt: 60_000,
+  windowEndedAt: 90_000,
+  samples: 10,
+  rssMinBytes: 200_000_000,
+  rssAvgBytes: 210_000_000,
+  rssMaxBytes: 230_000_000,
+  heapUsedMaxBytes: 90_000_000,
+  processAgeMs: 3_600_000,
+};
+
+test('vendored validateEvent accepts the process-memory fixture for every runtime (schema v10)', () => {
+  for (const runtime of [RUNTIME.MAIN, RUNTIME.RENDERER, RUNTIME.SERVER]) {
+    assert.equal(validateEvent({ ...processMemoryFixture, runtime }), true, `${runtime} validates`);
+    assert.equal(validateBaseEvent({ ...processMemoryFixture, runtime }), true, `${runtime} validates (the ingest path)`);
+  }
+  const { heapUsedMaxBytes: _h, ...noHeap } = processMemoryFixture;
+  assert.equal(validateEvent({ ...noHeap, runtime: RUNTIME.RENDERER }), true, 'heapUsedMaxBytes is optional');
+  assert.equal(validateEvent({ ...processMemoryFixture, appVersion: '0.1.86', platform: 'linux' }), true, 'optional labels attach');
+});
+
+test('process-memory is NUMBERS ONLY over a closed key set — hostile shapes are rejected', () => {
+  for (const extra of [{ chatName: 'x' }, { path: '/home/a' }, { host: 'a@b.internal' }, { name: 'n' }]) {
+    assert.equal(validateEvent({ ...processMemoryFixture, ...extra }), false, `${Object.keys(extra)[0]} key rejected`);
+  }
+  for (const k of ['samples', 'rssMinBytes', 'rssAvgBytes', 'rssMaxBytes', 'heapUsedMaxBytes', 'processAgeMs']) {
+    assert.equal(validateEvent({ ...processMemoryFixture, [k]: '1' }), false, `string ${k} rejected`);
+    assert.equal(validateEvent({ ...processMemoryFixture, [k]: -1 }), false, `negative ${k} rejected`);
+    assert.equal(validateEvent({ ...processMemoryFixture, [k]: 1.5 }), false, `non-integer ${k} rejected`);
+  }
+  assert.equal(validateEvent({ ...processMemoryFixture, samples: 0 }), false, 'an empty window is rejected');
+  assert.equal(validateEvent({ ...processMemoryFixture, rssMinBytes: 215_000_000 }), false, 'min > avg rejected');
+  assert.equal(validateEvent({ ...processMemoryFixture, rssAvgBytes: 231_000_000 }), false, 'avg > max rejected');
 });
 
 // ── BYTE-IDENTITY with the canonical client copy (WARDEN-1248) ────────────────
