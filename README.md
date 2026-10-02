@@ -234,7 +234,7 @@ curl http://localhost:7421/summary
 
 The response carries **counts and histograms only**, with ONE deliberate exception named below — it never
 echoes raw events. `total` is the record count; `byType` is always the full
-`{ error, crash, performance-stall, operational-metrics, server-stall, workspace-names, workspace-shape, feature-usage }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
+`{ error, crash, performance-stall, operational-metrics, server-stall, workspace-names, workspace-shape, feature-usage, process-memory }` set (zeroed when empty); `topErrorNames` comes from the non-identifying
 error `name` field; `schemaVersions` is a histogram keyed by version; `firstSeen`/`lastSeen` bound the
 observed time window (`null` on an empty store); `startedAt` is the epoch-ms at which **this receiver
 (re)booted**; `readAt` is the epoch-ms at which **this response was produced**. A fresh receiver with no
