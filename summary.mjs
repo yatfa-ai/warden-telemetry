@@ -5,8 +5,8 @@
 //   - `summarize(events)`        → flat aggregates (total / byType / topErrorNames
 //                                  / topSignatures / schemaVersions / appVersions
 //                                  / platforms / crashReasons / stalls / operations
-//                                  / workspaceShape / workspaceNames / featureUsage
-//                                  / firstSeen
+//                                  / operationLatency / workspaceShape
+//                                  / workspaceNames / featureUsage / firstSeen
 //                                  / lastSeen).
 //   - `lastAcceptedInstant(events)` → the newest effective instant across the batch
 //                                  (WARDEN-1428) — i.e. WHEN the newest ACCEPTED
@@ -289,8 +289,16 @@ function _createBoundedClientHistogram(cap = CLIENT_HISTOGRAM_CAP) {
 // windows would merge two different x-axes into one meaningless array, so
 // `operations` projects NO histogram axis at all: count / okCount / failCount /
 // min / avg / max only. The numbers are scale-free and always comparable; the
-// per-window histograms stay readable on /events.
+// per-window histograms stay readable on /events. The refusal's rule (never sum
+// across scales) is kept — the distribution is projected PER SCALE in the
+// sibling `operationLatency` key (WARDEN-1500), never inside `operations`.
 export const OPERATIONS_SUMMARY_CAP = 129; // anchored to schema.ts's MAX_OPERATIONS_PER_EVENT
+
+// Distinct histogram scales (boundary arrays) tracked per operation name in
+// `operationLatency` (WARDEN-1500). The two live producers ship two scales, so 4
+// leaves headroom for a future producer; every further distinct scale for a name
+// folds into that name's `excludedCount` (bounded memory, no silent loss).
+export const OPERATION_LATENCY_SCALE_CAP = 4;
 
 // ── WORKSPACE AGGREGATES (WARDEN-1473) ────────────────────────────────────────
 // The two workspace event types (`workspace-shape`, WARDEN-1424; and
@@ -592,6 +600,106 @@ function _newOperationAccumulator() {
   return { count: 0, okCount: 0, failCount: 0, weightedSum: 0, weightCount: 0, min: null, max: null };
 }
 
+// An empty per-operation latency accumulator (WARDEN-1500): up to
+// OPERATION_LATENCY_SCALE_CAP per-scale histograms plus the observations dropped
+// because their scale did not fit under the cap.
+function _newLatencyAccumulator() {
+  return { scales: [], overflowExcluded: 0 };
+}
+
+/**
+ * Is `boundaries` usable as a histogram scale: an array of finite numbers.
+ * (Ascending order is the validator's job; this fold only needs element-wise
+ * comparability, and never indexes outside the array.)
+ * @private
+ */
+function _validBoundaries(boundaries) {
+  return Array.isArray(boundaries) && boundaries.every((b) => typeof b === 'number' && Number.isFinite(b));
+}
+
+/**
+ * Fold ONE window entry's `buckets[]` into the latency accumulator `lat`
+ * (WARDEN-1500). SKIP-ROBUST on `_foldOperations`' terms and INDEPENDENT of its
+ * count/min/avg/max fold: an entry whose `buckets` is not an array of
+ * non-negative integers of length `boundaries.length + 1` (or whose window
+ * `boundaries` is unusable) contributes NOTHING here. Buckets are only ever
+ * index-summed into a scale whose `boundaries` are element-wise EQUAL — never
+ * across scales (the HISTOGRAM REFUSAL rule). An all-zero histogram (an idle
+ * placeholder window) registers nothing, so it can never occupy a scale slot.
+ * @private
+ */
+function _foldLatency(lat, boundaries, buckets) {
+  if (!_validBoundaries(boundaries)) return;
+  if (!Array.isArray(buckets) || buckets.length !== boundaries.length + 1) return;
+  let sum = 0;
+  for (const b of buckets) {
+    if (typeof b !== 'number' || !Number.isInteger(b) || b < 0) return;
+    sum += b;
+  }
+  if (sum === 0) return;
+  let scale = lat.scales.find(
+    (sc) => sc.boundaries.length === boundaries.length && sc.boundaries.every((v, i) => v === boundaries[i])
+  );
+  if (scale === undefined) {
+    if (lat.scales.length >= OPERATION_LATENCY_SCALE_CAP) {
+      lat.overflowExcluded += sum;
+      return;
+    }
+    scale = { boundaries: boundaries.slice(), buckets: new Array(boundaries.length + 1).fill(0), total: 0 };
+    lat.scales.push(scale);
+  }
+  for (let i = 0; i < buckets.length; i += 1) scale.buckets[i] += buckets[i];
+  scale.total += sum;
+}
+
+/**
+ * Nearest-rank percentile as a BUCKET UPPER BOUND (WARDEN-1500): the upper
+ * boundary of the first bucket whose cumulative count ≥ ceil(pct/100 × total).
+ * Never interpolated. Overflow bucket (beyond the top boundary) or an empty
+ * histogram → `null`. Integer arithmetic (pct × total / 100) so ceil can never be
+ * tipped by float noise (0.07 × 100 = 7.000000000000001).
+ * @private
+ */
+function _percentileUpperBound(boundaries, buckets, total, pct) {
+  if (total <= 0) return null;
+  const rank = Math.ceil((pct * total) / 100);
+  let cumulative = 0;
+  for (let i = 0; i < buckets.length; i += 1) {
+    cumulative += buckets[i];
+    if (cumulative >= rank) return i < boundaries.length ? boundaries[i] : null;
+  }
+  return null;
+}
+
+/**
+ * Render ONE latency accumulator as the public per-operation distribution
+ * (WARDEN-1500): the scale with the most observations (first-seen wins a tie);
+ * every other scale's observations plus any cap overflow become `excludedCount`.
+ * No histogram → `{ boundaries: [], buckets: [], histogramCount: 0,
+ * excludedCount: 0, p50/p95/p99: null }`.
+ * @private
+ */
+function _latencySnapshot(lat) {
+  let best = null;
+  let all = lat.overflowExcluded;
+  for (const sc of lat.scales) {
+    all += sc.total;
+    if (best === null || sc.total > best.total) best = sc;
+  }
+  if (best === null) {
+    return { boundaries: [], buckets: [], histogramCount: 0, excludedCount: all, p50: null, p95: null, p99: null };
+  }
+  return {
+    boundaries: best.boundaries.slice(),
+    buckets: best.buckets.slice(),
+    histogramCount: best.total,
+    excludedCount: all - best.total,
+    p50: _percentileUpperBound(best.boundaries, best.buckets, best.total, 50),
+    p95: _percentileUpperBound(best.boundaries, best.buckets, best.total, 95),
+    p99: _percentileUpperBound(best.boundaries, best.buckets, best.total, 99),
+  };
+}
+
 /**
  * Fold ONE operational-metrics event's `operations[]` into the per-name
  * accumulator map `accs` (WARDEN-1435). Skip-robust per `summarize()`'s stated
@@ -618,10 +726,13 @@ function _newOperationAccumulator() {
  *   `0 × 0` at best, `NaN × 0` at worst. The finite guard is the
  *   `_stallSnapshot` honesty posture: a non-finite value is skipped from the
  *   extrema / weighted sum but the observation (its `count`) is still counted.
- * - NO histogram axis is folded, deliberately: the two live producers ship
- *   incompatible boundary scales into this one event type (see the
- *   OPERATIONS_SUMMARY_CAP block above), so `buckets[]` is never summed,
- *   concatenated, or index-merged — the numbers here are scale-free.
+ * - NO histogram axis is folded into `accs`, deliberately: the two live
+ *   producers ship incompatible boundary scales into this one event type (see
+ *   the OPERATIONS_SUMMARY_CAP block above), so `buckets[]` is never summed,
+ *   concatenated, or index-merged here — the numbers in `accs` are scale-free.
+ *   The distribution is folded PER SCALE into the separate `latency` map
+ *   (WARDEN-1500, `_foldLatency`), under the same name key, independently: an
+ *   entry with unusable buckets still folds count/min/avg/max above.
  *
  * `operation` names are ≤64 chars on every validator-accepted event
  * (OPERATION_NAME_RE), so `_boundClientKey` can never truncate one — it is
@@ -633,22 +744,25 @@ function _newOperationAccumulator() {
  *
  * @param {unknown} operations the event's `operations` array (any shape)
  * @param {Map<string, object>} accs name → accumulator (mutated in place)
+ * @param {Map<string, object>} [latency] name → latency accumulator (mutated in place)
+ * @param {unknown} [boundaries] the event's histogram `boundaries`
  * @private
  */
-function _foldOperations(operations, accs) {
+function _foldOperations(operations, accs, latency, boundaries) {
   if (!Array.isArray(operations)) return;
   for (const op of operations) {
     if (!op || typeof op !== 'object') continue;
-    const { operation, count, okCount, failCount, min, avg, max } = op;
+    const { operation, count, okCount, failCount, min, avg, max, buckets } = op;
     if (typeof operation !== 'string' || operation.length === 0) continue;
     if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) continue;
-    const key = _boundClientKey(operation);
+    let key = _boundClientKey(operation);
     let acc = accs.get(key);
     if (acc === undefined) {
       if (accs.size < OPERATIONS_SUMMARY_CAP) {
         acc = _newOperationAccumulator();
         accs.set(key, acc);
       } else {
+        key = OVERFLOW_KEY;
         // Cap reached → fold every further NEW distinct name into the single
         // overflow accumulator: bounded cardinality, no count loss.
         acc = accs.get(OVERFLOW_KEY);
@@ -659,6 +773,14 @@ function _foldOperations(operations, accs) {
       }
     }
     acc.count += count;
+    if (latency instanceof Map) {
+      let lat = latency.get(key);
+      if (lat === undefined) {
+        lat = _newLatencyAccumulator();
+        latency.set(key, lat);
+      }
+      _foldLatency(lat, boundaries, buckets);
+    }
     if (typeof okCount === 'number' && Number.isFinite(okCount) && okCount >= 0) acc.okCount += okCount;
     if (typeof failCount === 'number' && Number.isFinite(failCount) && failCount >= 0) acc.failCount += failCount;
     if (count > 0) {
@@ -934,6 +1056,9 @@ export function lastAcceptedInstant(events) {
  *             bySource: Record<string, { count: number, min: number | null, avg: number, max: number | null }> },
  *   operations: Record<string, { count: number, okCount: number, failCount: number,
  *                                min: number | null, avg: number, max: number | null }>,
+ *   operationLatency: Record<string, { boundaries: number[], buckets: number[],
+ *                                      histogramCount: number, excludedCount: number,
+ *                                      p50: number | null, p95: number | null, p99: number | null }>,
  *   workspaceShape: { windowsSeen: number, lastSnapshotAt: number | null,
  *                     counts: Record<string, { windowsSeen: number, min: number | null,
  *                                              avg: number, max: number | null }> },
@@ -982,6 +1107,10 @@ export function summarize(events) {
   // bounded buckets (see _foldOperations + OPERATIONS_SUMMARY_CAP). Populated
   // in the event loop below, snapshotted into the `operations` return key.
   const operationsByName = new Map();
+  // Per-operation latency distribution (WARDEN-1500): the PER-SCALE histogram
+  // sibling of operationsByName, keyed by the SAME (bounded / overflow-folded)
+  // name key so `operationLatency` and `operations` always share a key set.
+  const latencyByName = new Map();
   // Workspace aggregates (WARDEN-1473): the two workspace event types' payloads
   // that the COUNT (byType) discards. `workspaceShapeCounts` folds every
   // `workspace-shape` window's counts per count NAME (see _foldWorkspaceShape);
@@ -1024,7 +1153,7 @@ export function summarize(events) {
     // `timestamp` is deliberately NOT destructured here: the ONLY consumer of it in
     // this loop was the time-bounds fallback, which now reads it through the shared
     // `_effectiveInstant(event)` helper (WARDEN-1428).
-    const { type, name, schemaVersion, appVersion, platform, runtime, reason, lagMs, source, operations } = event;
+    const { type, name, schemaVersion, appVersion, platform, runtime, reason, lagMs, source, operations, boundaries } = event;
 
     if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(byType, type)) {
       byType[type] += 1;
@@ -1120,7 +1249,7 @@ export function summarize(events) {
     // aggregate, while the EVENT is already counted in byType above (the two
     // are independent, exactly like a crash's reason and its byType count).
     if (type === 'operational-metrics') {
-      _foldOperations(operations, operationsByName);
+      _foldOperations(operations, operationsByName, latencyByName, boundaries);
     }
     // Workspace aggregates (WARDEN-1473): fold this window's payload into the
     // shape / names accumulators. Skip-robust on exactly the `_foldOperations`
@@ -1220,6 +1349,12 @@ export function summarize(events) {
     [...operationsByName.entries()].map(([name, acc]) => [name, _operationSnapshot(acc)])
   );
 
+  // Per-operation latency snapshot (WARDEN-1500): one distribution per name in
+  // `operations` (same keys, same order). Percentiles are bucket UPPER BOUNDS.
+  const operationLatency = Object.fromEntries(
+    [...operationsByName.keys()].map((name) => [name, _latencySnapshot(latencyByName.get(name) ?? _newLatencyAccumulator())])
+  );
+
   // Workspace-shape rollup (WARDEN-1473): `windowsSeen` is EVERY shape event (it
   // MUST equal byType['workspace-shape'] so the count and payload surfaces
   // agree), `lastSnapshotAt` is the newest window-close instant, and `counts`
@@ -1257,6 +1392,7 @@ export function summarize(events) {
     crashReasons: crashReasons.snapshot(),
     stalls,
     operations,
+    operationLatency,
     workspaceShape,
     workspaceNames,
     featureUsage: featureUsageAcc.snapshot(),

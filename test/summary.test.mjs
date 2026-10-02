@@ -50,6 +50,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.deepEqual(s.byRuntime, {});
   assert.deepEqual(s.crashReasons, {});
   assert.deepEqual(s.operations, {});
+  assert.deepEqual(s.operationLatency, {}, 'WARDEN-1500: stable empty shape');
   // WARDEN-1473 — the workspace axes read a STABLE zeroed shape on an empty
   // store: every schema count is present with `windowsSeen: 0` and `null`
   // min/max, never a fabricated `0` (a `0` panesOpen is a REAL measurement).
@@ -996,6 +997,122 @@ test('an over-128-char operation name is truncated — defence-in-depth over a N
   const keys = Object.keys(s.operations);
   assert.equal(keys.length, 1);
   assert.equal(keys[0].length, CLIENT_KEY_MAX_LENGTH, 'truncated at the shared client-key bound');
+});
+
+// ── operationLatency (WARDEN-1500) ────────────────────────────────────────────
+// Per-SCALE latency distribution + nearest-rank bucket-upper-bound percentiles.
+
+const lat = (windows, name) => summarize(windows).operationLatency[name];
+const zeros9 = () => [0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+test('operationLatency: the live bimodal route reads p50 ≤50 / p95 ≤10000 while operations.avg is unchanged', () => {
+  const buckets = [1696, 4, 36, 8, 2, 38, 49, 340, 0];
+  const w = metricsWindow([op('get-api-agent-states', 2173, 2173, 0, 1, 1212, 8837, buckets)]);
+  const s = summarize([w]);
+  const l = s.operationLatency['get-api-agent-states'];
+  assert.deepEqual(l.boundaries, SERVER_BOUNDARIES);
+  assert.deepEqual(l.buckets, buckets);
+  assert.equal(l.histogramCount, 2173);
+  assert.equal(l.excludedCount, 0);
+  assert.equal(l.p50, 50);
+  assert.equal(l.p95, 10000);
+  assert.equal(l.p99, 10000);
+  assert.deepEqual(s.operations['get-api-agent-states'], { count: 2173, okCount: 2173, failCount: 0, min: 1, avg: 1212, max: 8837 });
+});
+
+test('operationLatency: nearest-rank uses ceil — 95 in bucket 0, 5 in bucket 3 → p95 bucket-0 bound, p99 bucket-3 bound', () => {
+  const b = zeros9();
+  b[0] = 95;
+  b[3] = 5;
+  const l = lat([metricsWindow([op('x-op', 100, 100, 0, 1, 1, 1, b)])], 'x-op');
+  assert.equal(l.p50, 50);
+  assert.equal(l.p95, 50);
+  assert.equal(l.p99, 500);
+});
+
+test('operationLatency: folds the SAME scale across windows', () => {
+  const a = zeros9(); a[0] = 3;
+  const b = zeros9(); b[2] = 1;
+  const l = lat([metricsWindow([op('x-op', 3, 3, 0, 1, 1, 1, a)]), metricsWindow([op('x-op', 1, 1, 0, 1, 1, 1, b)])], 'x-op');
+  assert.deepEqual(l.buckets, [3, 0, 1, 0, 0, 0, 0, 0, 0]);
+  assert.equal(l.histogramCount, 4);
+});
+
+test('operationLatency: overflow-only observations → null percentiles, buckets[last] > 0', () => {
+  const b = zeros9(); b[8] = 4;
+  const l = lat([metricsWindow([op('x-op', 4, 4, 0, 20000, 20000, 20000, b)])], 'x-op');
+  assert.equal(l.p50, null);
+  assert.equal(l.p95, null);
+  assert.equal(l.p99, null);
+  assert.equal(l.histogramCount, 4);
+  assert.ok(l.buckets[l.buckets.length - 1] > 0);
+});
+
+test('operationLatency: empty histogram (zero-count placeholder) → null percentiles, histogramCount 0, no NaN', () => {
+  const s = summarize([metricsWindow([op('idle-op', 0, 0, 0, 0, 0, 0, zeros9())])]);
+  const l = s.operationLatency['idle-op'];
+  assert.deepEqual(l, { boundaries: [], buckets: [], histogramCount: 0, excludedCount: 0, p50: null, p95: null, p99: null });
+  assert.equal(JSON.stringify(s.operationLatency).includes('NaN'), false);
+});
+
+test('operationLatency: mixed scales — larger-count scale reported, other in excludedCount, never index-summed', () => {
+  const server = zeros9(); server[0] = 2;
+  const renderer = new Array(13).fill(0); renderer[2] = 3;
+  const l = lat([
+    metricsWindow([op('get-api-claude-sessions', 2, 2, 0, 60, 75, 90, server)], { boundaries: SERVER_BOUNDARIES }),
+    metricsWindow([op('get-api-claude-sessions', 3, 3, 0, 40, 60, 150, renderer)], { boundaries: RENDERER_BOUNDARIES, runtime: 'renderer' }),
+  ], 'get-api-claude-sessions');
+  assert.deepEqual(l.boundaries, RENDERER_BOUNDARIES);
+  assert.deepEqual(l.buckets, renderer);
+  assert.equal(l.histogramCount, 3);
+  assert.equal(l.excludedCount, 2);
+  assert.equal(l.p50, 75);
+});
+
+test('operationLatency: distinct scales past the cap fold into excludedCount (bounded, no loss)', () => {
+  const wins = [];
+  for (let i = 0; i < 7; i += 1) {
+    // Six distinct 1-boundary scales, i-th carries i+1 observations; scale 0..3 tracked.
+    wins.push(metricsWindow([op('x-op', i + 1, i + 1, 0, 1, 1, 1, [i + 1, 0])], { boundaries: [100 + i] }));
+  }
+  const l = lat(wins, 'x-op');
+  const total = 1 + 2 + 3 + 4 + 5 + 6 + 7;
+  // Only the first OPERATION_LATENCY_SCALE_CAP (4) scales are tracked; the largest of them (4 obs) is reported.
+  assert.equal(l.histogramCount, 4);
+  assert.equal(l.histogramCount + l.excludedCount, total);
+});
+
+test('operationLatency: unusable buckets contribute nothing to the histogram but still fold into operations and byType', () => {
+  const good = zeros9(); good[1] = 2;
+  const s = summarize([
+    metricsWindow([
+      op('x-op', 2, 2, 0, 80, 90, 100, good),
+      op('x-op', 5, 5, 0, 10, 10, 10, [1, 2, 3]), // wrong length
+      op('x-op', 5, 5, 0, 10, 10, 10, [NaN, 0, 0, 0, 0, 0, 0, 0, 0]),
+      op('x-op', 5, 5, 0, 10, 10, 10, [-1, 0, 0, 0, 0, 0, 0, 0, 0]),
+      op('x-op', 5, 5, 0, 10, 10, 10, [1.5, 0, 0, 0, 0, 0, 0, 0, 0]),
+      op('x-op', 5, 5, 0, 10, 10, 10, 'nope'),
+      op('x-op', 5, 5, 0, 10, 10, 10, undefined),
+    ]),
+    metricsWindow([op('x-op', 1, 1, 0, 1, 1, 1, zeros9())], { boundaries: 'bad' }),
+  ]);
+  const l = s.operationLatency['x-op'];
+  assert.equal(l.histogramCount, 2);
+  assert.equal(l.excludedCount, 0);
+  assert.deepEqual(l.buckets, [0, 2, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(s.operations['x-op'].count, 33, 'operations still folds every entry');
+  assert.equal(s.byType['operational-metrics'], 2);
+  assert.equal(JSON.stringify(s.operationLatency).includes('NaN'), false);
+});
+
+test('operationLatency: >129 names fold to __overflow__ with no observation loss, sharing operations\' key set', () => {
+  const names = [];
+  for (let i = 0; i < OPERATIONS_SUMMARY_CAP + 10; i += 1) names.push(`op-${String(i).padStart(3, '0')}`);
+  const s = summarize([metricsWindow(names.map((n) => op(n, 1, 1, 0, 1, 1, 1, [1, 0, 0, 0, 0, 0, 0, 0, 0])))]);
+  assert.deepEqual(Object.keys(s.operationLatency).sort(), Object.keys(s.operations).sort());
+  assert.equal(s.operationLatency.__overflow__.histogramCount, 10);
+  const total = Object.values(s.operationLatency).reduce((a, b) => a + b.histogramCount, 0);
+  assert.equal(total, names.length);
 });
 
 // ── TIME WINDOW ───────────────────────────────────────────────────────────────

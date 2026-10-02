@@ -194,6 +194,11 @@ curl http://localhost:7421/summary
 #     "pane-echo-e2e":           { "count": 96, "okCount": 96, "failCount": 0, "min": 250, "avg": 302, "max": 800 },   # a renderer operation reading 100% ok is correct — that producer only ever counts successes
 #     "__overflow__":            { "count": 12, "okCount": 12, "failCount": 0, "min": 1, "avg": 3, "max": 9 }          # past the 129-name cap, further distinct names fold here — represented, never dropped
 #   },
+#   "operationLatency": {                                                          # the per-SCALE latency distribution `operations` deliberately omits (WARDEN-1500): a bimodal route no longer reads as its mean
+#     "get-api-agent-states": { "boundaries": [50, 100, 250, 500, 1000, 2500, 5000, 10000], "buckets": [1696, 4, 36, 8, 2, 38, 49, 340, 0],
+#                               "histogramCount": 2173, "excludedCount": 0,        # histogramCount = observations in the reported scale; excludedCount = observations on OTHER scales (or past the scale cap) — never summed in
+#                               "p50": 50, "p95": 10000, "p99": 10000 }            # nearest-rank bucket UPPER BOUNDS (p95: 10000 means "in the 5000–10000ms bucket", NOT a measured 10,000ms); null = beyond the top boundary (see buckets[last])
+#   },
 #   "workspaceShape": {                                                            # the COUNT axis the workspace-shape event's byType integer hides (WARDEN-1473): how big is the workspace people actually run?
 #     "windowsSeen": 288,                                                          # EVERY workspace-shape window (=== byType['workspace-shape'])
 #     "lastSnapshotAt": 1720000000000,                                             # newest windowEndedAt — the PRODUCER's own clock, so out-of-order persistence cannot fake staleness
@@ -450,6 +455,22 @@ no count loss), and the keys are safe by construction: an operation name is a co
 the schema (`OPERATION_NAME_RE`), so a path or hostname can never ride the aggregate key. It is purely
 additive — a pure read over already-accepted, already-redacted events, computed on read; no new collection,
 wire field, schema bump, or identifier, and no change to `/events`.
+
+`operationLatency` is the distribution `operations` deliberately leaves out (WARDEN-1500): a bimodal route
+(most calls fast, a heavy tail at 5–10s) reads as its mean in `operations`. It is a **sibling** top-level key
+— `operations` is byte-identical — with one entry per operation name (the same 129-name cap and `__overflow__`
+fold) of `{ boundaries, buckets, histogramCount, excludedCount, p50, p95, p99 }`. The never-sum-across-scales
+rule is kept: window `buckets[]` are folded only into an accumulator whose `boundaries` are element-wise equal.
+If one operation's windows arrive on several scales, the scale with the most observations is reported and every
+other scale's observations (plus any scale beyond the 4-per-name cap) are counted in `excludedCount`, never
+merged. A window whose `buckets` is not a non-negative-integer array of length `boundaries.length + 1` adds
+nothing to the histogram but still folds into `operations`. **Percentiles are bucket upper bounds, never
+interpolated**: `pNN` is the upper boundary of the first bucket whose cumulative count reaches
+`ceil(NN/100 × histogramCount)`, so `p95: 10000` means "the 95th-percentile call fell in the 5000–10000ms
+bucket", not a measured 10,000ms. A percentile landing in the overflow bucket (beyond the top boundary) is
+`null` — readable from `buckets[last] > 0` — and an empty histogram reads `histogramCount: 0` with `null`
+percentiles. Purely additive and computed on read; it inherits the `?type=` / `?platform=` / `?appVersion=` /
+`?since=` scoping, with no schema bump or new identifier.
 
 `workspaceShape` is the COUNT axis the `workspace-shape` event's `byType` integer hides (WARDEN-1473).
 A day of 5-minute window snapshots carrying how many workspaces, panes and sidebar rows a real install
