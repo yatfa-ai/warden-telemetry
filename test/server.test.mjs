@@ -5068,3 +5068,40 @@ test('GET /summary serves processMemory and ?type= scopes it (WARDEN-1514)', asy
   assert.equal(otherPm.lastWindowAt, null);
   assert.equal(otherPm.byRuntime.main.rssMaxBytes, null);
 });
+
+// WARDEN-1519 — the operationRejections aggregate, end-to-end through the real handler.
+test('GET /summary serves operationRejections and ?appVersion= scopes it (WARDEN-1519)', async () => {
+  const win = (overrides) => ({
+    schemaVersion: SCHEMA_VERSION,
+    type: 'operational-metrics',
+    runtime: 'renderer',
+    timestamp: 50,
+    windowStartedAt: 40,
+    windowEndedAt: 50,
+    boundaries: [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+    operations: [],
+    rejected: 0,
+    ...overrides,
+  });
+  const store = readableStore([
+    win({ rejected: 3, appVersion: '0.1.19', windowEndedAt: 50, timestamp: 50 }),
+    win({ rejected: 2, appVersion: '0.1.20', windowEndedAt: 70, timestamp: 70 }),
+    win({ runtime: 'main', rejected: 0, appVersion: '0.1.20', windowEndedAt: 60, timestamp: 60 }),
+  ]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.operationRejections.windowsSeen, 3);
+  assert.deepEqual(body.operationRejections.byRuntime.renderer, { windowsSeen: 2, windowsWithRejections: 2, rejectedTotal: 5, lastRejectedAt: 70 });
+  assert.equal(body.operationRejections.byRuntime.main.rejectedTotal, 0);
+  assert.equal(body.operationRejections.byRuntime.server.rejectedTotal, null);
+
+  const scoped = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?appVersion=0.1.19' }), scoped);
+  const sr = JSON.parse(scoped.body).operationRejections;
+  assert.equal(sr.windowsSeen, 1);
+  assert.deepEqual(sr.byRuntime.renderer, { windowsSeen: 1, windowsWithRejections: 1, rejectedTotal: 3, lastRejectedAt: 50 });
+  assert.equal(sr.byRuntime.main.rejectedTotal, null, 'scoped out → silence, not zero');
+});
