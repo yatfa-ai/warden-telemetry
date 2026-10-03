@@ -6,8 +6,8 @@
 //                                  / topSignatures / schemaVersions / appVersions
 //                                  / platforms / crashReasons / stalls / operations
 //                                  / operationLatency / workspaceShape
-//                                  / workspaceNames / featureUsage / firstSeen
-//                                  / lastSeen).
+//                                  / workspaceNames / featureUsage / processMemory
+//                                  / firstSeen / lastSeen).
 //   - `lastAcceptedInstant(events)` → the newest effective instant across the batch
 //                                  (WARDEN-1428) — i.e. WHEN the newest ACCEPTED
 //                                  event landed, or `null` on an empty store. Equal
@@ -435,6 +435,133 @@ function _createFeatureUsageAccumulator() {
         features: out,
         distinctCount: features.size,
       };
+    },
+  };
+}
+
+// ── PROCESS MEMORY aggregate (WARDEN-1514) ────────────────────────────────────
+// Schema v10 (WARDEN-1507/1508) made the operational-metrics category carry a
+// `process-memory` event, and until this axis existed `summarize()` reduced every
+// accepted memory window to the bare `byType['process-memory']` integer — the
+// RSS / heap / process-age numbers were discarded ("producer landed, read surface
+// lagging", the same mechanism as WARDEN-1488 / WARDEN-1473). `processMemory` is
+// the read-side completion: the last pure receiver projection of the v9/v10 events.
+//
+// TRUST / HONESTY (stated here so the diff carries it):
+//  - NUMBERS ONLY. No string from the event is echoed except the CLOSED runtime key
+//    (main | renderer | server); a runtime outside that set is skipped by the fold
+//    (the event still counts in the top-level `windowsSeen`). The schema already
+//    guarantees the fields are non-identifying numbers.
+//  - SILENCE ≠ LOW MEMORY. A runtime that never reported has `windowsSeen: 0` and
+//    NULL min/avg/max/heap/peak/latest — never fabricated zeros.
+//  - `rssAvgBytes` is the SAMPLE-WEIGHTED mean (sum(avg*samples)/sum(samples),
+//    integer-rounded), not a mean of window means.
+//  - `peak` is the window with the largest `rssMaxBytes` together with THAT
+//    window's `processAgeMs` (a small age beside a high peak reads as "high right
+//    after a restart"); `latest` is the window with the greatest producer-clock
+//    `windowEndedAt` (not arrival order). Ties break deterministically so the
+//    result never depends on event order. No restart-detection logic.
+//  - `process-memory` is NOT a liveness signal: `lastWindowAt` is the producer-clock
+//    close of the newest window seen and must not be read as liveness.
+export const PROCESS_MEMORY_RUNTIMES = Object.freeze(['main', 'renderer', 'server']);
+
+function _finiteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * Create the `process-memory` accumulator (WARDEN-1514). See the block comment
+ * above for the contract. Skip-robust: a non-number / non-finite field is skipped
+ * individually and can never throw or poison a sum to `NaN`.
+ *
+ * @returns {{ fold(event: object): void, snapshot(): object }}
+ * @private
+ */
+function _createProcessMemoryAccumulator() {
+  let windowsSeen = 0;
+  let lastWindowAt = null;
+  const runtimes = new Map();
+  for (const r of PROCESS_MEMORY_RUNTIMES) {
+    runtimes.set(r, {
+      windowsSeen: 0,
+      samples: 0,
+      rssMin: null,
+      rssMax: null,
+      heapMax: null,
+      weightedSum: 0,
+      weightedSamples: 0,
+      peak: null,
+      latest: null,
+    });
+  }
+  return {
+    fold(event) {
+      windowsSeen += 1; // the EVENT counts whatever its payload turns out to be
+      const endedAt = _finiteNumber(event.windowEndedAt);
+      if (endedAt !== null && (lastWindowAt === null || endedAt > lastWindowAt)) lastWindowAt = endedAt;
+      const acc = typeof event.runtime === 'string' ? runtimes.get(event.runtime) : undefined;
+      if (acc === undefined) return; // closed key set: unknown runtime is skipped
+      acc.windowsSeen += 1;
+
+      const samples = _finiteNumber(event.samples);
+      const rssMin = _finiteNumber(event.rssMinBytes);
+      const rssAvg = _finiteNumber(event.rssAvgBytes);
+      const rssMax = _finiteNumber(event.rssMaxBytes);
+      const heapMax = _finiteNumber(event.heapUsedMaxBytes);
+      const ageMs = _finiteNumber(event.processAgeMs);
+
+      if (samples !== null && samples > 0) acc.samples += samples;
+      if (rssMin !== null && (acc.rssMin === null || rssMin < acc.rssMin)) acc.rssMin = rssMin;
+      if (rssMax !== null && (acc.rssMax === null || rssMax > acc.rssMax)) acc.rssMax = rssMax;
+      if (heapMax !== null && (acc.heapMax === null || heapMax > acc.heapMax)) acc.heapMax = heapMax;
+      if (rssAvg !== null && samples !== null && samples > 0) {
+        acc.weightedSum += rssAvg * samples;
+        acc.weightedSamples += samples;
+      }
+
+      if (rssMax !== null) {
+        // Largest rssMax wins; ties → later window close, then larger age (order-independent).
+        const p = acc.peak;
+        const better =
+          p === null ||
+          rssMax > p.rssMaxBytes ||
+          (rssMax === p.rssMaxBytes &&
+            ((endedAt ?? -Infinity) > (p.windowEndedAt ?? -Infinity) ||
+              ((endedAt ?? -Infinity) === (p.windowEndedAt ?? -Infinity) && (ageMs ?? -Infinity) > (p.processAgeMs ?? -Infinity))));
+        if (better) acc.peak = { rssMaxBytes: rssMax, processAgeMs: ageMs, windowEndedAt: endedAt };
+      }
+      if (endedAt !== null) {
+        // Greatest windowEndedAt wins; ties → larger rssMax, then larger age, then larger avg.
+        const l = acc.latest;
+        const key = [rssMax ?? -Infinity, ageMs ?? -Infinity, rssAvg ?? -Infinity];
+        let better = l === null || endedAt > l.windowEndedAt;
+        if (!better && endedAt === l.windowEndedAt) {
+          const lk = [l.rssMaxBytes ?? -Infinity, l.processAgeMs ?? -Infinity, l.rssAvgBytes ?? -Infinity];
+          for (let i = 0; i < key.length; i++) {
+            if (key[i] !== lk[i]) {
+              better = key[i] > lk[i];
+              break;
+            }
+          }
+        }
+        if (better) acc.latest = { rssAvgBytes: rssAvg, rssMaxBytes: rssMax, processAgeMs: ageMs, windowEndedAt: endedAt };
+      }
+    },
+    snapshot() {
+      const byRuntime = {};
+      for (const [name, a] of runtimes) {
+        byRuntime[name] = {
+          windowsSeen: a.windowsSeen,
+          samples: a.samples,
+          rssMinBytes: a.rssMin,
+          rssAvgBytes: a.weightedSamples > 0 ? Math.round(a.weightedSum / a.weightedSamples) : null,
+          rssMaxBytes: a.rssMax,
+          heapUsedMaxBytes: a.heapMax,
+          peak: a.peak === null ? null : { ...a.peak },
+          latest: a.latest === null ? null : { ...a.latest },
+        };
+      }
+      return { windowsSeen, lastWindowAt, byRuntime };
     },
   };
 }
@@ -1069,6 +1196,13 @@ export function lastAcceptedInstant(events) {
  *   featureUsage: { windowsSeen: number, lastWindowAt: number | null,
  *                   features: Record<string, { count: number, windowsSeen: number }>,
  *                   distinctCount: number },
+ *   processMemory: { windowsSeen: number, lastWindowAt: number | null,
+ *                    byRuntime: Record<'main' | 'renderer' | 'server', {
+ *                      windowsSeen: number, samples: number,
+ *                      rssMinBytes: number | null, rssAvgBytes: number | null,
+ *                      rssMaxBytes: number | null, heapUsedMaxBytes: number | null,
+ *                      peak: { rssMaxBytes: number, processAgeMs: number | null, windowEndedAt: number | null } | null,
+ *                      latest: { rssAvgBytes: number | null, rssMaxBytes: number | null, processAgeMs: number | null, windowEndedAt: number } | null }> },
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
@@ -1124,6 +1258,7 @@ export function summarize(events) {
   const workspaceNamesAcc = _createWorkspaceNamesAccumulator();
   // Feature-usage aggregate (WARDEN-1488): per-capability count + windowsSeen.
   const featureUsageAcc = _createFeatureUsageAccumulator();
+  const processMemoryAcc = _createProcessMemoryAccumulator();
   // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
   // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
   // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
@@ -1275,6 +1410,9 @@ export function summarize(events) {
     if (type === 'feature-usage') {
       featureUsageAcc.fold(event); // skip-robust; the event still counts in windowsSeen
     }
+    if (type === 'process-memory') {
+      processMemoryAcc.fold(event); // skip-robust; the event still counts in windowsSeen
+    }
     // Failure signature (WARDEN-707): rank DISTINCT failures across ALL base
     // types in one list. `signatureOf` is skip-robust (returns null for an
     // unknown type or a type-specific field gap) — null yields no bucket, never
@@ -1396,6 +1534,7 @@ export function summarize(events) {
     workspaceShape,
     workspaceNames,
     featureUsage: featureUsageAcc.snapshot(),
+    processMemory: processMemoryAcc.snapshot(),
     firstSeen,
     lastSeen,
   };

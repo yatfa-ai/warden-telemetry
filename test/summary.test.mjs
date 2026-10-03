@@ -2333,3 +2333,138 @@ test('featureUsage treats hostile keys as ordinary own keys', () => {
   const s = summarize([featureWindow([{ name: 'constructor', count: 1 }, { name: 'toString', count: 2 }])]);
   assert.deepEqual(s.featureUsage.features, { constructor: { count: 1, windowsSeen: 1 }, toString: { count: 2, windowsSeen: 1 } });
 });
+
+// ── PROCESS MEMORY (WARDEN-1514) ──────────────────────────────────────────────
+
+const memWindow = (overrides = {}) => ({
+  schemaVersion: 10,
+  type: 'process-memory',
+  runtime: 'main',
+  timestamp: 1000,
+  windowStartedAt: 900,
+  windowEndedAt: 1000,
+  samples: 10,
+  rssMinBytes: 100,
+  rssAvgBytes: 150,
+  rssMaxBytes: 200,
+  processAgeMs: 5000,
+  ...overrides,
+});
+
+const ZEROED_RUNTIME = {
+  windowsSeen: 0, samples: 0, rssMinBytes: null, rssAvgBytes: null, rssMaxBytes: null,
+  heapUsedMaxBytes: null, peak: null, latest: null,
+};
+
+test('processMemory is a stable zeroed shape: silence is null, never fabricated zero', () => {
+  const s = summarize([validError, validCrash, validStall, validServerStall]);
+  assert.deepEqual(s.processMemory, {
+    windowsSeen: 0,
+    lastWindowAt: null,
+    byRuntime: { main: ZEROED_RUNTIME, renderer: ZEROED_RUNTIME, server: ZEROED_RUNTIME },
+  });
+  assert.deepEqual(Object.keys(summarize([]).processMemory.byRuntime), ['main', 'renderer', 'server']);
+});
+
+test('processMemory folds min/max/samples across windows and runtimes; unreported runtimes stay null', () => {
+  const s = summarize([
+    memWindow({ rssMinBytes: 120, rssMaxBytes: 300, samples: 4, windowEndedAt: 1000 }),
+    memWindow({ rssMinBytes: 90, rssMaxBytes: 250, samples: 6, windowEndedAt: 2000 }),
+    memWindow({ runtime: 'renderer', rssMinBytes: 500, rssAvgBytes: 600, rssMaxBytes: 700, samples: 3, windowEndedAt: 1500 }),
+  ]);
+  const pm = s.processMemory;
+  assert.equal(pm.windowsSeen, 3);
+  assert.equal(pm.lastWindowAt, 2000);
+  assert.equal(pm.byRuntime.main.windowsSeen, 2);
+  assert.equal(pm.byRuntime.main.samples, 10);
+  assert.equal(pm.byRuntime.main.rssMinBytes, 90);
+  assert.equal(pm.byRuntime.main.rssMaxBytes, 300);
+  assert.equal(pm.byRuntime.renderer.windowsSeen, 1);
+  assert.equal(pm.byRuntime.renderer.rssMinBytes, 500);
+  assert.deepEqual(pm.byRuntime.server, ZEROED_RUNTIME);
+  assert.equal(s.byType['process-memory'], 3);
+});
+
+test('processMemory rssAvgBytes is SAMPLE-WEIGHTED, not a mean of means', () => {
+  const s = summarize([
+    memWindow({ rssAvgBytes: 100, samples: 1, windowEndedAt: 1000 }),
+    memWindow({ rssAvgBytes: 400, samples: 9, windowEndedAt: 2000 }),
+  ]);
+  // weighted = (100*1 + 400*9)/10 = 370; mean of means would be 250.
+  assert.equal(s.processMemory.byRuntime.main.rssAvgBytes, 370);
+  // integer-rounded: (100*1 + 101*2)/3 = 100.67 → 101
+  const r = summarize([memWindow({ rssAvgBytes: 100, samples: 1 }), memWindow({ rssAvgBytes: 101, samples: 2, windowEndedAt: 2000 })]);
+  assert.equal(r.processMemory.byRuntime.main.rssAvgBytes, 101);
+});
+
+test('processMemory heapUsedMaxBytes is max where present, null where no window carried one', () => {
+  const none = summarize([memWindow(), memWindow({ windowEndedAt: 2000 })]);
+  assert.equal(none.processMemory.byRuntime.main.heapUsedMaxBytes, null);
+  const some = summarize([
+    memWindow({ heapUsedMaxBytes: 50 }),
+    memWindow({ windowEndedAt: 2000 }),
+    memWindow({ windowEndedAt: 3000, heapUsedMaxBytes: 80 }),
+    memWindow({ runtime: 'server', windowEndedAt: 3000 }),
+  ]);
+  assert.equal(some.processMemory.byRuntime.main.heapUsedMaxBytes, 80);
+  assert.equal(some.processMemory.byRuntime.server.heapUsedMaxBytes, null);
+});
+
+test('processMemory peak and latest diverge; peak carries THAT window\'s processAgeMs', () => {
+  const s = summarize([
+    memWindow({ rssMaxBytes: 900, rssAvgBytes: 800, processAgeMs: 1234, windowEndedAt: 1000 }),
+    memWindow({ rssMaxBytes: 300, rssAvgBytes: 250, processAgeMs: 99999, windowEndedAt: 2000 }),
+  ]);
+  const m = s.processMemory.byRuntime.main;
+  assert.deepEqual(m.peak, { rssMaxBytes: 900, processAgeMs: 1234, windowEndedAt: 1000 });
+  assert.deepEqual(m.latest, { rssAvgBytes: 250, rssMaxBytes: 300, processAgeMs: 99999, windowEndedAt: 2000 });
+});
+
+test('processMemory latest follows windowEndedAt (producer clock), not arrival order; ties are order-independent', () => {
+  const newer = memWindow({ windowEndedAt: 5000, rssMaxBytes: 111, rssAvgBytes: 100, processAgeMs: 7 });
+  const older = memWindow({ windowEndedAt: 1000, rssMaxBytes: 222, rssAvgBytes: 200, processAgeMs: 3 });
+  const a = summarize([newer, older]).processMemory.byRuntime.main;
+  const b = summarize([older, newer]).processMemory.byRuntime.main;
+  assert.deepEqual(a, b);
+  assert.equal(a.latest.windowEndedAt, 5000);
+  assert.equal(a.latest.rssMaxBytes, 111);
+  assert.equal(a.peak.rssMaxBytes, 222);
+
+  const t1 = memWindow({ windowEndedAt: 5000, rssMaxBytes: 300, processAgeMs: 10 });
+  const t2 = memWindow({ windowEndedAt: 5000, rssMaxBytes: 300, processAgeMs: 20 });
+  assert.deepEqual(summarize([t1, t2]).processMemory.byRuntime.main, summarize([t2, t1]).processMemory.byRuntime.main);
+});
+
+test('processMemory is skip-robust: bad numbers, missing/unknown runtime never throw or poison a sum', () => {
+  const s = summarize([
+    memWindow({ rssMinBytes: 'x', rssAvgBytes: NaN, rssMaxBytes: Infinity, samples: 'many', processAgeMs: null, windowEndedAt: 1000 }),
+    memWindow({ runtime: 'toString' }),
+    memWindow({ runtime: undefined }),
+    memWindow({ runtime: 42 }),
+    memWindow({ windowEndedAt: 'soon', rssAvgBytes: 100, samples: 2, rssMinBytes: 10, rssMaxBytes: 20 }),
+  ]);
+  const pm = s.processMemory;
+  assert.equal(pm.windowsSeen, 5, 'every event counts, parity with byType');
+  assert.equal(s.byType['process-memory'], 5);
+  const m = pm.byRuntime.main;
+  assert.equal(m.windowsSeen, 2);
+  assert.equal(m.samples, 2);
+  assert.equal(m.rssMinBytes, 10);
+  assert.equal(m.rssMaxBytes, 20);
+  assert.equal(m.rssAvgBytes, 100);
+  assert.equal(Number.isNaN(m.rssAvgBytes), false);
+  assert.deepEqual(m.peak, { rssMaxBytes: 20, processAgeMs: 5000, windowEndedAt: null });
+  assert.equal(m.latest.windowEndedAt, 1000);
+  assert.equal(JSON.stringify(pm).includes('NaN'), false);
+  assert.deepEqual(Object.keys(pm.byRuntime), ['main', 'renderer', 'server'], 'no foreign runtime key leaked');
+  assert.doesNotThrow(() => summarize([{ type: 'process-memory' }]));
+  assert.equal(summarize([{ type: 'process-memory' }]).processMemory.windowsSeen, 1);
+});
+
+test('processMemory positive control: values appear only on the new key, pre-existing keys unchanged', () => {
+  const s = summarize([memWindow({ rssMaxBytes: 987654321 })]);
+  const { processMemory, ...preChange } = s;
+  assert.equal(JSON.stringify(preChange).includes('987654321'), false, 'absent from every pre-existing key');
+  assert.equal(JSON.stringify(s).includes('987654321'), true, 'present once processMemory exists');
+  assert.equal(processMemory.byRuntime.main.rssMaxBytes, 987654321);
+});
