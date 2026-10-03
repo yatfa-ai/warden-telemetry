@@ -7,6 +7,7 @@
 //                                  / platforms / crashReasons / stalls / operations
 //                                  / operationLatency / workspaceShape
 //                                  / workspaceNames / featureUsage / processMemory
+//                                  / operationRejections
 //                                  / firstSeen / lastSeen).
 //   - `lastAcceptedInstant(events)` → the newest effective instant across the batch
 //                                  (WARDEN-1428) — i.e. WHEN the newest ACCEPTED
@@ -562,6 +563,78 @@ function _createProcessMemoryAccumulator() {
         };
       }
       return { windowsSeen, lastWindowAt, byRuntime };
+    },
+  };
+}
+
+// ── OPERATION REJECTIONS aggregate (WARDEN-1519) ──────────────────────────────
+// The `operational-metrics` event carries a required `rejected` integer
+// (schema.ts): observations the PRODUCER refused as invalid / out-of-range — in
+// NEITHER the window's `count` NOR its histogram. `summarize()` used to discard it
+// ("producer landed, read surface lagging"). `operationRejections` projects it per
+// runtime.
+//
+// WHY IT MATTERS: the renderer pane-latency producer only folds an echo that
+// arrives within 10 s (PENDING_INPUT_MAX_AGE_MS); an older pending input is counted
+// as `rejected` and never reaches `count` or the histogram, so `operationLatency`
+// is RIGHT-CENSORED at 10 s. `rejected` is the only place a >10 s wait is visible.
+//
+// WHAT `rejected` MEANS / DOES NOT MEAN (load-bearing — do not erode):
+//  - It counts observations a producer refused as out-of-range or invalid. For the
+//    renderer pane producer the dominant cause is an echo older than the 10 s
+//    correlation window, which is EITHER a >10 s freeze OR a lost echo (pane died,
+//    WS dropped). The counter CANNOT tell them apart and it is NOT an error count.
+//  - SILENCE ≠ ZERO. A runtime with `windowsSeen: 0` reports `rejectedTotal: null`
+//    and `lastRejectedAt: null`; a runtime that reported windows with none refused
+//    reports a MEASURED `rejectedTotal: 0`.
+//  - Skip-robust: `rejected` must be a finite non-negative integer to fold; a
+//    malformed value never throws and never poisons a sum, but the window still
+//    counts in `windowsSeen`.
+//  - `lastRejectedAt` is the greatest producer-clock `windowEndedAt` among windows
+//    with rejected > 0 (never arrival time); not a liveness signal.
+//  - Closed runtime key set (main | renderer | server); an unknown runtime is
+//    skipped from `byRuntime` but still counted in the top-level `windowsSeen`.
+export const OPERATION_REJECTIONS_RUNTIMES = Object.freeze(['main', 'renderer', 'server']);
+
+/**
+ * Create the operation-rejections accumulator (WARDEN-1519). See the block comment
+ * above for the contract.
+ *
+ * @returns {{ fold(event: object): void, snapshot(): object }}
+ * @private
+ */
+function _createOperationRejectionsAccumulator() {
+  let windowsSeen = 0;
+  const runtimes = new Map();
+  for (const r of OPERATION_REJECTIONS_RUNTIMES) {
+    runtimes.set(r, { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: 0, lastRejectedAt: null });
+  }
+  return {
+    fold(event) {
+      windowsSeen += 1; // the EVENT counts whatever its payload turns out to be
+      const acc = typeof event.runtime === 'string' ? runtimes.get(event.runtime) : undefined;
+      if (acc === undefined) return; // closed key set: unknown runtime is skipped
+      acc.windowsSeen += 1;
+      const rejected = event.rejected;
+      if (typeof rejected !== 'number' || !Number.isInteger(rejected) || rejected < 0) return; // malformed: skipped
+      acc.rejectedTotal += rejected;
+      if (rejected > 0) {
+        acc.windowsWithRejections += 1;
+        const endedAt = _finiteNumber(event.windowEndedAt);
+        if (endedAt !== null && (acc.lastRejectedAt === null || endedAt > acc.lastRejectedAt)) acc.lastRejectedAt = endedAt;
+      }
+    },
+    snapshot() {
+      const byRuntime = {};
+      for (const [name, a] of runtimes) {
+        byRuntime[name] = {
+          windowsSeen: a.windowsSeen,
+          windowsWithRejections: a.windowsWithRejections,
+          rejectedTotal: a.windowsSeen > 0 ? a.rejectedTotal : null, // silence is not zero
+          lastRejectedAt: a.lastRejectedAt,
+        };
+      }
+      return { windowsSeen, byRuntime };
     },
   };
 }
@@ -1203,6 +1276,10 @@ export function lastAcceptedInstant(events) {
  *                      rssMaxBytes: number | null, heapUsedMaxBytes: number | null,
  *                      peak: { rssMaxBytes: number, processAgeMs: number | null, windowEndedAt: number | null } | null,
  *                      latest: { rssAvgBytes: number | null, rssMaxBytes: number | null, processAgeMs: number | null, windowEndedAt: number } | null }> },
+ *   operationRejections: { windowsSeen: number,
+ *                          byRuntime: Record<'main' | 'renderer' | 'server', {
+ *                            windowsSeen: number, windowsWithRejections: number,
+ *                            rejectedTotal: number | null, lastRejectedAt: number | null }> },
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
@@ -1259,6 +1336,7 @@ export function summarize(events) {
   // Feature-usage aggregate (WARDEN-1488): per-capability count + windowsSeen.
   const featureUsageAcc = _createFeatureUsageAccumulator();
   const processMemoryAcc = _createProcessMemoryAccumulator();
+  const operationRejectionsAcc = _createOperationRejectionsAccumulator();
   // Stall-severity accumulators (WARDEN-854): the `lagMs` magnitude distribution of
   // performance-stall events, overall + per-source. `stallMin`/`stallMax` are null
   // until the first FINITE lagMs is seen (mirrors firstSeen/lastSeen's null-until-
@@ -1385,6 +1463,7 @@ export function summarize(events) {
     // are independent, exactly like a crash's reason and its byType count).
     if (type === 'operational-metrics') {
       _foldOperations(operations, operationsByName, latencyByName, boundaries);
+      operationRejectionsAcc.fold(event); // WARDEN-1519: skip-robust; the window still counts in windowsSeen
     }
     // Workspace aggregates (WARDEN-1473): fold this window's payload into the
     // shape / names accumulators. Skip-robust on exactly the `_foldOperations`
@@ -1535,6 +1614,7 @@ export function summarize(events) {
     workspaceNames,
     featureUsage: featureUsageAcc.snapshot(),
     processMemory: processMemoryAcc.snapshot(),
+    operationRejections: operationRejectionsAcc.snapshot(),
     firstSeen,
     lastSeen,
   };

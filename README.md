@@ -243,6 +243,14 @@ curl http://localhost:7421/summary
 #       "renderer": { "...": "same shape" },
 #       "server":   { "windowsSeen": 0, "samples": 0, "rssMinBytes": null, "rssAvgBytes": null, "rssMaxBytes": null, "heapUsedMaxBytes": null, "peak": null, "latest": null }
 #     }
+#   },
+#   "operationRejections": {                                                       # the per-runtime `rejected` axis of operational-metrics windows (WARDEN-1519): observations a producer REFUSED — in neither `count` nor the histogram. NOT an error count
+#     "windowsSeen": 4,                                                            # EVERY operational-metrics window (=== byType['operational-metrics']), even a malformed `rejected` or unknown runtime
+#     "byRuntime": {                                                               # stable key set: main | renderer | server
+#       "renderer": { "windowsSeen": 3, "windowsWithRejections": 2, "rejectedTotal": 3, "lastRejectedAt": 1720000000000 },  # lastRejectedAt = newest windowEndedAt (producer clock) among windows with rejected > 0
+#       "main":     { "windowsSeen": 1, "windowsWithRejections": 0, "rejectedTotal": 0, "lastRejectedAt": null },            # reported, none refused: a MEASURED zero
+#       "server":   { "windowsSeen": 0, "windowsWithRejections": 0, "rejectedTotal": null, "lastRejectedAt": null }          # never reported: silence is null, never zero
+#     }
 #   }
 # }
 ```
@@ -550,6 +558,25 @@ by the fold). It is **numbers only** — no string from the event is echoed exce
 `channel` verdict remains the liveness surface. Purely additive: a pure read over already-accepted events,
 scoped by `?type=` / `?platform=` / `?appVersion=` / `?since=` like every other key; no new collection, wire
 field, schema bump, or change to `/events`.
+
+`operationRejections` projects the `rejected` integer every `operational-metrics` window carries (WARDEN-1519).
+`rejected` counts observations the producer REFUSED as out-of-range or invalid; they land in neither the window's
+`count` nor its histogram, so `operationLatency` cannot see them. That is exactly why the axis exists: the renderer
+pane-latency producer only folds an echo that arrives within 10 s, and an older pending input is counted as
+`rejected`, so the latency distributions are right-censored at 10 s and `rejected` is the only place a longer
+wait is visible. **What `rejected` does NOT mean:** for the renderer pane producer the dominant cause is an echo
+older than the 10 s correlation window, which is EITHER a >10 s freeze OR a lost echo (the pane died, the
+WebSocket dropped). The counter cannot tell them apart, and it is **NOT an error count** — read it as "waits we
+could not measure", never as "failures". `byRuntime.<runtime>` (`main` / `renderer` / `server`) carries
+`windowsSeen`, `windowsWithRejections`, `rejectedTotal` (sum of `rejected` over windows where it is a finite
+non-negative integer) and `lastRejectedAt` (the greatest producer-clock `windowEndedAt` among windows with
+`rejected > 0`, otherwise null). **Silence is not zero**: a runtime that never reported has `windowsSeen: 0` with
+`rejectedTotal: null`, while a runtime that reported windows with nothing refused has a measured
+`rejectedTotal: 0`. A malformed `rejected` (a string, negative, fractional) never throws and never poisons a sum,
+but its window still counts in `windowsSeen`; a runtime outside the three is skipped from `byRuntime` yet still
+counted in the top-level `windowsSeen`. Purely additive: a pure read over already-accepted events, scoped by
+`?type=` / `?platform=` / `?appVersion=` / `?since=` like every other key; no schema bump, new collection,
+wire field, or change to `/events`.
 
 `workspaceNames` is the axis that makes **the identically-named-chats defect legible in one query**
 (WARDEN-1473) — the founding sentence of the workspace-signal direction: *"twenty-five chats and

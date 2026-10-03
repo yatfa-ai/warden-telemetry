@@ -2468,3 +2468,63 @@ test('processMemory positive control: values appear only on the new key, pre-exi
   assert.equal(JSON.stringify(s).includes('987654321'), true, 'present once processMemory exists');
   assert.equal(processMemory.byRuntime.main.rssMaxBytes, 987654321);
 });
+
+
+// ── OPERATION REJECTIONS (WARDEN-1519) ────────────────────────────────────────
+
+const rejWindow = (runtime, rejected, windowEndedAt) =>
+  metricsWindow([], { runtime, rejected, windowEndedAt, timestamp: windowEndedAt });
+
+test('operationRejections is a stable shape on an empty store: silence is null, never zero', () => {
+  const r = summarize([]).operationRejections;
+  assert.equal(r.windowsSeen, 0);
+  assert.deepEqual(Object.keys(r.byRuntime), ['main', 'renderer', 'server']);
+  for (const rt of ['main', 'renderer', 'server']) {
+    assert.deepEqual(r.byRuntime[rt], { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: null, lastRejectedAt: null });
+  }
+});
+
+test('operationRejections folds rejected per runtime; malformed counts as a window but never poisons the sum', () => {
+  const s = summarize([
+    rejWindow('renderer', 1, 100),
+    rejWindow('renderer', 2, 300), // latest rejected window
+    rejWindow('renderer', 0, 500), // later window, nothing refused → must NOT move lastRejectedAt
+    rejWindow('renderer', '3', 600), // malformed (string)
+    rejWindow('main', 0, 200),
+  ]);
+  const r = s.operationRejections;
+  assert.equal(r.windowsSeen, 5);
+  assert.deepEqual(r.byRuntime.renderer, { windowsSeen: 4, windowsWithRejections: 2, rejectedTotal: 3, lastRejectedAt: 300 });
+  assert.deepEqual(r.byRuntime.main, { windowsSeen: 1, windowsWithRejections: 0, rejectedTotal: 0, lastRejectedAt: null }, 'measured zero');
+  assert.deepEqual(r.byRuntime.server, { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: null, lastRejectedAt: null }, 'silence');
+});
+
+test('operationRejections skip-robust: negative / fractional / NaN / missing rejected and unknown runtime never throw', () => {
+  const evs = [
+    rejWindow('renderer', -1, 10),
+    rejWindow('renderer', 1.5, 20),
+    rejWindow('renderer', NaN, 30),
+    rejWindow('renderer', undefined, 40),
+    rejWindow('renderer', 4, 50),
+    rejWindow('bogus', 9, 60), // unknown runtime: top-level only
+  ];
+  const r = summarize(evs).operationRejections;
+  assert.equal(r.windowsSeen, 6);
+  assert.deepEqual(r.byRuntime.renderer, { windowsSeen: 5, windowsWithRejections: 1, rejectedTotal: 4, lastRejectedAt: 50 });
+  assert.deepEqual(Object.keys(r.byRuntime), ['main', 'renderer', 'server']);
+});
+
+test('operationRejections lastRejectedAt follows windowEndedAt (producer clock), not arrival order', () => {
+  const a = rejWindow('renderer', 1, 900);
+  const b = rejWindow('renderer', 1, 100);
+  assert.equal(summarize([a, b]).operationRejections.byRuntime.renderer.lastRejectedAt, 900);
+  assert.equal(summarize([b, a]).operationRejections.byRuntime.renderer.lastRejectedAt, 900);
+});
+
+test('operationRejections reads only operational-metrics windows; existing keys are unaffected', () => {
+  const s = summarize([validError, memWindow(), rejWindow('renderer', 2, 100)]);
+  assert.equal(s.operationRejections.windowsSeen, 1);
+  const { operationRejections, ...rest } = s;
+  assert.equal(rest.byType['operational-metrics'], 1);
+  assert.equal(rest.total, 3);
+});
