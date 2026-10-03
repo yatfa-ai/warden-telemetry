@@ -228,6 +228,21 @@ curl http://localhost:7421/summary
 #       "chat-create":   { "count": 96,   "windowsSeen": 71 }
 #     },
 #     "distinctCount": 2                                                           # keys in `features` (the `__overflow__` bucket, when present, counts as one)
+#   },
+#   "processMemory": {                                                             # the per-runtime memory axis the process-memory COUNT hides (WARDEN-1514): how big does each process get, and how old was it at its peak?
+#     "windowsSeen": 288,                                                          # EVERY process-memory window (=== byType['process-memory']) — NOT a liveness signal
+#     "lastWindowAt": 1720000000000,                                               # newest windowEndedAt (producer clock) — NOT liveness
+#     "byRuntime": {                                                               # stable key set: main | renderer | server; a runtime that never reported is all-null (silence, not low memory)
+#       "main": {
+#         "windowsSeen": 144, "samples": 8640,                                     # windows / total samples folded
+#         "rssMinBytes": 98000000, "rssAvgBytes": 152000000, "rssMaxBytes": 410000000,  # min of mins / SAMPLE-WEIGHTED mean / max of maxes
+#         "heapUsedMaxBytes": 61000000,                                            # max where a window carried one, else null
+#         "peak":   { "rssMaxBytes": 410000000, "processAgeMs": 86400000, "windowEndedAt": 1719990000000 },  # the window with the largest rssMax + THAT window's process age
+#         "latest": { "rssAvgBytes": 150000000, "rssMaxBytes": 160000000, "processAgeMs": 90000000, "windowEndedAt": 1720000000000 }  # the newest window by producer clock
+#       },
+#       "renderer": { "...": "same shape" },
+#       "server":   { "windowsSeen": 0, "samples": 0, "rssMinBytes": null, "rssAvgBytes": null, "rssMaxBytes": null, "heapUsedMaxBytes": null, "peak": null, "latest": null }
+#     }
 #   }
 # }
 ```
@@ -516,6 +531,25 @@ down", and `lastWindowAt` is the time of the newest window that reported usage, 
 `channel` liveness verdict remains the liveness surface. Purely additive: a pure read over already-accepted
 events, scoped by `?type=` / `?platform=` / `?appVersion=` / `?since=` like every other key; no new collection,
 wire field, schema bump, or change to `/events`.
+
+`processMemory` is the per-runtime memory axis the `process-memory` event's `byType` integer hides (WARDEN-1514).
+Schema v10 made the operational-metrics category carry a `process-memory` window per runtime
+(`main` / `renderer` / `server`) — RSS min/avg/max, an optional peak heap and the process's age at window close —
+and `byType` reduced a day of them to one integer. `processMemory.byRuntime.<runtime>` folds every retained
+window: `rssMinBytes` is the min of the window mins, `rssMaxBytes` the max of the window maxes, `rssAvgBytes` the
+SAMPLE-WEIGHTED mean (`sum(avg × samples) / sum(samples)`, integer-rounded — not a mean of means) and
+`heapUsedMaxBytes` the max where a window carried one (null otherwise). `peak` is the window with the largest
+`rssMaxBytes` together with THAT window's `processAgeMs` (a small age beside a high peak reads "high right after
+a restart"), and `latest` is the window with the greatest `windowEndedAt` on the PRODUCER's clock (not arrival
+order). The runtime key set is stable: a runtime that never reported reads `windowsSeen: 0` with null
+min/avg/max/heap/`peak`/`latest` — silence is distinguishable from low memory, never a fabricated zero. Top-level
+`windowsSeen` is EVERY process-memory event (it equals `byType['process-memory']`, even when a window's fields
+were unusable — a non-number field is skipped, never poisoning a sum, and a runtime outside the three is skipped
+by the fold). It is **numbers only** — no string from the event is echoed except the closed runtime key — and
+**NOT a liveness signal**: `lastWindowAt` is the newest window's producer-clock close, never a heartbeat; the
+`channel` verdict remains the liveness surface. Purely additive: a pure read over already-accepted events,
+scoped by `?type=` / `?platform=` / `?appVersion=` / `?since=` like every other key; no new collection, wire
+field, schema bump, or change to `/events`.
 
 `workspaceNames` is the axis that makes **the identically-named-chats defect legible in one query**
 (WARDEN-1473) — the founding sentence of the workspace-signal direction: *"twenty-five chats and

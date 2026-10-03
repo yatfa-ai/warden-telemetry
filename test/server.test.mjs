@@ -5023,3 +5023,48 @@ test('WINDOW: the accepted set is ONE definition — DEFAULT_SCHEMA carries the 
   assert.deepEqual(nums, [...nums].sort((a, b) => a - b), 'the window is stored ascending');
   assert.ok(nums.every((n) => Number.isInteger(n)), 'every window member is an integer version');
 });
+
+// WARDEN-1514 — the process-memory aggregate, end-to-end through the real handler.
+const processMemoryEvent = {
+  schemaVersion: SCHEMA_VERSION,
+  type: 'process-memory',
+  runtime: 'main',
+  timestamp: 30,
+  windowStartedAt: 20,
+  windowEndedAt: 30,
+  samples: 4,
+  rssMinBytes: 100,
+  rssAvgBytes: 200,
+  rssMaxBytes: 400,
+  heapUsedMaxBytes: 50,
+  processAgeMs: 60000,
+};
+
+test('GET /summary serves processMemory and ?type= scopes it (WARDEN-1514)', async () => {
+  const store = readableStore([errorEvent, processMemoryEvent, { ...processMemoryEvent, timestamp: 40, windowEndedAt: 40, rssMaxBytes: 300, processAgeMs: 70000 }]);
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.byType['process-memory'], 2, 'the count axis is unchanged');
+  assert.equal(body.processMemory.windowsSeen, 2);
+  assert.equal(body.processMemory.lastWindowAt, 40);
+  const main = body.processMemory.byRuntime.main;
+  assert.equal(main.rssMaxBytes, 400);
+  assert.deepEqual(main.peak, { rssMaxBytes: 400, processAgeMs: 60000, windowEndedAt: 30 });
+  assert.equal(main.latest.processAgeMs, 70000);
+  assert.equal(body.processMemory.byRuntime.server.windowsSeen, 0);
+  assert.equal(body.processMemory.byRuntime.server.rssMaxBytes, null);
+
+  const scoped = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?type=process-memory' }), scoped);
+  assert.equal(JSON.parse(scoped.body).processMemory.windowsSeen, 2);
+
+  const other = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/summary?type=error' }), other);
+  const otherPm = JSON.parse(other.body).processMemory;
+  assert.equal(otherPm.windowsSeen, 0);
+  assert.equal(otherPm.lastWindowAt, null);
+  assert.equal(otherPm.byRuntime.main.rssMaxBytes, null);
+});
