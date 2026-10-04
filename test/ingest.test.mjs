@@ -590,7 +590,7 @@ test('a dedup HIT stamps NOTHING — the 202 {accepted:0,deduped:true} path pers
   assert.deepEqual(store.appended[0], { ...validError, receivedAt: RECEIVED_AT }, 'only the first call stamped; the dedup HIT stamped nothing');
 });
 
-// ── SCHEMA VERSION WINDOW (WARDEN-1445, rolled to [8,9,10] in WARDEN-1508) ────
+// ── SCHEMA VERSION WINDOW (WARDEN-1445, rolled to [9,10,11] in WARDEN-1528) ────
 // The receiver accepts a BOUNDED window of prior schema versions — each PROVEN
 // a pure subset of the current schema (the diff removes only the SCHEMA_VERSION
 // literal and widens the type unions) — so an additive producer bump stops
@@ -602,7 +602,7 @@ test('a dedup HIT stamps NOTHING — the 202 {accepted:0,deduped:true} path pers
 // current-version path is byte-identical to the pre-window behavior.
 //
 // THE WINDOW ROLLS, IT DOES NOT GROW: each bump keeps exactly THREE proven-
-// additive versions. v10 joined in WARDEN-1508, so v7 (the oldest of [7,8,9])
+// additive versions. v11 joined in WARDEN-1528, so v8 (the oldest of [8,9,10])
 // aged out — still additive, simply drift again, exactly as pre-window.
 
 // v9-shaped fixture — the production rows the installed v9 build emits
@@ -635,6 +635,37 @@ const v8WorkspaceShape = {
   peakChats: 9,
 };
 
+// v10-shaped fixtures (WARDEN-1528): process-memory (the type v10 added) and an
+// operational-metrics window in the UNSPLIT v10 shape — `rejected` only, no
+// `rejectedStale` / `rejectedInvalid`.
+const v10ProcessMemory = {
+  schemaVersion: 10,
+  type: 'process-memory',
+  runtime: 'server',
+  timestamp: 10,
+  windowStartedAt: 1,
+  windowEndedAt: 10,
+  samples: 10,
+  rssMinBytes: 100_000_000,
+  rssAvgBytes: 110_000_000,
+  rssMaxBytes: 130_000_000,
+  heapUsedMaxBytes: 40_000_000,
+  processAgeMs: 600_000,
+};
+const v10UnsplitMetrics = {
+  schemaVersion: 10,
+  type: 'operational-metrics',
+  runtime: 'renderer',
+  timestamp: 10,
+  windowStartedAt: 1,
+  windowEndedAt: 10,
+  boundaries: [25, 50, 75, 100, 150, 200, 300, 500, 800, 1200, 2000, 5000],
+  operations: [
+    { operation: 'pane-echo-e2e', count: 3, okCount: 3, failCount: 0, min: 20, avg: 40, max: 90, buckets: [1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+  ],
+  rejected: 4,
+};
+
 // The WINDOWED deps: the same shape production threads via `{...schema}` —
 // SCHEMA_VERSION + validateEvent + the window. Every window test below passes
 // this explicitly; a deps() caller without it keeps the strict pre-window
@@ -645,22 +676,22 @@ const v9BodyOf = (events) => JSON.stringify({ schemaVersion: 9, events });
 const v8Headers = { 'x-telemetry-schema': '8' };
 const v8BodyOf = (events) => JSON.stringify({ schemaVersion: 8, events });
 
-test('accepts a v8-declared batch → 202, and persists the ORIGINAL events (own v8 stamp intact)', async () => {
+test('accepts a v9-declared batch (the oldest window version) → 202, and persists the ORIGINAL events (own v9 stamp intact)', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: v8Headers, body: v8BodyOf([v8WorkspaceShape, { ...validMetrics, schemaVersion: 8 }, { ...validServerStall, schemaVersion: 8 }]) },
+    { headers: v9Headers, body: v9BodyOf([v9FeatureUsage, { ...validMetrics, schemaVersion: 9 }, { ...validServerStall, schemaVersion: 9 }]) },
     windowedDeps(store)
   );
   assert.equal(res.ok, true, `a proven-additive prior version is accepted (got ${res.status}: ${JSON.stringify(res.body)})`);
   assert.equal(res.status, 202);
   assert.equal(res.body.accepted, 3);
-  // Persisted AS SENT — each event keeps its OWN schemaVersion 8, so the /summary
+  // Persisted AS SENT — each event keeps its OWN schemaVersion 9, so the /summary
   // schemaVersions histogram stays truthful about what the fleet emits.
-  assert.deepEqual(store.appended[0], { ...v8WorkspaceShape, receivedAt: RECEIVED_AT });
-  assert.equal(store.appended.every((e) => e.schemaVersion === 8), true, 'no event is rewritten to the current version on disk');
+  assert.deepEqual(store.appended[0], { ...v9FeatureUsage, receivedAt: RECEIVED_AT });
+  assert.equal(store.appended.every((e) => e.schemaVersion === 9), true, 'no event is rewritten to the current version on disk');
 });
 
-test('accepts a v9-declared batch carrying the v9-added feature-usage type (the window is per-version, not v8-only)', async () => {
+test('accepts a v9-declared batch carrying the v9-added feature-usage type (the window is per-version, not oldest-only)', async () => {
   const store = memoryStore();
   const res = await ingest({ headers: v9Headers, body: v9BodyOf([v9FeatureUsage]) }, windowedDeps(store));
   assert.equal(res.ok, true, `v9 is inside the window (got ${res.status}: ${JSON.stringify(res.body)})`);
@@ -710,10 +741,10 @@ test('a v10 batch with an INVALID process-memory event → 422 and NOTHING persi
   }
 });
 
-test('a v8-declared batch with ONE malformed event → 422 and NOTHING is persisted (atomicity holds under normalization)', async () => {
+test('a v9-declared batch with ONE malformed event → 422 and NOTHING is persisted (atomicity holds under normalization)', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: v8Headers, body: v8BodyOf([{ ...validMetrics, schemaVersion: 8 }, { ...v8WorkspaceShape, workspaces: 'two' }]) },
+    { headers: v9Headers, body: v9BodyOf([{ ...validMetrics, schemaVersion: 9 }, { ...v9FeatureUsage, features: 'two' }]) },
     windowedDeps(store)
   );
   assert.equal(res.ok, false);
@@ -721,44 +752,44 @@ test('a v8-declared batch with ONE malformed event → 422 and NOTHING is persis
   assert.equal(store.appended.length, 0, 'nothing persisted');
 });
 
-test('a v8-declared batch with a NON-OBJECT event (null) → 422 (the own-version check cannot throw)', async () => {
+test('a v9-declared batch with a NON-OBJECT event (null) → 422 (the own-version check cannot throw)', async () => {
   const store = memoryStore();
   const res = await ingest(
-    { headers: v8Headers, body: v8BodyOf([{ ...validMetrics, schemaVersion: 8 }, null]) },
+    { headers: v9Headers, body: v9BodyOf([{ ...validMetrics, schemaVersion: 9 }, null]) },
     windowedDeps(store)
   );
   assert.equal(res.status, 422);
   assert.equal(store.appended.length, 0);
 });
 
-test('a v8-declared batch carrying an event stamped with a DIFFERENT schemaVersion (9) → 422, whole batch', async () => {
+test('a v9-declared batch carrying an event stamped with a DIFFERENT schemaVersion (10) → 422, whole batch', async () => {
   // The substitution that powers normalization would otherwise paper over exactly
-  // this mismatch: validateEvent({ ...event, schemaVersion: 9 }) would make a
-  // 9-stamped event pass inside an 8-declared batch. The explicit own-version
+  // this mismatch: validateEvent({ ...event, schemaVersion: 10 }) would make a
+  // 10-stamped event pass inside a 9-declared batch. The explicit own-version
   // check is what holds the line.
   const store = memoryStore();
-  const smuggled = { ...validError, schemaVersion: 9 }; // valid TODAY, wrong for a v8 batch
+  const smuggled = { ...validError, schemaVersion: 10 }; // valid TODAY, wrong for a v9 batch
   const res = await ingest(
-    { headers: v8Headers, body: v8BodyOf([{ ...validMetrics, schemaVersion: 8 }, smuggled]) },
+    { headers: v9Headers, body: v9BodyOf([{ ...validMetrics, schemaVersion: 9 }, smuggled]) },
     windowedDeps(store)
   );
-  assert.equal(res.status, 422, 'a 9-stamped event inside an 8-declared batch is a 422, not a silent accept');
+  assert.equal(res.status, 422, 'a 10-stamped event inside a 9-declared batch is a 422, not a silent accept');
   assert.equal(store.appended.length, 0, 'nothing persisted');
 });
 
-test('a v8-declared batch whose events carry NO schemaVersion → 422 (undefined ≠ declared 8)', async () => {
+test('a v9-declared batch whose events carry NO schemaVersion → 422 (undefined ≠ declared 9)', async () => {
   const unstamped = { type: 'error', runtime: 'main', timestamp: 1, name: 'E', message: 'm', frames: [] };
   const store = memoryStore();
-  const res = await ingest({ headers: v8Headers, body: v8BodyOf([unstamped]) }, windowedDeps(store));
+  const res = await ingest({ headers: v9Headers, body: v9BodyOf([unstamped]) }, windowedDeps(store));
   assert.equal(res.status, 422);
   assert.equal(store.appended.length, 0);
 });
 
-test('a declared version OUTSIDE the window still 415s (7 below — aged out, SCHEMA_VERSION+1 above)', async () => {
+test('a declared version OUTSIDE the window still 415s (8 below — aged out, SCHEMA_VERSION+1 above)', async () => {
   const storeA = memoryStore();
-  const below = await ingest({ headers: { 'x-telemetry-schema': '7' }, body: '}{ not json' }, windowedDeps(storeA));
-  assert.equal(below.status, 415, 'v7 aged OUT of the bounded window when v10 landed (still additive — the window rolls, it does not grow)');
-  assert.equal(below.body.declaredVersion, '7');
+  const below = await ingest({ headers: { 'x-telemetry-schema': '8' }, body: '}{ not json' }, windowedDeps(storeA));
+  assert.equal(below.status, 415, 'v8 aged OUT of the bounded window when v11 landed (still additive — the window rolls, it does not grow)');
+  assert.equal(below.body.declaredVersion, '8');
   assert.equal(storeA.appended.length, 0);
 
   const storeB = memoryStore();
@@ -769,16 +800,16 @@ test('a declared version OUTSIDE the window still 415s (7 below — aged out, SC
 
 test('the 415 reason text names the accepted set (the window), not a single expected version', async () => {
   const store = memoryStore();
-  const res = await ingest({ headers: { 'x-telemetry-schema': '7' }, body: '}{ not json' }, windowedDeps(store));
-  assert.match(res.body.error, /expected one of \["8","9","10"\]/, `reason names the ascending window (got: ${res.body.error})`);
-  assert.match(res.body.error, /got "7"/);
+  const res = await ingest({ headers: { 'x-telemetry-schema': '8' }, body: '}{ not json' }, windowedDeps(store));
+  assert.match(res.body.error, /expected one of \["9","10","11"\]/, `reason names the ascending window (got: ${res.body.error})`);
+  assert.match(res.body.error, /got "8"/);
 });
 
-test('window header matching stays EXACT-STRING: a numeric 10, "010", " 8", or "" never matches a window version', async () => {
+test('window header matching stays EXACT-STRING: a numeric 11, "011", " 9", or "" never matches a window version', async () => {
   // Mirrors the pre-window handshake discipline: req.headers values are strings on
   // the real wire, and the Set comparison keeps that strictness (no Number()
   // coercion anywhere in the accept path).
-  for (const [label, header] of [['numeric 10', 10], ['zero-padded "010"', '010'], ['whitespace " 8"', ' 8'], ['empty string', '']]) {
+  for (const [label, header] of [['numeric 11', 11], ['zero-padded "011"', '011'], ['whitespace " 9"', ' 9'], ['empty string', '']]) {
     const store = memoryStore();
     const res = await ingest({ headers: { 'x-telemetry-schema': header }, body: '}{ not json' }, windowedDeps(store));
     assert.equal(res.status, 415, `${label} is not an accepted declared version`);
@@ -788,9 +819,9 @@ test('window header matching stays EXACT-STRING: a numeric 10, "010", " 8", or "
 
 test('an ABSENT window dep keeps the strict pre-window handshake (byte-identical behavior for existing callers)', async () => {
   const store = memoryStore();
-  const res = await ingest({ headers: v8Headers, body: v8BodyOf([{ ...validMetrics, schemaVersion: 8 }]) }, deps(store));
-  assert.equal(res.status, 415, 'no window threaded → v8 (a prior version) is still drift, exactly as before WARDEN-1445');
-  assert.match(res.body.error, /expected one of \["10"\]/, 'the accepted set collapses to the current version');
+  const res = await ingest({ headers: v9Headers, body: v9BodyOf([{ ...validMetrics, schemaVersion: 9 }]) }, deps(store));
+  assert.equal(res.status, 415, 'no window threaded → v9 (a prior version) is still drift, exactly as before WARDEN-1445');
+  assert.match(res.body.error, /expected one of \["11"\]/, 'the accepted set collapses to the current version');
   assert.equal(store.appended.length, 0);
 });
 
@@ -803,15 +834,18 @@ test('an ABSENT window dep keeps the strict pre-window handshake (byte-identical
 // constant without a fixture also fails here — the window cannot grow silently.
 
 const WINDOW_FIXTURES = {
-  // v8 — the type v8 itself added (workspace-shape).
-  8: [v8WorkspaceShape],
   // v9 — the type v9 itself added (feature-usage).
   9: [v9FeatureUsage],
+  // v10 — the type v10 itself added (process-memory) AND the unsplit
+  // operational-metrics window every v9/v10 build emits: it carries NO
+  // `rejectedStale` / `rejectedInvalid`, so it is the mechanical proof that the
+  // v11 additive-OPTIONAL fields strand nothing (WARDEN-1528).
+  10: [v10ProcessMemory, v10UnsplitMetrics],
 };
 
 test('WINDOW GUARD: every prior version in COMPATIBLE_SCHEMA_VERSIONS has a fixture that validates under normalization', async () => {
   const priors = COMPATIBLE_SCHEMA_VERSIONS.filter((v) => v !== SCHEMA_VERSION);
-  assert.ok(priors.length >= 1, 'the window actually contains prior versions (a degenerate [10]-only window would silently unfix WARDEN-1445)');
+  assert.ok(priors.length >= 1, 'the window actually contains prior versions (a degenerate [11]-only window would silently unfix WARDEN-1445)');
   for (const version of priors) {
     const fixtures = WINDOW_FIXTURES[version];
     assert.ok(Array.isArray(fixtures) && fixtures.length > 0, `no committed fixture for prior version ${version} — add one (shaped like that version's production rows) or REMOVE ${version} from COMPATIBLE_SCHEMA_VERSIONS`);
@@ -836,9 +870,9 @@ test('WINDOW GUARD: every prior version in COMPATIBLE_SCHEMA_VERSIONS has a fixt
 });
 
 test('acceptedSchemaVersionStrings: ascending, always includes the current version, dedupes, and degrades to current-only', () => {
-  assert.deepEqual(acceptedSchemaVersionStrings(COMPATIBLE_SCHEMA_VERSIONS, SCHEMA_VERSION), ['8', '9', '10']);
-  assert.deepEqual(acceptedSchemaVersionStrings([10, 8, 9, 10], SCHEMA_VERSION), ['8', '9', '10'], 'unsorted + duplicated input normalizes');
-  assert.deepEqual(acceptedSchemaVersionStrings([8, 9], SCHEMA_VERSION), ['8', '9', '10'], 'the current version is ALWAYS accepted, even if the window omits it');
-  assert.deepEqual(acceptedSchemaVersionStrings(undefined, SCHEMA_VERSION), ['10'], 'absent window → current-only (the strict pre-window shape)');
-  assert.deepEqual(acceptedSchemaVersionStrings('not-an-array', SCHEMA_VERSION), ['10'], 'a non-array window degrades to current-only, never throws');
+  assert.deepEqual(acceptedSchemaVersionStrings(COMPATIBLE_SCHEMA_VERSIONS, SCHEMA_VERSION), ['9', '10', '11']);
+  assert.deepEqual(acceptedSchemaVersionStrings([11, 9, 10, 11], SCHEMA_VERSION), ['9', '10', '11'], 'unsorted + duplicated input normalizes');
+  assert.deepEqual(acceptedSchemaVersionStrings([9, 10], SCHEMA_VERSION), ['9', '10', '11'], 'the current version is ALWAYS accepted, even if the window omits it');
+  assert.deepEqual(acceptedSchemaVersionStrings(undefined, SCHEMA_VERSION), ['11'], 'absent window → current-only (the strict pre-window shape)');
+  assert.deepEqual(acceptedSchemaVersionStrings('not-an-array', SCHEMA_VERSION), ['11'], 'a non-array window degrades to current-only, never throws');
 });

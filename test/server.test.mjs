@@ -4802,27 +4802,23 @@ const v6ServerStall = {
     { culprit: 'fs-read-file-sync', count: 1, totalOverlapMs: 5800 },
   ],
 };
-// v8 added workspace-shape — the v8-only type, included so the window's accept
-// path is proven on the newest prior version's own shape.
-const v8WorkspaceShape = {
-  schemaVersion: 8,
-  type: 'workspace-shape',
+// v9 added feature-usage — the v9-only type, included so the window's accept
+// path is proven on the OLDEST in-window version's own shape (WARDEN-1528 rolled
+// the window to [9,10,11]).
+const v9FeatureUsage = {
+  schemaVersion: 9,
+  type: 'feature-usage',
   runtime: 'renderer',
   timestamp: 8,
   windowStartedAt: 1,
   windowEndedAt: 8,
-  workspaces: 2,
-  panesOpen: 5,
-  panesActive: 3,
-  chats: 7,
-  peakPanesOpen: 6,
-  peakChats: 9,
+  features: [{ name: 'global-search', count: 3 }, { name: 'settings', count: 1 }],
 };
-// The window batch: real-production-shaped rows STAMPED v8 (the newest prior
-// version), carried by the v8-added type + the two types every build emits.
-const v8BatchBody = JSON.stringify({
-  schemaVersion: 8,
-  events: [v8WorkspaceShape, { ...v6Metrics, schemaVersion: 8 }, { ...v6Stall, schemaVersion: 8 }],
+// The window batch: real-production-shaped rows STAMPED v9 (the oldest in-window
+// version), carried by the v9-added type + the two types every build emits.
+const v9BatchBody = JSON.stringify({
+  schemaVersion: 9,
+  events: [v9FeatureUsage, { ...v6Metrics, schemaVersion: 9 }, { ...v6Stall, schemaVersion: 9 }],
 });
 
 // The WINDOWED wiring: the schema bundle carries the receiver-local window (the
@@ -4862,30 +4858,30 @@ function erroringReq({ method = 'POST', url = '/ingest', headers = {} } = {}) {
   return req;
 }
 
-test('WINDOW: a v8-declared batch of real-production-shaped rows → 202, and /summary shows them under schemaVersions["8"] with liveness GREEN (WARDEN-1445 criterion 1, window rolled in WARDEN-1479)', async () => {
+test('WINDOW: a v9-declared batch of real-production-shaped rows → 202, and /summary shows them under schemaVersions["9"] with liveness GREEN (WARDEN-1445 criterion 1, window rolled in WARDEN-1528)', async () => {
   // THIS TEST FAILS ON PRE-WINDOW ORIGIN/MAIN: the strict handshake 415s the
   // batch at the pre-read seam, so the 202 assertion is the first thing to break —
   // that flip (415 → 202) is the window's whole point.
   const { handler } = windowedWiring();
   const post = fakeRes();
-  await handler(fakeReq({ headers: { 'x-telemetry-schema': '8' }, body: v8BatchBody }), post);
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '9' }, body: v9BatchBody }), post);
   assert.equal(post.statusCode, 202, `a proven-additive prior version is accepted through the FULL handler (got ${post.statusCode}: ${post.body})`);
   assert.deepEqual(JSON.parse(post.body), { accepted: 3 });
 
-  // The persisted rows keep their OWN v8 stamp (persist-as-sent), and /summary's
+  // The persisted rows keep their OWN v9 stamp (persist-as-sent), and /summary's
   // histogram reads them back under "8" — truthful about what the fleet emits.
   const res = fakeRes();
   await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
-  assert.equal(body.schemaVersions['8'], 3, 'the histogram buckets under the DECLARED (v8) stamp, not the receiver version');
+  assert.equal(body.schemaVersions['9'], 3, 'the histogram buckets under the DECLARED (v9) stamp, not the receiver version');
   assert.equal(body.schemaVersions[String(SCHEMA_VERSION)], undefined, 'nothing was rewritten to the current version');
   assert.equal(Number.isFinite(body.lastSeen), true, 'lastSeen advanced — the accepted batch is the newest instant');
   assert.equal(body.liveness.acceptedSinceBoot, true, 'THE SUCCESS-PATH CHANNEL IS GREEN: acceptedSinceBoot flips true');
   assert.deepEqual(body.liveness.mismatchedDeclaredVersions, [], 'a window version is no longer a declared-version disagreement');
 });
 
-test('WINDOW: declared 6 / 10 / abc / MISSING still 415 at the PRE-READ seam (poisoned-stream probe) and still tally their drift (criterion 2; 6 aged out when the window rolled past it, now [8,9,10])', async () => {
+test('WINDOW: declared 6 / 12 / abc / MISSING still 415 at the PRE-READ seam (poisoned-stream probe) and still tally their drift (criterion 2; 6 aged out when the window rolled past it, now [9,10,11])', async () => {
   const { handler, rejections } = windowedWiring();
 
   // The control: the CURRENT version on a poisoned stream passes the seam and
@@ -4900,7 +4896,7 @@ test('WINDOW: declared 6 / 10 / abc / MISSING still 415 at the PRE-READ seam (po
     const res = fakeRes();
     await handler(erroringReq({ headers: { 'x-telemetry-schema': declared } }), res);
     assert.equal(res.statusCode, 415, `declared ${JSON.stringify(declared)} is 415'd at the PRE-READ seam (a post-seam poisoned stream would be 400)`);
-    assert.match(JSON.parse(res.body).error, /expected one of \["8","9","10"\]/, 'the reason names the accepted set');
+    assert.match(JSON.parse(res.body).error, /expected one of \["9","10","11"\]/, 'the reason names the accepted set');
     // PIN the no-drift claim: the seam's 415 error text must equal the canonical
     // check's, because both sites call the ONE imported reason builder
     // unsupportedSchemaVersionReason. Compares the `error` TEXT, not the whole
@@ -4938,25 +4934,25 @@ test('WINDOW: declared 6 / 10 / abc / MISSING still 415 at the PRE-READ seam (po
   assert.deepEqual(rej.byDeclaredVersion, { '6': 1, [String(SCHEMA_VERSION + 1)]: 1, abc: 1 }, 'each declared version buckets on the drift axis');
 });
 
-test('WINDOW: a v8-declared batch with one malformed event → 422 through the handler, nothing persisted (criterion 3)', async () => {
+test('WINDOW: a v9-declared batch with one malformed event → 422 through the handler, nothing persisted (criterion 3)', async () => {
   const { handler } = windowedWiring();
   const res = fakeRes();
-  const bad = JSON.stringify({ schemaVersion: 8, events: [{ ...v6Metrics, schemaVersion: 8 }, { ...v8WorkspaceShape, panesOpen: -1 }] });
-  await handler(fakeReq({ headers: { 'x-telemetry-schema': '8' }, body: bad }), res);
+  const bad = JSON.stringify({ schemaVersion: 9, events: [{ ...v6Metrics, schemaVersion: 9 }, { ...v9FeatureUsage, features: 'bad' }] });
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '9' }, body: bad }), res);
   assert.equal(res.statusCode, 422);
   const summary = fakeRes();
   await handler(fakeReq({ method: 'GET', url: '/summary' }), summary);
   assert.equal(JSON.parse(summary.body).total, 0, 'nothing persisted');
 });
 
-test('WINDOW: a v8-declared batch carrying a 9-stamped event → 422 through the handler (criterion 4)', async () => {
+test('WINDOW: a v9-declared batch carrying a 10-stamped event → 422 through the handler (criterion 4)', async () => {
   const { handler } = windowedWiring();
   const res = fakeRes();
   const smuggled = JSON.stringify({
-    schemaVersion: 8,
-    events: [{ ...v6Metrics, schemaVersion: 8 }, { ...validError, schemaVersion: SCHEMA_VERSION }], // valid TODAY, wrong inside a v8 batch
+    schemaVersion: 9,
+    events: [{ ...v6Metrics, schemaVersion: 9 }, { ...validError, schemaVersion: SCHEMA_VERSION }], // valid TODAY, wrong inside a v9 batch
   });
-  await handler(fakeReq({ headers: { 'x-telemetry-schema': '8' }, body: smuggled }), res);
+  await handler(fakeReq({ headers: { 'x-telemetry-schema': '9' }, body: smuggled }), res);
   assert.equal(res.statusCode, 422, 'normalization must not paper over a version-stamp mismatch');
 });
 
@@ -4966,7 +4962,7 @@ test('WINDOW: GET /capabilities advertises acceptedSchemaVersions ascending besi
   await handler(fakeReq({ method: 'GET', url: '/capabilities' }), res);
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
-  assert.deepEqual(body.acceptedSchemaVersions, [8, 9, 10], 'the full accepted window, ascending NUMBERS (rolled in WARDEN-1508)');
+  assert.deepEqual(body.acceptedSchemaVersions, [9, 10, 11], 'the full accepted window, ascending NUMBERS (rolled in WARDEN-1528)');
   assert.equal(body.schemaVersion, SCHEMA_VERSION, 'schemaVersion is unchanged — the client Test-connection check is untouched');
   assert.equal(body.authRequired, false, 'authRequired is unchanged');
 });
@@ -4989,7 +4985,7 @@ test('WINDOW: liveness.mismatchedDeclaredVersions does NOT exclude window versio
   // version. The rejection tally is in-memory per boot, so while a version is
   // IN the window it can never be 415'd again — but if a '6' bucket DOES exist
   // (a tally from before the window deploy, or — since WARDEN-1508 rolled the
-  // window to [8,9,10] — a live v6 build drift again), it is genuine history a
+  // window to [9,10,11] — a live v6 build drift again), it is genuine history a
   // maintainer should still see. The window must not silently rewrite the drift
   // story, so the filter is unchanged and this test holds it in place.
   const rejections = createRejectionTally({ now: () => 0 });
@@ -5005,7 +5001,7 @@ test('WINDOW: liveness.mismatchedDeclaredVersions does NOT exclude window versio
   await handler(fakeReq({ method: 'GET', url: '/summary' }), res);
   const { mismatchedDeclaredVersions } = JSON.parse(res.body).liveness;
   // The composer's sort() is LEXICOGRAPHIC (pre-existing, deterministic): with
-  // v10 current, SCHEMA_VERSION+1 is '11', which sorts BEFORE '6' as strings —
+  // v11 current, SCHEMA_VERSION+1 is '12', which sorts BEFORE '6' as strings —
   // the order is the composer's contract, and this pin holds it, not a
   // numeric reading of the versions.
   assert.deepEqual(mismatchedDeclaredVersions, [String(SCHEMA_VERSION + 1), '6'], 'window versions are NOT filtered from the drift list — only the own version is');
@@ -5094,7 +5090,7 @@ test('GET /summary serves operationRejections and ?appVersion= scopes it (WARDEN
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
   assert.equal(body.operationRejections.windowsSeen, 3);
-  assert.deepEqual(body.operationRejections.byRuntime.renderer, { windowsSeen: 2, windowsWithRejections: 2, rejectedTotal: 5, lastRejectedAt: 70 });
+  assert.deepEqual(body.operationRejections.byRuntime.renderer, { windowsSeen: 2, windowsWithRejections: 2, rejectedTotal: 5, rejectedStaleTotal: null, rejectedInvalidTotal: null, lastRejectedAt: 70 });
   assert.equal(body.operationRejections.byRuntime.main.rejectedTotal, 0);
   assert.equal(body.operationRejections.byRuntime.server.rejectedTotal, null);
 
@@ -5102,6 +5098,6 @@ test('GET /summary serves operationRejections and ?appVersion= scopes it (WARDEN
   await handler(fakeReq({ method: 'GET', url: '/summary?appVersion=0.1.19' }), scoped);
   const sr = JSON.parse(scoped.body).operationRejections;
   assert.equal(sr.windowsSeen, 1);
-  assert.deepEqual(sr.byRuntime.renderer, { windowsSeen: 1, windowsWithRejections: 1, rejectedTotal: 3, lastRejectedAt: 50 });
+  assert.deepEqual(sr.byRuntime.renderer, { windowsSeen: 1, windowsWithRejections: 1, rejectedTotal: 3, rejectedStaleTotal: null, rejectedInvalidTotal: null, lastRejectedAt: 50 });
   assert.equal(sr.byRuntime.main.rejectedTotal, null, 'scoped out → silence, not zero');
 });

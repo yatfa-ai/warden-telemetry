@@ -584,6 +584,16 @@ function _createProcessMemoryAccumulator() {
 //    renderer pane producer the dominant cause is an echo older than the 10 s
 //    correlation window, which is EITHER a >10 s freeze OR a lost echo (pane died,
 //    WS dropped). The counter CANNOT tell them apart and it is NOT an error count.
+//  - THE SPLIT (WARDEN-1528, schema v11): a window MAY also carry `rejectedStale`
+//    (echo older than the 10 s window — the right-censored unusable-tail count,
+//    NOT a failure) and `rejectedInvalid` (malformed input — a caller-contract
+//    violation, expected ~zero); `rejected` is their sum. `rejectedStaleTotal` /
+//    `rejectedInvalidTotal` sum each field over the windows that CARRY it and are
+//    `null` until one does (a v9/v10 window predates the split — its refusals are
+//    UNCLASSIFIED, never zero). While a runtime mixes pre-split and split windows
+//    the two split totals sum to LESS than `rejectedTotal`: the gap is the
+//    unclassified pre-split refusals, not a leak. Each field folds independently
+//    and skip-robustly (a malformed value is skipped, never poisons a sum).
 //  - SILENCE ≠ ZERO. A runtime with `windowsSeen: 0` reports `rejectedTotal: null`
 //    and `lastRejectedAt: null`; a runtime that reported windows with none refused
 //    reports a MEASURED `rejectedTotal: 0`.
@@ -607,7 +617,7 @@ function _createOperationRejectionsAccumulator() {
   let windowsSeen = 0;
   const runtimes = new Map();
   for (const r of OPERATION_REJECTIONS_RUNTIMES) {
-    runtimes.set(r, { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: 0, lastRejectedAt: null });
+    runtimes.set(r, { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: 0, rejectedStaleTotal: null, rejectedInvalidTotal: null, lastRejectedAt: null });
   }
   return {
     fold(event) {
@@ -615,6 +625,12 @@ function _createOperationRejectionsAccumulator() {
       const acc = typeof event.runtime === 'string' ? runtimes.get(event.runtime) : undefined;
       if (acc === undefined) return; // closed key set: unknown runtime is skipped
       acc.windowsSeen += 1;
+      // WARDEN-1528 — the optional split folds BEFORE the `rejected` guard and
+      // independently of it: each field is its own skip-robust fact.
+      const stale = event.rejectedStale;
+      if (typeof stale === 'number' && Number.isInteger(stale) && stale >= 0) acc.rejectedStaleTotal = (acc.rejectedStaleTotal ?? 0) + stale;
+      const invalid = event.rejectedInvalid;
+      if (typeof invalid === 'number' && Number.isInteger(invalid) && invalid >= 0) acc.rejectedInvalidTotal = (acc.rejectedInvalidTotal ?? 0) + invalid;
       const rejected = event.rejected;
       if (typeof rejected !== 'number' || !Number.isInteger(rejected) || rejected < 0) return; // malformed: skipped
       acc.rejectedTotal += rejected;
@@ -631,6 +647,8 @@ function _createOperationRejectionsAccumulator() {
           windowsSeen: a.windowsSeen,
           windowsWithRejections: a.windowsWithRejections,
           rejectedTotal: a.windowsSeen > 0 ? a.rejectedTotal : null, // silence is not zero
+          rejectedStaleTotal: a.rejectedStaleTotal, // null until a v11+ window carries the split
+          rejectedInvalidTotal: a.rejectedInvalidTotal,
           lastRejectedAt: a.lastRejectedAt,
         };
       }
@@ -1279,7 +1297,9 @@ export function lastAcceptedInstant(events) {
  *   operationRejections: { windowsSeen: number,
  *                          byRuntime: Record<'main' | 'renderer' | 'server', {
  *                            windowsSeen: number, windowsWithRejections: number,
- *                            rejectedTotal: number | null, lastRejectedAt: number | null }> },
+ *                            rejectedTotal: number | null,
+ *                            rejectedStaleTotal: number | null, rejectedInvalidTotal: number | null,
+ *                            lastRejectedAt: number | null }> },
  *   firstSeen: number | null,
  *   lastSeen: number | null,
  * }}
