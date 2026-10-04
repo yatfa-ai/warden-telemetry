@@ -67,7 +67,8 @@ function reject(status, error, extra) {
 // a pure subset of the current schema: the diff from that version's vendored
 // schema.ts to the current one removes ONLY the `SCHEMA_VERSION` literal and
 // WIDENS `BASE_EVENT_TYPES` / the `BaseEvent` union — never a field, a shape
-// validator, or a boundary. A v8/v9 event is therefore a valid v10 event in
+// validator, or a boundary. (v11 adds the second additive diff class: a new
+// OPTIONAL field validated only WHEN PRESENT — see the 10 entry below.) A v9/v10 event is therefore a valid v10 event in
 // everything but its own `schemaVersion` stamp, so the receiver can validate it
 // by NORMALIZATION (see step 3) without relaxing a single shape check.
 //
@@ -83,13 +84,28 @@ function reject(status, error, extra) {
 //       shape (removed exactly `export const SCHEMA_VERSION = 9;`, the
 //       eight-entry BASE_EVENT_TYPES line, and the eight-member BaseEvent
 //       union; `process-memory` and its validator are pure addition).
-//   10 — the current schema itself (WARDEN-1508 vendored v10).
+//   10 — the v10→v11 diff, verified on the WARDEN-1528 change. A DIFFERENT
+//       additive class from the 3-line type-widening shape above: no type was
+//       added, so BASE_EVENT_TYPES / the BaseEvent union are untouched and the
+//       diff removes only the `export const SCHEMA_VERSION = 10;` literal (and
+//       the `OperationalMetricsEvent` interface gains two `?`-optional
+//       members). The validator gains checks for `rejectedStale` /
+//       `rejectedInvalid` that fire ONLY `!== undefined`, so an event that
+//       omits them — every v9/v10 operational-metrics event — runs the
+//       unmodified current validator exactly as before. Provable mechanically:
+//       the committed v9/v10 fixtures in test/ingest.test.mjs (WINDOW GUARD)
+//       validate unmodified. THE LOAD-BEARING CONSTRAINT: such a field must be
+//       OPTIONAL. A REQUIRED new field on an existing type would make the
+//       normalization step 422 every prior-version event (the validator is
+//       the current one, with only the stamp swapped) — stranding the build
+//       the window exists to keep alive.
+//   11 — the current schema itself (WARDEN-1528 vendored v11).
 //
-// v7 left the window in WARDEN-1508: the window stays BOUNDED at three
-// versions as it rolls forward (v6 left when v9 landed, v7 leaves when v10
-// lands) — never a monotonic growth. v7 remains additive (nothing a v7
-// build emits is invalid under v10); it simply ages out of the bounded window,
-// and a v7 build is drift again, exactly as pre-window.
+// v8 left the window in WARDEN-1528: the window stays BOUNDED at three
+// versions as it rolls forward (v6 left when v9 landed, v7 when v10 landed,
+// v8 leaves when v11 lands) — never a monotonic growth. v8 remains additive
+// (nothing a v8 build emits is invalid under v11); it simply ages out of the
+// bounded window, and a v8 build is drift again, exactly as pre-window.
 //
 // RECEIVER-LOCAL BY CONSTRUCTION — deliberately NOT in schema.ts: that file is
 // vendored verbatim from the client and pinned byte-identical by
@@ -100,7 +116,7 @@ function reject(status, error, extra) {
 // the new version, then extend this array (and a non-additive bump has to
 // consciously REMOVE the versions it no longer covers — the window-guard test
 // in test/ingest.test.mjs makes that shrink a deliberate act).
-export const COMPATIBLE_SCHEMA_VERSIONS = [8, 9, 10];
+export const COMPATIBLE_SCHEMA_VERSIONS = [9, 10, 11];
 
 /**
  * The accepted `x-telemetry-schema` header values as an ASCENDING string array:

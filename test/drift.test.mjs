@@ -35,7 +35,7 @@ import {
 // warden/web/src/lib/telemetry/schema.ts. If you re-vendor schema.ts after a
 // client schema bump, update THESE pinned assertions in the same change.
 const PINNED = {
-  SCHEMA_VERSION: 10,
+  SCHEMA_VERSION: 11,
   BASE_EVENT_TYPES: ['error', 'crash', 'performance-stall', 'operational-metrics', 'server-stall', 'workspace-names', 'workspace-shape', 'feature-usage', 'process-memory'],
   // v6 (WARDEN-1278) added SERVER — warden's backend is a FORKED CHILD of the
   // Electron main process, a third real OS process the wire could not name, so

@@ -2566,7 +2566,7 @@ test('operationRejections is a stable shape on an empty store: silence is null, 
   assert.equal(r.windowsSeen, 0);
   assert.deepEqual(Object.keys(r.byRuntime), ['main', 'renderer', 'server']);
   for (const rt of ['main', 'renderer', 'server']) {
-    assert.deepEqual(r.byRuntime[rt], { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: null, lastRejectedAt: null });
+    assert.deepEqual(r.byRuntime[rt], { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: null, rejectedStaleTotal: null, rejectedInvalidTotal: null, lastRejectedAt: null });
   }
 });
 
@@ -2580,9 +2580,9 @@ test('operationRejections folds rejected per runtime; malformed counts as a wind
   ]);
   const r = s.operationRejections;
   assert.equal(r.windowsSeen, 5);
-  assert.deepEqual(r.byRuntime.renderer, { windowsSeen: 4, windowsWithRejections: 2, rejectedTotal: 3, lastRejectedAt: 300 });
-  assert.deepEqual(r.byRuntime.main, { windowsSeen: 1, windowsWithRejections: 0, rejectedTotal: 0, lastRejectedAt: null }, 'measured zero');
-  assert.deepEqual(r.byRuntime.server, { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: null, lastRejectedAt: null }, 'silence');
+  assert.deepEqual(r.byRuntime.renderer, { windowsSeen: 4, windowsWithRejections: 2, rejectedTotal: 3, rejectedStaleTotal: null, rejectedInvalidTotal: null, lastRejectedAt: 300 });
+  assert.deepEqual(r.byRuntime.main, { windowsSeen: 1, windowsWithRejections: 0, rejectedTotal: 0, rejectedStaleTotal: null, rejectedInvalidTotal: null, lastRejectedAt: null }, 'measured zero');
+  assert.deepEqual(r.byRuntime.server, { windowsSeen: 0, windowsWithRejections: 0, rejectedTotal: null, rejectedStaleTotal: null, rejectedInvalidTotal: null, lastRejectedAt: null }, 'silence');
 });
 
 test('operationRejections skip-robust: negative / fractional / NaN / missing rejected and unknown runtime never throw', () => {
@@ -2596,8 +2596,41 @@ test('operationRejections skip-robust: negative / fractional / NaN / missing rej
   ];
   const r = summarize(evs).operationRejections;
   assert.equal(r.windowsSeen, 6);
-  assert.deepEqual(r.byRuntime.renderer, { windowsSeen: 5, windowsWithRejections: 1, rejectedTotal: 4, lastRejectedAt: 50 });
+  assert.deepEqual(r.byRuntime.renderer, { windowsSeen: 5, windowsWithRejections: 1, rejectedTotal: 4, rejectedStaleTotal: null, rejectedInvalidTotal: null, lastRejectedAt: 50 });
   assert.deepEqual(Object.keys(r.byRuntime), ['main', 'renderer', 'server']);
+});
+
+// ── THE STALE/INVALID SPLIT (WARDEN-1528, schema v11) ─────────────────────────
+
+const splitWindow = (runtime, split, windowEndedAt) =>
+  metricsWindow([], { runtime, ...split, windowEndedAt, timestamp: windowEndedAt });
+
+test('operationRejections projects the v11 split: stale=5/invalid=2 → rejectedStaleTotal 5, rejectedInvalidTotal 2, rejectedTotal 7', () => {
+  const r = summarize([splitWindow('renderer', { rejected: 7, rejectedStale: 5, rejectedInvalid: 2 }, 100)]).operationRejections;
+  assert.deepEqual(r.byRuntime.renderer, { windowsSeen: 1, windowsWithRejections: 1, rejectedTotal: 7, rejectedStaleTotal: 5, rejectedInvalidTotal: 2, lastRejectedAt: 100 });
+});
+
+test('operationRejections: a v9/v10-era window (no split fields) projects NULL split totals, never zeros', () => {
+  const r = summarize([rejWindow('renderer', 4, 100)]).operationRejections;
+  assert.equal(r.byRuntime.renderer.rejectedTotal, 4);
+  assert.equal(r.byRuntime.renderer.rejectedStaleTotal, null, 'unclassified, not zero');
+  assert.equal(r.byRuntime.renderer.rejectedInvalidTotal, null, 'unclassified, not zero');
+  // A split window that MEASURED zero is a real zero, distinct from the null above.
+  const z = summarize([splitWindow('main', { rejected: 0, rejectedStale: 0, rejectedInvalid: 0 }, 50)]).operationRejections;
+  assert.equal(z.byRuntime.main.rejectedStaleTotal, 0);
+  assert.equal(z.byRuntime.main.rejectedInvalidTotal, 0);
+});
+
+test('operationRejections: mixed pre-split + split windows sum the split only over windows that carry it; malformed split values are skipped', () => {
+  const r = summarize([
+    rejWindow('renderer', 4, 100), // pre-split
+    splitWindow('renderer', { rejected: 7, rejectedStale: 5, rejectedInvalid: 2 }, 200),
+    splitWindow('renderer', { rejected: 1, rejectedStale: -1, rejectedInvalid: '1' }, 300), // malformed split
+    splitWindow('renderer', { rejected: 2, rejectedStale: 1.5, rejectedInvalid: 2 }, 400),
+  ]).operationRejections.byRuntime.renderer;
+  assert.equal(r.rejectedTotal, 14);
+  assert.equal(r.rejectedStaleTotal, 5);
+  assert.equal(r.rejectedInvalidTotal, 4);
 });
 
 test('operationRejections lastRejectedAt follows windowEndedAt (producer clock), not arrival order', () => {

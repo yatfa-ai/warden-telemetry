@@ -247,9 +247,9 @@ curl http://localhost:7421/summary
 #   "operationRejections": {                                                       # the per-runtime `rejected` axis of operational-metrics windows (WARDEN-1519): observations a producer REFUSED — in neither `count` nor the histogram. NOT an error count
 #     "windowsSeen": 4,                                                            # EVERY operational-metrics window (=== byType['operational-metrics']), even a malformed `rejected` or unknown runtime
 #     "byRuntime": {                                                               # stable key set: main | renderer | server
-#       "renderer": { "windowsSeen": 3, "windowsWithRejections": 2, "rejectedTotal": 3, "lastRejectedAt": 1720000000000 },  # lastRejectedAt = newest windowEndedAt (producer clock) among windows with rejected > 0
-#       "main":     { "windowsSeen": 1, "windowsWithRejections": 0, "rejectedTotal": 0, "lastRejectedAt": null },            # reported, none refused: a MEASURED zero
-#       "server":   { "windowsSeen": 0, "windowsWithRejections": 0, "rejectedTotal": null, "lastRejectedAt": null }          # never reported: silence is null, never zero
+#       "renderer": { "windowsSeen": 3, "windowsWithRejections": 2, "rejectedTotal": 3, "rejectedStaleTotal": 2, "rejectedInvalidTotal": 1, "lastRejectedAt": 1720000000000 },  # rejectedStaleTotal / rejectedInvalidTotal (WARDEN-1528, schema v11): the split of rejectedTotal — stale = echo older than the 10 s window (the unusable tail), invalid = malformed input; null until a v11+ window carries them. # lastRejectedAt = newest windowEndedAt (producer clock) among windows with rejected > 0
+#       "main":     { "windowsSeen": 1, "windowsWithRejections": 0, "rejectedTotal": 0, "rejectedStaleTotal": null, "rejectedInvalidTotal": null, "lastRejectedAt": null },            # reported, none refused: a MEASURED zero
+#       "server":   { "windowsSeen": 0, "windowsWithRejections": 0, "rejectedTotal": null, "rejectedStaleTotal": null, "rejectedInvalidTotal": null, "lastRejectedAt": null }          # never reported: silence is null, never zero
 #     }
 #   }
 # }
@@ -574,8 +574,19 @@ non-negative integer) and `lastRejectedAt` (the greatest producer-clock `windowE
 `rejectedTotal: null`, while a runtime that reported windows with nothing refused has a measured
 `rejectedTotal: 0`. A malformed `rejected` (a string, negative, fractional) never throws and never poisons a sum,
 but its window still counts in `windowsSeen`; a runtime outside the three is skipped from `byRuntime` yet still
-counted in the top-level `windowsSeen`. Purely additive: a pure read over already-accepted events, scoped by
-`?type=` / `?platform=` / `?appVersion=` / `?since=` like every other key; no schema bump, new collection,
+counted in the top-level `windowsSeen`.
+
+**The split (WARDEN-1528, schema v11).** `rejected` conflated two very different things, so v11 windows
+additionally carry the OPTIONAL `rejectedStale` (an echo older than the 10 s correlation window — the
+right-censored *unusable tail*: "typed and saw nothing for over ten seconds"; a latency fact, not a failure) and
+`rejectedInvalid` (malformed input — a caller-contract violation, expected ~zero); `rejected` is their sum.
+`byRuntime.<runtime>.rejectedStaleTotal` / `rejectedInvalidTotal` sum each field over the windows that carry it
+and are **`null` until one does** (a v9/v10 window predates the split — its refusals are *unclassified*, never
+zero). While a runtime mixes pre-split and split windows the two split totals sum to less than `rejectedTotal`;
+the gap is the unclassified pre-split refusals. The `main` and `server` producers' refusals are all
+validation-class, so they report `rejectedStale: 0` and `rejectedInvalid === rejected`. A malformed split value
+is skipped independently and never poisons a sum. Purely additive: a pure read over already-accepted events, scoped by
+`?type=` / `?platform=` / `?appVersion=` / `?since=` like every other key; no new collection,
 wire field, or change to `/events`.
 
 `workspaceNames` is the axis that makes **the identically-named-chats defect legible in one query**
