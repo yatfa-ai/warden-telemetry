@@ -1102,6 +1102,22 @@ test('GET /summary liveness.lastRejectionAt survives the 24h window roll that em
   assert.deepEqual(body.liveness.mismatchedDeclaredVersions, ['6'], 'and the drift diagnosis rides beside it');
 });
 
+test('createRejectionTally buckets hostile declaredVersion keys ("__proto__" / "constructor") as ordinary own keys (WARDEN-1524)', () => {
+  const tally = createRejectionTally({ now: () => 0, maxDeclaredVersions: 3 });
+  for (let i = 0; i < 5; i += 1) tally.record({ status: 415, reason: 'x', declaredVersion: '__proto__' });
+  tally.record({ status: 415, reason: 'x', declaredVersion: 'constructor' });
+  tally.record({ status: 415, reason: 'x', declaredVersion: 'constructor' });
+  tally.record({ status: 415, reason: 'x', declaredVersion: '1' });
+  tally.record({ status: 415, reason: 'x', declaredVersion: '2' });
+  const snap = tally.snapshot();
+  assert.strictEqual(snap.byDeclaredVersion.__proto__, 5, '__proto__ buckets as an own key');
+  assert.strictEqual(snap.byDeclaredVersion.constructor, 2, 'constructor counts as a number');
+  // cap is 3 distinct: __proto__, constructor, '1' → '2' folds to overflow
+  assert.strictEqual(snap.byDeclaredVersion['1'], 1);
+  assert.strictEqual(snap.byDeclaredVersion.__overflow__, 1);
+  assert.equal(snap.total, 9);
+});
+
 test('GET /summary liveness.mismatchedDeclaredVersions excludes the receiver OWN version and the __overflow__ sentinel', async () => {
   // Two exclusions. The receiver's own version is by definition not a mismatch
   // (String()-compared, since histogram keys are strings and SCHEMA_VERSION is a
