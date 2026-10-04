@@ -1788,6 +1788,47 @@ test('stallsTimeline: the HEADLINE — two stores with byte-identical stalls.max
 // cardinality, with overflow REPRESENTED via the `__overflow__` sentinel (the
 // same shape as createRejectionTally's byDeclaredVersion, WARDEN-829).
 
+// ── NULL-PROTOTYPE HISTOGRAMS (WARDEN-1524) ───────────────────────────────────
+// The client-keyed plain-object histograms must treat hostile keys
+// ("__proto__" / "constructor" / "toString") as ORDINARY own keys, exactly like
+// the Map-backed featureUsage sibling. On a plain `{}` "__proto__" writes were
+// silent no-ops and "constructor" counts became inherited-function STRINGS.
+
+test('topErrorNames treats hostile error names as ordinary own keys with NUMERIC counts', () => {
+  const ev = (name, t) => ({ type: 'error', timestamp: t, name });
+  const s = summarize([
+    ev('TypeError', 1), ev('TypeError', 2), ev('TypeError', 3),
+    ev('constructor', 4), ev('constructor', 5),
+    ev('toString', 6),
+    ev('__proto__', 7), ev('__proto__', 8),
+  ]);
+  const byName = Object.fromEntries(s.topErrorNames.map((e) => [e.name, e.count]));
+  assert.equal(byName.TypeError, 3);
+  assert.strictEqual(byName.constructor, 2, 'constructor counts as a NUMBER, not an inherited-function string');
+  assert.strictEqual(byName.toString, 1);
+  assert.strictEqual(byName.__proto__, 2, '__proto__ events are bucketed, not silently dropped');
+  assert.ok(s.topErrorNames.every((e) => typeof e.count === 'number'));
+  assert.equal(s.topErrorNames.reduce((n, e) => n + e.count, 0), s.byType.error, 'histogram total equals the error count');
+});
+
+test('a "__proto__" client key buckets as an ordinary own key and does not trigger the overflow fold', () => {
+  const events = [];
+  for (let i = 0; i < CLIENT_HISTOGRAM_CAP + 2; i += 1) {
+    events.push({ type: 'error', timestamp: i + 1, name: 'E', platform: '__proto__' });
+  }
+  events.push({ type: 'error', timestamp: 100, name: 'E', platform: 'darwin' });
+  events.push({ type: 'crash', timestamp: 101, reason: 'constructor' });
+  events.push({ type: 'crash', timestamp: 102, reason: '__proto__' });
+  const s = summarize(events);
+  assert.strictEqual(s.platforms.__proto__, CLIENT_HISTOGRAM_CAP + 2, '__proto__ events are counted');
+  assert.strictEqual(s.platforms.darwin, 1, 'a legitimate key is not mis-folded');
+  assert.equal(Object.prototype.hasOwnProperty.call(s.platforms, '__overflow__'), false, 'no spurious overflow');
+  assert.strictEqual(s.crashReasons.constructor, 1, 'constructor reason counts as a number');
+  assert.strictEqual(s.crashReasons.__proto__, 1);
+  // The key survives JSON as an ordinary own key.
+  assert.equal(JSON.parse(JSON.stringify(s.platforms)).darwin, 1);
+});
+
 test('an oversized client key is truncated in every client-keyed histogram', () => {
   const huge = 'x'.repeat(CLIENT_KEY_MAX_LENGTH * 40); // far over the cap
   const s = summarize([

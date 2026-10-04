@@ -221,8 +221,12 @@ function _boundClientKey(key) {
  * `__overflow__` cardinality cap, the same shape as createRejectionTally's
  * `byDeclaredVersion` (server.mjs, WARDEN-829). `snapshot()` returns a plain
  * `{ [key]: count }` object holding ≤ `cap` + 1 keys no matter what any client
- * sent. hasOwnProperty (not `in`) keeps attacker keys like "toString" /
- * "constructor" bucketing as ordinary own keys.
+ * sent. `counts` is a NULL-PROTOTYPE object (WARDEN-1524): on a plain `{}` a
+ * client key like "__proto__" makes the write a silent no-op (the event vanishes
+ * and `distinct` is bumped past the cap, mis-folding later legitimate keys into
+ * `__overflow__`), and "constructor" / "toString" read back an inherited function
+ * so `+ 1` yields a STRING. With no prototype, every key is an ordinary own key.
+ * The hasOwnProperty guard stays (it is correct on a null-prototype object too).
  *
  * `cap` defaults to CLIENT_HISTOGRAM_CAP — the bound every free-text client
  * histogram here uses. It is a PARAMETER only because one axis legitimately
@@ -238,7 +242,7 @@ function _boundClientKey(key) {
  * @private
  */
 function _createBoundedClientHistogram(cap = CLIENT_HISTOGRAM_CAP) {
-  const counts = {};
+  const counts = Object.create(null);
   let distinct = 0;
   return {
     record(value) {
@@ -1292,7 +1296,7 @@ export function summarize(events) {
   const byType = {};
   for (const t of BASE_EVENT_TYPES) byType[t] = 0;
 
-  const errorNameCounts = {};
+  const errorNameCounts = Object.create(null);
   const schemaVersions = {};
   // Client-keyed histograms (WARDEN-1246): appVersions / platforms / byRuntime /
   // crashReasons are all keyed by FREE client-supplied strings, so they go

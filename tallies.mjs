@@ -227,7 +227,7 @@ export function createRejectionTally({
 } = {}) {
   let total = 0;
   const byStatus = {};
-  const byDeclaredVersion = {};
+  const byDeclaredVersion = Object.create(null);
   // Distinct declared-version buckets currently tracked as their OWN keys in
   // `byDeclaredVersion` (excludes the `__overflow__` sentinel). Maintained in
   // lockstep with record() so the cap check is O(1) — never recomputed by scan.
@@ -283,9 +283,13 @@ export function createRejectionTally({
       //  FIFO eviction, so an early legit version is never evicted by a later flood).
       //  Bucket any PRESENT value (incl. scanner non-numerics like "abc" / "");
       //  absent/missing (undefined/null) → no bucket. Only the 415 seams pass a
-      //  declaredVersion, so this naturally reflects drift alone. hasOwnProperty
-      //  (not `in`/bracket-truthiness) keeps attacker keys like "toString" /
-      //  "constructor" bucketing as ordinary own keys.
+      //  declaredVersion, so this naturally reflects drift alone. `byDeclaredVersion`
+      //  is a NULL-PROTOTYPE object (WARDEN-1524): on a plain `{}` a hostile header
+      //  like "__proto__" makes the write a silent no-op (and bumps the distinct
+      //  count past the cap, mis-folding legit versions into overflow) and
+      //  "constructor" / "toString" read back an inherited function so `+ 1` yields
+      //  a string. With no prototype every key is an ordinary own key; the
+      //  hasOwnProperty guard stays correct on it.
       if (declaredVersion !== undefined && declaredVersion !== null) {
         const dvKey = String(declaredVersion);
         if (Object.prototype.hasOwnProperty.call(byDeclaredVersion, dvKey)) {
