@@ -18,7 +18,7 @@ WORKDIR /app
 
 # No node_modules to copy — the app is zero-dep. Copy only what server.mjs loads.
 COPY package.json ./
-COPY server.mjs ingest.mjs store.mjs summary.mjs events.mjs schema.ts ./
+COPY server.mjs ingest.mjs store.mjs summary.mjs events.mjs tallies.mjs schema.ts ./
 
 # Telemetry events are persisted to a PVC mounted at /data (see deployment.yaml).
 # The path itself comes from the STORE env var; the dir just needs to be writable
