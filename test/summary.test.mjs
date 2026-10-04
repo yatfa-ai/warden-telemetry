@@ -2435,6 +2435,51 @@ test('processMemory latest follows windowEndedAt (producer clock), not arrival o
   assert.deepEqual(summarize([t1, t2]).processMemory.byRuntime.main, summarize([t2, t1]).processMemory.byRuntime.main);
 });
 
+// Each tie-break rung is pinned by WHICH window wins (and which values are
+// reported), in BOTH arrival orders. Order-independence alone would also be
+// satisfied by a wrong-but-deterministic ladder (WARDEN-1523).
+const bothOrders = (a, b) => [summarize([a, b]).processMemory.byRuntime.main, summarize([b, a]).processMemory.byRuntime.main];
+
+test('processMemory peak tie on rssMax: the LATER windowEndedAt wins and its processAgeMs is reported', () => {
+  // The earlier window carries the LARGER age so the age rung cannot mask the endedAt rung.
+  const early = memWindow({ rssMaxBytes: 500, windowEndedAt: 1000, processAgeMs: 9000 });
+  const late = memWindow({ rssMaxBytes: 500, windowEndedAt: 2000, processAgeMs: 100 });
+  for (const m of bothOrders(early, late)) {
+    assert.deepEqual(m.peak, { rssMaxBytes: 500, processAgeMs: 100, windowEndedAt: 2000 });
+  }
+});
+
+test('processMemory peak tie on rssMax and windowEndedAt: the LARGER processAgeMs wins', () => {
+  const young = memWindow({ rssMaxBytes: 500, windowEndedAt: 2000, processAgeMs: 10 });
+  const old = memWindow({ rssMaxBytes: 500, windowEndedAt: 2000, processAgeMs: 20 });
+  for (const m of bothOrders(young, old)) {
+    assert.deepEqual(m.peak, { rssMaxBytes: 500, processAgeMs: 20, windowEndedAt: 2000 });
+  }
+});
+
+test('processMemory latest tie on windowEndedAt: larger rssMax wins, then larger processAgeMs, then larger rssAvgBytes', () => {
+  // Rung 1: rssMax decides even though the loser is ahead on age and avg.
+  const bigMax = memWindow({ windowEndedAt: 5000, rssMaxBytes: 300, processAgeMs: 1, rssAvgBytes: 1 });
+  const smallMax = memWindow({ windowEndedAt: 5000, rssMaxBytes: 200, processAgeMs: 99, rssAvgBytes: 99 });
+  for (const m of bothOrders(bigMax, smallMax)) {
+    assert.deepEqual(m.latest, { rssAvgBytes: 1, rssMaxBytes: 300, processAgeMs: 1, windowEndedAt: 5000 });
+  }
+
+  // Rung 2: equal rssMax → processAgeMs decides even though the loser has the larger avg.
+  const olderProc = memWindow({ windowEndedAt: 5000, rssMaxBytes: 300, processAgeMs: 20, rssAvgBytes: 1 });
+  const youngerProc = memWindow({ windowEndedAt: 5000, rssMaxBytes: 300, processAgeMs: 10, rssAvgBytes: 99 });
+  for (const m of bothOrders(olderProc, youngerProc)) {
+    assert.deepEqual(m.latest, { rssAvgBytes: 1, rssMaxBytes: 300, processAgeMs: 20, windowEndedAt: 5000 });
+  }
+
+  // Rung 3: equal rssMax and processAgeMs → larger rssAvgBytes decides.
+  const highAvg = memWindow({ windowEndedAt: 5000, rssMaxBytes: 300, processAgeMs: 10, rssAvgBytes: 250 });
+  const lowAvg = memWindow({ windowEndedAt: 5000, rssMaxBytes: 300, processAgeMs: 10, rssAvgBytes: 150 });
+  for (const m of bothOrders(highAvg, lowAvg)) {
+    assert.deepEqual(m.latest, { rssAvgBytes: 250, rssMaxBytes: 300, processAgeMs: 10, windowEndedAt: 5000 });
+  }
+});
+
 test('processMemory is skip-robust: bad numbers, missing/unknown runtime never throw or poison a sum', () => {
   const s = summarize([
     memWindow({ rssMinBytes: 'x', rssAvgBytes: NaN, rssMaxBytes: Infinity, samples: 'many', processAgeMs: null, windowEndedAt: 1000 }),
