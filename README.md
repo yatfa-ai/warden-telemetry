@@ -219,6 +219,7 @@ curl http://localhost:7421/summary
 #     "maxChatCount": 25,                                                          # … against a TRUE catalog of 25 → distinctCount < maxChatCount IS the collision
 #     "lastChatCount": 25,                                                         # the most recent window's TRUE catalog size (by windowEndedAt, not array order)
 #     "truncatedEver": true,                                                       # at least one window's `chats` list was already capped by the producer
+#     "generatedShaped": { "distinctCount": 0, "considered": 5, "share": 0 },      # distinct names matching the retired generators' shapes (chat-xxxxxx / split-xxxxxxxx / shell-xxxxxx); share is null (never 0) when considered is 0
 #     "lastSnapshotAt": 1720000000000
 #   },
 #   "featureUsage": {                                                              # the per-capability axis the feature-usage COUNT hides (WARDEN-1488): which capabilities are adopted, and how heavily?
@@ -610,7 +611,7 @@ that comparison required paging `/events` and hand-folding windows. It folds eve
 set, each name's count being the number of windows it appeared in), `distinctCount`, `maxChatCount` (the
 largest TRUE catalog size observed), `lastChatCount` (the most recent window's, keyed off the producer's
 own `windowEndedAt` rather than array order, so out-of-order persistence cannot rewrite "latest"),
-`truncatedEver` (any window reported a producer-capped list), and `lastSnapshotAt`. The name space is
+`truncatedEver` (any window reported a producer-capped list), `generatedShaped`, and `lastSnapshotAt`. The name space is
 bounded like every other client-keyed axis: each name is truncated at 128 chars and the cardinality is
 capped at the first 200 distinct names — the producer's own per-window cap, for the same reason
 `operations` uses 129 rather than 10: a chat catalog's realistic cardinality is an order of magnitude past
@@ -623,6 +624,15 @@ ONLY the `names` consent category, so this axis is populated only where that opt
 purely additive — a pure read over already-accepted, already-redacted events; no new collection, wire
 field, schema bump, or identifier, and no change to `/events` (where the raw per-window list stays
 readable for the drill-down after the aggregate points at a collision).
+
+`distinctCount < maxChatCount` only detects **identical** names. The founding defect also has a
+*distinct-but-indistinguishable* form — machine-generated names (`chat-0r8s2s`, `split-33jgqgxp`,
+`shell-cr00af`) that are all different yet tell a human nothing. `generatedShaped` reads that in one query:
+`{ distinctCount, considered, share }` over the already-bounded `names` map, where `considered` is every
+distinct name except the `__overflow__` bucket, `distinctCount` is how many of those match the retired
+generators' shapes (`GENERATED_NAME_SHAPE` in `summary.mjs`), and `share` is their ratio — `null` (never
+`0`) when nothing was considered. It is a **shape** verdict, not proof: a name a user chose that happens to
+look like `chat-abcdef` also matches. Purely additive: no new collection, wire field or schema bump.
 
 #### Scoping the aggregates — `?type=` / `?platform=` / `?appVersion=` / `?since=`
 

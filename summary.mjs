@@ -343,6 +343,14 @@ const WORKSPACE_SHAPE_COUNTS = Object.freeze([
 // be edited to widen an export), the same posture the operations cap records.
 export const WORKSPACE_NAMES_SUMMARY_CAP = 200;
 
+// The shapes of the RETIRED machine-name generators (WARDEN-1536, roadmap
+// WARDEN-1265): web App.tsx minted `chat-${Math.random().toString(36).slice(2,8)}`,
+// `split-…slice(2,10)` and `shell-…slice(2,8)` (removed in warden a2db023 /
+// WARDEN-1422); `src/server.js` `newTempName` still mints `shell-<6 base36>`.
+// `workspaceNames.generatedShaped` counts distinct names matching this. It is a
+// SHAPE verdict — a user-chosen `chat-abcdef` would match too — not proof.
+export const GENERATED_NAME_SHAPE = /^(?:(?:chat|shell)-[a-z0-9]{6}|split-[a-z0-9]{8})$/;
+
 // ── FEATURE USAGE aggregate (WARDEN-1488) ─────────────────────────────────────
 // Schema v9 (WARDEN-1479) made the feature-adoption category carry a
 // `feature-usage` event, and until this axis existed `summarize()` reduced it to
@@ -1191,6 +1199,11 @@ function _createWorkspaceNamesAccumulator() {
     },
     snapshot() {
       const nameCounts = names.snapshot();
+      // Distinct-but-machine-named verdict (WARDEN-1536): over the already-bounded
+      // `names` map, `__overflow__` excluded from both counts. `share` is null
+      // (never 0) when nothing was considered.
+      const considered = Object.keys(nameCounts).filter((k) => k !== '__overflow__');
+      const shaped = considered.filter((k) => GENERATED_NAME_SHAPE.test(k)).length;
       return {
         windowsSeen,
         names: nameCounts,
@@ -1198,6 +1211,11 @@ function _createWorkspaceNamesAccumulator() {
         maxChatCount,
         lastChatCount,
         truncatedEver,
+        generatedShaped: {
+          distinctCount: shaped,
+          considered: considered.length,
+          share: considered.length === 0 ? null : shaped / considered.length,
+        },
         lastSnapshotAt,
       };
     },
@@ -1295,6 +1313,8 @@ export function lastAcceptedInstant(events) {
  *   workspaceNames: { windowsSeen: number, names: Record<string, number>,
  *                     distinctCount: number, maxChatCount: number | null,
  *                     lastChatCount: number | null, truncatedEver: boolean,
+ *                     generatedShaped: { distinctCount: number, considered: number,
+ *                                        share: number | null },
  *                     lastSnapshotAt: number | null },
  *   featureUsage: { windowsSeen: number, lastWindowAt: number | null,
  *                   features: Record<string, { count: number, windowsSeen: number }>,
