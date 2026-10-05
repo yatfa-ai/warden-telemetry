@@ -191,6 +191,7 @@ curl http://localhost:7421/summary
 #   },
 #   "operations": {                                                                # the per-operation axis the operational-metrics COUNT hides (WARDEN-1435): a day of route latencies reads on byType as one integer
 #     "get-api-claude-sessions": { "count": 288, "okCount": 284, "failCount": 4, "min": 80, "avg": 141, "max": 4000 },  # folded across every retained window; avg is WEIGHTED (Σ avg×count / Σ count), max is the worst single observation
+#     "file-exists-remote":      { "count": 2139, "okCount": 34, "failCount": 2105, "min": 6, "avg": 148, "max": 9777 },  # file-exists-* ok/fail = path EXISTS/ABSENT (the probe's verdict), NOT transport success/failure — 98% failCount = mostly-absent paths; no-verdict probes land in file-exists-remote-failed / -timeout
 #     "pane-echo-e2e":           { "count": 96, "okCount": 96, "failCount": 0, "min": 250, "avg": 302, "max": 800 },   # a renderer operation reading 100% ok is correct — that producer only ever counts successes
 #     "__overflow__":            { "count": 12, "okCount": 12, "failCount": 0, "min": 1, "avg": 3, "max": 9 }          # past the 129-name cap, further distinct names fold here — represented, never dropped
 #   },
@@ -464,7 +465,16 @@ a day of 5-minute windows carrying every `/api` route's latency reduces on `byTy
 paging `/events` and re-folding thousands of raw per-window accumulators by hand. `operations` folds every
 retained window's `operations[]` by operation NAME into bounded buckets carrying `count` / `okCount` /
 `failCount` / `min` / `avg` / `max`: the failure ratio and the worst single observation of each route,
-readable at a glance. `avg` is **weighted** — `Σ(avg × count) / Σcount`, never a mean of window means (10
+readable at a glance. **`okCount`/`failCount` default to the producer's outcome** (HTTP `<500` counts ok for a
+route) — **except the `file-exists-*` family, which records the probe's VERDICT instead**: for
+`file-exists-remote` / `file-exists-local`, `okCount` = paths that **EXIST** and `failCount` = paths **ABSENT**,
+so a high `failCount` means absence, **not** a failing transport (most path-like tokens probed in terminal
+output are not files; e.g. `file-exists-remote` reading ~98% `failCount` is the normal shape). Probes that got
+**no verdict** (transport error, channel death, script failure, deadline) ride the separate
+`file-exists-remote-failed` / `file-exists-remote-timeout` names, so those two names being **absent from
+`operations`** means the transport observed no broken probes in the retained window — not an empty channel.
+The producer (`warden` `src/fileExistsTelemetry.js` `FILE_EXISTS_OPS`, checked at warden `7da4e39`) is the
+semantics of record. `avg` is **weighted** — `Σ(avg × count) / Σcount`, never a mean of window means (10
 observations @ 100ms + 1 @ 1000ms must read ≈182, not 550); `min`/`max` are true extrema across windows and
 read `null` (never `0`) when no finite observation was folded — `0` is a REAL measured duration here (a cache
 hit), so it cannot double as the empty sentinel, and a zero-count placeholder entry (an idle renderer window
