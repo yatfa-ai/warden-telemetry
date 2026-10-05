@@ -964,6 +964,14 @@ function _latencySnapshot(lat) {
  * one shared `__overflow__` accumulator (bounded cardinality, no count loss),
  * mirroring `stallBySource`'s overflow exactly.
  *
+ * DECODE NOTE (WARDEN-1532): okCount/failCount are the PRODUCER's outcome, and for
+ * the `file-exists-*` family that outcome is the probe's VERDICT — okCount = path
+ * EXISTS, failCount = path ABSENT (exists/absent only; high failCount is absence,
+ * not a transport failure). No-verdict probes arrive under the separate
+ * `file-exists-remote-failed` / `file-exists-remote-timeout` names, so their absence
+ * here means no broken probes. Semantics of record: warden
+ * `src/fileExistsTelemetry.js` FILE_EXISTS_OPS. Folded verbatim — no decoding here.
+ *
  * @param {unknown} operations the event's `operations` array (any shape)
  * @param {Map<string, object>} accs name → accumulator (mutated in place)
  * @param {Map<string, object>} [latency] name → latency accumulator (mutated in place)
