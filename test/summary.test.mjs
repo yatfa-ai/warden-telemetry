@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP, WORKSPACE_NAMES_SUMMARY_CAP, FEATURE_USAGE_SUMMARY_CAP } from '../summary.mjs';
+import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP, WORKSPACE_NAMES_SUMMARY_CAP, GENERATED_NAME_SHAPE, FEATURE_USAGE_SUMMARY_CAP } from '../summary.mjs';
 // Canonical valid events (verbatim shapes ingest persists — one per base type).
 const validError = {
   schemaVersion: 1,
@@ -73,6 +73,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
     maxChatCount: null,
     lastChatCount: null,
     truncatedEver: false,
+    generatedShaped: { distinctCount: 0, considered: 0, share: null },
     lastSnapshotAt: null,
   });
   // WARDEN-1488 — the feature-usage axis reads a STABLE zeroed shape too.
@@ -2041,7 +2042,9 @@ test('workspaceShape/workspaceNames are stable zeroed shapes on a workspace-free
   });
   assert.deepEqual(s.workspaceNames, {
     windowsSeen: 0, names: {}, distinctCount: 0, maxChatCount: null,
-    lastChatCount: null, truncatedEver: false, lastSnapshotAt: null,
+    lastChatCount: null, truncatedEver: false,
+    generatedShaped: { distinctCount: 0, considered: 0, share: null },
+    lastSnapshotAt: null,
   });
 });
 
@@ -2646,4 +2649,32 @@ test('operationRejections reads only operational-metrics windows; existing keys 
   const { operationRejections, ...rest } = s;
   assert.equal(rest.byType['operational-metrics'], 1);
   assert.equal(rest.total, 3);
+});
+
+// ── workspaceNames.generatedShaped — distinct-but-machine-named verdict ───────
+
+test('workspaceNames.generatedShaped counts distinct names matching the retired generator shapes', () => {
+  const s = summarize([namesWindow({
+    chats: ['chat-0r8s2s', 'split-33jgqgxp', 'shell-cr00af', 'demo', 'Refactor auth'], chatCount: 5,
+  })]);
+  assert.deepEqual(s.workspaceNames.generatedShaped, { distinctCount: 3, considered: 5, share: 0.6 });
+});
+
+test('workspaceNames.generatedShaped does NOT match near-miss shapes (negative controls)', () => {
+  const near = ['chat-planner', 'split-abc', 'chatabcdef', 'Chat-0r8s2s'];
+  for (const n of near) assert.equal(GENERATED_NAME_SHAPE.test(n), false, `${n} must not match`);
+  const s = summarize([namesWindow({ chats: near, chatCount: 4 })]);
+  assert.deepEqual(s.workspaceNames.generatedShaped, { distinctCount: 0, considered: 4, share: 0 });
+});
+
+test('workspaceNames.generatedShaped excludes the __overflow__ bucket from both counts', () => {
+  const N = WORKSPACE_NAMES_SUMMARY_CAP;
+  const chats = Array.from({ length: N + 5 }, (_, i) => `chat-${String(i).padStart(6, '0')}`);
+  const s = summarize([namesWindow({ chats, chatCount: chats.length })]);
+  assert.ok(s.workspaceNames.names.__overflow__ > 0, 'precondition: overflow bucket exists');
+  assert.deepEqual(s.workspaceNames.generatedShaped, { distinctCount: N, considered: N, share: 1 });
+});
+
+test('workspaceNames.generatedShaped share is null (never 0) when nothing was considered', () => {
+  assert.deepEqual(summarize([]).workspaceNames.generatedShaped, { distinctCount: 0, considered: 0, share: null });
 });

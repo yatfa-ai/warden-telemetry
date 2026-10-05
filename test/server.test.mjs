@@ -397,6 +397,7 @@ test('GET /summary on a workspace-free store serves the stable zeroed workspace 
     maxChatCount: null,
     lastChatCount: null,
     truncatedEver: false,
+    generatedShaped: { distinctCount: 0, considered: 0, share: null },
     lastSnapshotAt: null,
   });
 });
