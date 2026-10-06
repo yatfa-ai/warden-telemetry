@@ -59,6 +59,7 @@
 // are the receiver's to define.
 
 import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
 import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -103,6 +104,23 @@ export {
 
 export const DEFAULT_PORT = 7421;
 export const DEFAULT_STORE_PATH = new URL('./telemetry.ndjson', import.meta.url).pathname;
+
+// Build identity of the running receiver (WARDEN-1585). Reads `version` from the
+// package.json shipped beside server.mjs (the Dockerfile COPYs it into the image).
+// Returns the version ONLY when it is a non-empty string; on ANY failure (missing
+// file, unparseable JSON, absent / non-string / empty version) returns `null` —
+// never throws and never a placeholder like 'unknown', so a reader can tell
+// "unreadable" from a real release. `url` is injectable for tests.
+export function readReceiverVersion(url = new URL('./package.json', import.meta.url)) {
+  try {
+    const version = JSON.parse(readFileSync(url, 'utf8'))?.version;
+    return typeof version === 'string' && version.length > 0 ? version : null;
+  } catch {
+    return null;
+  }
+}
+// Computed ONCE at module load: the process's build identity never changes.
+export const DEFAULT_RECEIVER_VERSION = readReceiverVersion();
 export const INGEST_PATH = '/ingest';
 export const SUMMARY_PATH = '/summary';
 // The config-time verification surface (WARDEN-595). A warden client probes
@@ -756,10 +774,10 @@ function _composeLiveness({ readAt, startedAt, lastAcceptedAt, rejectionSnapshot
  * seenKeys / retention-trigger factories) keeps the stamp unit-testable with a
  * fake clock; absent it defaults to Date.now.
  *
- * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void, snapshot(): { configured: { maxKeys: number, ttlMs: number }, size: number } }, deduped?: { record(): void, snapshot(): object }, maxBodyBytes?: number, now?: () => number, retentionHealth?: { record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void, snapshot(): object } }} deps
+ * @param {{ store: object, schema?: { SCHEMA_VERSION: number, validateEvent: (e: unknown) => boolean }, authToken?: string, retention?: { afterAppend(count?: number): void }, rejections?: { record(rec: { status: number, reason?: string }): void, snapshot(): object }, persistErrors?: { record(rec: { reason?: string }): void, snapshot(): object }, seenKeys?: { has(key: string): boolean, record(key: string): void, snapshot(): { configured: { maxKeys: number, ttlMs: number }, size: number } }, deduped?: { record(): void, snapshot(): object }, maxBodyBytes?: number, now?: () => number, retentionHealth?: { record(rec: { before?: number, after?: number, pruned?: number, rewrote?: boolean, retainedCount?: number }): void, snapshot(): object }, receiverVersion?: string | null }} deps
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, deduped, maxBodyBytes = 0, now = Date.now, retentionHealth } = {}) {
+export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken, retention, rejections, persistErrors, seenKeys, deduped, maxBodyBytes = 0, now = Date.now, retentionHealth, receiverVersion = DEFAULT_RECEIVER_VERSION } = {}) {
   if (!store) throw new TypeError('createRequestHandler: `store` is required');
 
   // Boot timestamp (WARDEN-768): captured ONCE here at handler construction
@@ -979,6 +997,12 @@ export function createRequestHandler({ store, schema = DEFAULT_SCHEMA, authToken
           // tallies). Never persisted — operational metadata about the process,
           // counts/epoch-ms only, no JSONB allow-list concern.
           startedAt,
+          // `receiverVersion` (WARDEN-1585): the build identity of the process that
+          // answered — package.json `version`, read once at module load; `null`
+          // when unreadable. Lets a reader tell "this /summary axis is not
+          // deployed yet" (receiver predates it) from "axis exists, nothing to
+          // report". One short string or null — bounded by construction.
+          receiverVersion,
           // `readAt` (WARDEN-1428): the READ's OWN clock — epoch-ms stating when
           // THIS response was produced, from the single `now()` read above.
           // Before it, /summary served 22 top-level keys and NOT ONE of them was

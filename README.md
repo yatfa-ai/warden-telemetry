@@ -122,6 +122,7 @@ curl http://localhost:7421/summary
 #   "firstSeen": 1719820800000,
 #   "lastSeen": 1720000000000,
 #   "startedAt": 1719980000000,                 # epoch-ms this receiver (re)booted — the observation window for the tallies below
+#   "receiverVersion": "0.1.19",                # build identity (package.json version) of the receiver process that answered; null when unreadable (WARDEN-1585)
 #   "readAt": 1720000400000,                    # epoch-ms THIS response was produced — the read's own clock; subtract it from any timestamp above to get an age
 #   "liveness": {                               # is the channel RECEIVING? the twin of startedAt for the ACCEPTED-event stream (WARDEN-1428)
 #     "lastAcceptedAt": 1720000000000,          # when the newest ACCEPTED event landed (equal to top-level lastSeen on an UNFILTERED read — on a filtered read lastSeen is scoped and this is not, see the unscoped note below — restated so the verdict is self-contained); null on an empty store
@@ -292,6 +293,13 @@ genuinely reflect that whole window. `startedAt` is itself receiver-local and in
 survive a restart, so after a restart it shows the **new** boot time, immediately self-documenting that the
 tallies were just zeroed. It is operational metadata about the process (an epoch-ms, never raw events or
 extended-tier identifiers), exactly like `firstSeen`/`lastSeen`, and is never persisted.
+
+`receiverVersion` is the **build identity of the process that answered** — the `version` from the
+`package.json` shipped beside `server.mjs`, read once at boot (a string, or `null` when the file is
+unreadable; never a placeholder). Compare it against `package.json` on `main`/`prod`. If `main` documents a
+`/summary` key that the body lacks, the deployed receiver predates it — check `receiverVersion` first, before
+concluding "nothing to report". It is exact for `prod`, because prod only advances with a version bump; a
+dirty local run reports its checkout's version. It is one short string, not a per-event tally.
 
 `readAt` is the **read's own clock** — the epoch-ms at which this response was produced. Before it,
 `/summary` served two epoch-ms timestamps (`startedAt`, `lastSeen`) and **no `now` to subtract them from**,
