@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP, WORKSPACE_NAMES_SUMMARY_CAP, GENERATED_NAME_SHAPE, FEATURE_USAGE_SUMMARY_CAP } from '../summary.mjs';
+import { summarize, summarizeTimeline, summarizeStallsTimeline, lastAcceptedInstant, CLIENT_KEY_MAX_LENGTH, CLIENT_HISTOGRAM_CAP, OPERATIONS_SUMMARY_CAP, WORKSPACE_NAMES_SUMMARY_CAP, GENERATED_NAME_SHAPE, FEATURE_USAGE_SUMMARY_CAP, RELEASES_SUMMARY_CAP } from '../summary.mjs';
 // Canonical valid events (verbatim shapes ingest persists — one per base type).
 const validError = {
   schemaVersion: 1,
@@ -46,6 +46,7 @@ test('empty input → total 0, zeroed byType, empty histograms, null time window
   assert.deepEqual(s.topSignatures, []);
   assert.deepEqual(s.schemaVersions, {});
   assert.deepEqual(s.appVersions, {});
+  assert.deepEqual(s.releases, { distinctCount: 0, byVersion: {}, newestSeen: null }, 'WARDEN-1540: stable zeroed shape');
   assert.deepEqual(s.platforms, {});
   assert.deepEqual(s.byRuntime, {});
   assert.deepEqual(s.crashReasons, {});
@@ -2677,4 +2678,103 @@ test('workspaceNames.generatedShaped excludes the __overflow__ bucket from both 
 
 test('workspaceNames.generatedShaped share is null (never 0) when nothing was considered', () => {
   assert.deepEqual(summarize([]).workspaceNames.generatedShaped, { distinctCount: 0, considered: 0, share: null });
+});
+
+// ── RELEASES adoption axis (WARDEN-1540) ──────────────────────────────────────
+
+const relEv = (appVersion, extra = {}) => ({ ...validError, appVersion, ...extra });
+
+test('releases: per-version count + firstSeenAt/lastSeenAt, receivedAt preferred over timestamp fallback', () => {
+  const s = summarize([
+    relEv('0.1.86', { timestamp: 10, receivedAt: 1000 }),
+    relEv('0.1.86', { timestamp: 20 }), // timestamp-only fallback (older, pre-annotation)
+    relEv('0.1.86', { timestamp: 9_999_999, receivedAt: 3000 }), // skewed client clock ignored
+    relEv('0.1.90', { timestamp: 5000, receivedAt: 4000 }),
+  ]);
+  assert.deepEqual(s.releases.byVersion['0.1.86'], { count: 3, firstSeenAt: 20, lastSeenAt: 3000 });
+  assert.deepEqual(s.releases.byVersion['0.1.90'], { count: 1, firstSeenAt: 4000, lastSeenAt: 4000 });
+  assert.equal(s.releases.distinctCount, 2);
+  assert.equal(s.releases.newestSeen, '0.1.90');
+});
+
+test('releases: an event with no effective instant counts but leaves first/last null (never 0)', () => {
+  const e = { ...validError, appVersion: '0.1.5' };
+  delete e.timestamp;
+  const s = summarize([e]);
+  assert.deepEqual(s.releases.byVersion['0.1.5'], { count: 1, firstSeenAt: null, lastSeenAt: null });
+  // a later event with an instant fills them in
+  const s2 = summarize([e, relEv('0.1.5', { timestamp: 7 })]);
+  assert.deepEqual(s2.releases.byVersion['0.1.5'], { count: 2, firstSeenAt: 7, lastSeenAt: 7 });
+});
+
+test('releases: 12 sequential labels are ALL named while appVersions is unchanged (folds at 10)', () => {
+  const labels = ['0.1.19', '0.1.56', '0.1.60', '0.1.66', '0.1.70', '0.1.72', '0.1.74', '0.1.82', '0.1.86', '0.1.88', '0.1.89', '0.1.90'];
+  const s = summarize(labels.map((l, i) => relEv(l, { timestamp: 100 + i })));
+  assert.equal(labels.length, 12);
+  // appVersions byte-identical to the pre-existing first-seen-wins cap-10 behaviour.
+  const expected = {};
+  for (const l of labels.slice(0, CLIENT_HISTOGRAM_CAP)) expected[l] = 1;
+  expected.__overflow__ = 2;
+  assert.deepEqual(s.appVersions, expected);
+  // releases names every one.
+  assert.deepEqual(Object.keys(s.releases.byVersion).sort(), [...labels].sort());
+  assert.equal(s.releases.distinctCount, 12);
+  assert.equal(s.releases.newestSeen, '0.1.90');
+  assert.equal(s.releases.byVersion['0.1.90'].lastSeenAt, 111);
+});
+
+test('releases: numeric (not lexical) ordering — 0.1.9 < 0.1.10, and shorter/longer components compare right', () => {
+  assert.equal(summarize([relEv('0.1.10'), relEv('0.1.9')]).releases.newestSeen, '0.1.10');
+  assert.equal(summarize([relEv('0.1.9'), relEv('0.1.10')]).releases.newestSeen, '0.1.10');
+  assert.equal(summarize([relEv('0.2'), relEv('0.1.99')]).releases.newestSeen, '0.2');
+  assert.equal(summarize([relEv('1.0'), relEv('1.0.0')]).releases.distinctCount, 2);
+});
+
+test('releases: cap → ONE __overflow__ bucket, no count loss, newestSeen/distinctCount stay correct past the cap', () => {
+  const events = [];
+  for (let i = 0; i < RELEASES_SUMMARY_CAP; i += 1) events.push(relEv(`0.1.${i}`, { timestamp: 10 + i }));
+  // Past the cap: two NEW labels (the newest build among them), plus a repeat of a tracked one.
+  events.push(relEv('0.1.500', { timestamp: 900 }));
+  events.push(relEv('0.1.600', { timestamp: 950 }));
+  events.push(relEv('0.1.0', { timestamp: 999 }));
+  const s = summarize(events);
+  const keys = Object.keys(s.releases.byVersion);
+  assert.equal(keys.length, RELEASES_SUMMARY_CAP + 1, 'capped labels + ONE overflow bucket');
+  assert.deepEqual(s.releases.byVersion.__overflow__, { count: 2, firstSeenAt: 900, lastSeenAt: 950 });
+  assert.equal(s.releases.byVersion['0.1.500'], undefined, 'folded label has no named bucket');
+  assert.equal(s.releases.byVersion['0.1.0'].count, 2, 'tracked label keeps bumping its own bucket');
+  const total = Object.values(s.releases.byVersion).reduce((a, b) => a + b.count, 0);
+  assert.equal(total, events.length, 'no count loss');
+  assert.equal(s.releases.distinctCount, RELEASES_SUMMARY_CAP + 2, 'distinctCount is cap-independent; overflow bucket is not a label');
+  assert.equal(s.releases.newestSeen, '0.1.600', 'newestSeen is correct even though it landed past the cap');
+});
+
+test('releases: a __proto__ / constructor label buckets as an ordinary own key', () => {
+  const s = summarize([relEv('__proto__', { timestamp: 1 }), relEv('__proto__', { timestamp: 2 }), relEv('constructor', { timestamp: 3 }), relEv('0.1.1', { timestamp: 4 })]);
+  assert.ok(Object.prototype.hasOwnProperty.call(s.releases.byVersion, '__proto__'));
+  assert.deepEqual(s.releases.byVersion.__proto__, { count: 2, firstSeenAt: 1, lastSeenAt: 2 });
+  assert.deepEqual(s.releases.byVersion.constructor, { count: 1, firstSeenAt: 3, lastSeenAt: 3 });
+  assert.equal(s.releases.distinctCount, 3);
+  assert.equal(s.releases.newestSeen, '0.1.1', 'non-orderable labels never win newestSeen');
+});
+
+test('releases: skip-robust — absent / null / non-string / empty ignored; non-orderable label ignored for newestSeen', () => {
+  const s = summarize([
+    { ...validError },
+    relEv(null),
+    relEv(42),
+    relEv(''),
+    relEv(['0.1.1']),
+    relEv('nightly', { timestamp: 5 }),
+    relEv('0.1.3-beta', { timestamp: 6 }),
+  ]);
+  assert.deepEqual(Object.keys(s.releases.byVersion).sort(), ['0.1.3-beta', 'nightly']);
+  assert.equal(s.releases.distinctCount, 2);
+  assert.equal(s.releases.newestSeen, null, 'no orderable label → null');
+  assert.equal(summarize([relEv('nightly'), relEv('0.0.1')]).releases.newestSeen, '0.0.1');
+});
+
+test('releases: over-long label is truncated at CLIENT_KEY_MAX_LENGTH', () => {
+  const s = summarize([relEv('x'.repeat(CLIENT_KEY_MAX_LENGTH + 50))]);
+  assert.deepEqual(Object.keys(s.releases.byVersion), ['x'.repeat(CLIENT_KEY_MAX_LENGTH)]);
 });

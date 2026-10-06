@@ -523,6 +523,7 @@ test('GET /summary on an empty store → 200, total: 0, zeroed counters (not an 
   assert.deepEqual(body.byType, { error: 0, crash: 0, 'performance-stall': 0, 'operational-metrics': 0, 'server-stall': 0, 'workspace-names': 0, 'workspace-shape': 0, 'feature-usage': 0, 'process-memory': 0 });
   assert.deepEqual(body.topErrorNames, []);
   assert.deepEqual(body.schemaVersions, {});
+  assert.deepEqual(body.releases, { distinctCount: 0, byVersion: {}, newestSeen: null }, 'WARDEN-1540: zeroed releases shape');
   assert.equal(body.firstSeen, null);
   assert.equal(body.lastSeen, null);
 });
@@ -1513,6 +1514,11 @@ test('GET /summary?appVersion=0.1.18&platform=darwin&type=crash intersects all f
   assert.deepEqual(body.topSignatures, [{ signature: 'crash:mac-oom', type: 'crash', count: 1 }]);
   assert.deepEqual(body.platforms, { darwin: 1 });
   assert.deepEqual(body.appVersions, { '0.1.18': 1 });
+  // WARDEN-1540: releases inherits the same scoping and collapses to that label.
+  assert.deepEqual(Object.keys(body.releases.byVersion), ['0.1.18']);
+  assert.equal(body.releases.byVersion['0.1.18'].count, 1);
+  assert.equal(body.releases.distinctCount, 1);
+  assert.equal(body.releases.newestSeen, '0.1.18');
 });
 
 test('GET /summary with NO filters is backward compatible — matched === total, aggregates over the whole set', async () => {

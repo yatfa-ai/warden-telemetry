@@ -634,6 +634,35 @@ generators' shapes (`GENERATED_NAME_SHAPE` in `summary.mjs`), and `share` is the
 `0`) when nothing was considered. It is a **shape** verdict, not proof: a name a user chose that happens to
 look like `chat-abcdef` also matches. Purely additive: no new collection, wire field or schema bump.
 
+`releases` is the **release-adoption axis** (WARDEN-1540), the sibling of `appVersions` that answers
+*"when was release X last heard from, and is there any build newer than X?"* — the question the
+count-only `appVersions` histogram cannot. `appVersions` is a first-seen-wins histogram capped at 10
+keys, so the 11th and later (i.e. NEWER) releases fold into `__overflow__` and become invisible by name;
+its shape is unchanged. `releases` is `{ distinctCount, byVersion, newestSeen }`: `byVersion` maps each
+`appVersion` label to `{ count, firstSeenAt, lastSeenAt }` (epoch-ms read through the same
+receivedAt-preferred rule as `lastSeen` / `liveness`, so it can never disagree with them; `null` — never
+`0` — when no event for that label carried a finite instant). Keys are truncated at 128 chars and capped
+at 64 distinct labels (`RELEASES_SUMMARY_CAP`); past the cap every further new label folds into ONE
+counted `__overflow__` bucket (count preserved, first/last folded as min/max). `distinctCount` is the true
+number of distinct labels seen — independent of the cap and **not** counting the `__overflow__` bucket — so
+`distinctCount` exceeding the named keys is the loud signal that labels were folded. `newestSeen` is the
+greatest label by **numeric** dotted-component comparison (`0.1.9` < `0.1.10`), computed over ALL labels
+seen independent of the cap, so a newest build that landed past the cap is still reported; labels that
+are not purely dotted-numeric (`nightly`, `0.1.3-beta`) are ignored for ordering, and it is `null` when no
+orderable label exists. Empty store: `{ distinctCount: 0, byVersion: {}, newestSeen: null }`. Scoped by
+`?type=` / `?platform=` / `?appVersion=` / `?since=` like every other key (`?appVersion=0.1.86` collapses
+it to that one label).
+
+**Reading it — silent channel vs. empty channel.** A zero on a channel that a *later* build introduced
+(e.g. `feature-usage` / `process-memory` windows) usually means *the build that carries it has not reported*,
+not *the producer is broken*. Compare the build that introduced the channel with `releases`: if
+`newestSeen` (or `byVersion[X].lastSeenAt` for the newest build you have) is **older** than that build, the
+channel is silent because nobody running it has reported — "nobody was looking". If a build at or past the
+introducing release HAS reported (`byVersion[Y].lastSeenAt` is recent) and the channel still reads zero,
+the build reported and the channel is genuinely empty — "nothing happened". Privacy: the release label is
+the same non-identifying value `appVersions` already echoes; `releases` adds counts and timestamps of
+already-accepted events only — no new identifier, wire field or schema change.
+
 #### Scoping the aggregates — `?type=` / `?platform=` / `?appVersion=` / `?since=`
 
 Every aggregate above can be **scoped** to a platform / release / type / time window with the SAME
