@@ -4,6 +4,7 @@
 // self-hosting maintainer can act on (counts / histograms only):
 //   - `summarize(events)`        → flat aggregates (total / byType / topErrorNames
 //                                  / topSignatures / schemaVersions / appVersions
+//                                  / releases
 //                                  / platforms / crashReasons / stalls / operations
 //                                  / operationLatency / workspaceShape
 //                                  / workspaceNames / featureUsage / processMemory
@@ -342,6 +343,112 @@ const WORKSPACE_SHAPE_COUNTS = Object.freeze([
 // there and schema.ts is vendored byte-identical to the client (it must never
 // be edited to widen an export), the same posture the operations cap records.
 export const WORKSPACE_NAMES_SUMMARY_CAP = 200;
+
+// The release-adoption axis bound (WARDEN-1540). `appVersions` is a count-only,
+// FIRST-SEEN-WINS histogram at CLIENT_HISTOGRAM_CAP (10): the first 10 distinct
+// release labels keep a bucket forever and every later — i.e. NEWER — label folds
+// into `__overflow__`, so the release that matters most ("is the build that
+// carries channel X live yet?") is exactly the one that becomes invisible by
+// name. Release labels are a LOW-cardinality, owner-driven axis (one per shipped
+// build) whose NEWEST members matter, so the free-text default of 10 destroys the
+// capability — the same reasoning WORKSPACE_NAMES_SUMMARY_CAP records for chat
+// names. 64 holds a long run of builds in readable buckets while the response
+// stays bounded (≤ 65 keys × CLIENT_KEY_MAX_LENGTH chars). Past the cap, every
+// further NEW label folds into ONE counted `__overflow__` bucket (count preserved,
+// first/last folded as min/max) — but `newestSeen` and `distinctCount` are tracked
+// independently of the cap, so neither is ever lossy.
+export const RELEASES_SUMMARY_CAP = 64;
+
+const RELEASE_LABEL_ORDERABLE_RE = /^\d+(\.\d+)*$/;
+
+/**
+ * Compare two dotted-numeric labels component-by-component NUMERICALLY (0.1.9 <
+ * 0.1.10). A missing trailing component reads as 0 (`0.1` == `0.1.0`). Components
+ * compare as digit strings (strip leading zeros, then length, then lexical) so an
+ * arbitrarily long component can never lose precision the way Number() would.
+ * Both inputs MUST match RELEASE_LABEL_ORDERABLE_RE. Pure.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {number} negative / 0 / positive
+ * @private
+ */
+function _compareDottedNumeric(a, b) {
+  const pa = a.split('.');
+  const pb = b.split('.');
+  const n = Math.max(pa.length, pb.length);
+  for (let i = 0; i < n; i += 1) {
+    const x = (pa[i] ?? '0').replace(/^0+(?=\d)/, '');
+    const y = (pb[i] ?? '0').replace(/^0+(?=\d)/, '');
+    if (x.length !== y.length) return x.length - y.length;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Per-release adoption accumulator (WARDEN-1540). `record(label, instant)` folds
+ * one event: count +1, first/last widened by `instant` (a finite epoch-ms from the
+ * shared `_effectiveInstant`, or `null` → counts but contributes no first/last).
+ * `snapshot()` returns `{ distinctCount, byVersion, newestSeen }`.
+ *
+ *  - `byVersion` is cap-bounded FIRST-SEEN-WINS (RELEASES_SUMMARY_CAP) with ONE
+ *    `__overflow__` bucket past the cap (count preserved; first/last = min/max of
+ *    the folded labels). Its buckets live in a NULL-PROTOTYPE map (WARDEN-1524) so
+ *    a `__proto__` / `constructor` label is an ordinary own key.
+ *  - `distinctCount` is the TRUE number of distinct (key-bounded) labels seen,
+ *    INDEPENDENT of the cap and NOT counting the `__overflow__` bucket as a label —
+ *    so `distinctCount > Object.keys(byVersion).length - 1` is the loud signal that
+ *    labels were folded.
+ *  - `newestSeen` is the greatest label by NUMERIC dotted compare over ALL labels
+ *    seen, independent of the cap; labels not matching /^\d+(\.\d+)*$/ are ignored
+ *    for ordering; `null` when none is orderable.
+ *
+ * @returns {{ record(label: string, instant: number | null): void,
+ *             snapshot(): { distinctCount: number,
+ *                           byVersion: Record<string, { count: number, firstSeenAt: number | null, lastSeenAt: number | null }>,
+ *                           newestSeen: string | null } }}
+ * @private
+ */
+function _createReleasesAccumulator() {
+  const buckets = Object.create(null);
+  const seen = new Set();
+  let tracked = 0;
+  let newest = null;
+  const widen = (b, instant) => {
+    b.count += 1;
+    if (instant === null) return;
+    if (b.firstSeenAt === null || instant < b.firstSeenAt) b.firstSeenAt = instant;
+    if (b.lastSeenAt === null || instant > b.lastSeenAt) b.lastSeenAt = instant;
+  };
+  return {
+    record(label, instant) {
+      const key = _boundClientKey(label);
+      seen.add(key);
+      if (RELEASE_LABEL_ORDERABLE_RE.test(key) && (newest === null || _compareDottedNumeric(key, newest) > 0)) {
+        newest = key;
+      }
+      let slot = key;
+      if (!Object.prototype.hasOwnProperty.call(buckets, key)) {
+        if (tracked < RELEASES_SUMMARY_CAP) {
+          tracked += 1;
+        } else {
+          slot = OVERFLOW_KEY;
+        }
+        if (!Object.prototype.hasOwnProperty.call(buckets, slot)) {
+          buckets[slot] = { count: 0, firstSeenAt: null, lastSeenAt: null };
+        }
+      }
+      widen(buckets[slot], instant);
+    },
+    snapshot() {
+      // fromEntries defines own data properties, so a `__proto__` key is an own key
+      // (plain `obj[k] = v` would invoke the prototype setter and drop it).
+      const byVersion = Object.fromEntries(Object.keys(buckets).map((k) => [k, { ...buckets[k] }]));
+      return { distinctCount: seen.size, byVersion, newestSeen: newest };
+    },
+  };
+}
 
 // The shapes of the RETIRED machine-name generators (WARDEN-1536, roadmap
 // WARDEN-1265): web App.tsx minted `chat-${Math.random().toString(36).slice(2,8)}`,
@@ -1297,6 +1404,9 @@ export function lastAcceptedInstant(events) {
  *   topSignatures: { signature: string, type: BaseEventType, count: number }[],
  *   schemaVersions: Record<string, number>,
  *   appVersions: Record<string, number>,
+ *   releases: { distinctCount: number,
+ *               byVersion: Record<string, { count: number, firstSeenAt: number | null, lastSeenAt: number | null }>,
+ *               newestSeen: string | null },
  *   platforms: Record<string, number>,
  *   byRuntime: Record<string, number>,
  *   crashReasons: Record<string, number>,
@@ -1351,6 +1461,9 @@ export function summarize(events) {
   // through the bounded accumulator (key-length truncation + top-N + overflow)
   // — no single accepted event can permanently inflate every summary response.
   const appVersions = _createBoundedClientHistogram();
+  // Release-adoption axis (WARDEN-1540): per-appVersion count + first/last seen,
+  // cap-independent `newestSeen`. Additive beside `appVersions`, whose shape is untouched.
+  const releases = _createReleasesAccumulator();
   const platforms = _createBoundedClientHistogram();
   // runtime process label histogram (WARDEN-869) — the PROCESS sibling of
   // `appVersions` / `platforms`. `runtime` is mandatory on valid events, but the
@@ -1437,6 +1550,7 @@ export function summarize(events) {
     // malformed value never crashes or produces a junk bucket.
     if (typeof appVersion === 'string' && appVersion.length > 0) {
       appVersions.record(appVersion);
+      releases.record(appVersion, _effectiveInstant(event));
     }
     // platform OS label (WARDEN-684). Skip-robust exactly like appVersions: only
     // bucket a PRESENT, non-empty string — absent / null / non-string / empty is
@@ -1656,6 +1770,7 @@ export function summarize(events) {
     topSignatures,
     schemaVersions,
     appVersions: appVersions.snapshot(),
+    releases: releases.snapshot(),
     platforms: platforms.snapshot(),
     byRuntime: byRuntime.snapshot(),
     crashReasons: crashReasons.snapshot(),
