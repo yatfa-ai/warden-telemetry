@@ -179,7 +179,7 @@ import { BASE_EVENT_TYPES } from './schema.ts';
 // `git log -S"'<type>'" --reverse -- schema.ts` and the SCHEMA_VERSION at that commit.
 //
 // SCHEMA-BUMP CHECKLIST: a bump that adds a BASE_EVENT_TYPES member MUST add its
-// entry here — test/summary.test.mjs fails otherwise.
+// entry here — test/summary-type-reach.test.mjs fails otherwise.
 export const TYPE_INTRODUCED_IN_SCHEMA_VERSION = Object.freeze({
   'error': 1, // bc436c8
   'crash': 1, // bc436c8
