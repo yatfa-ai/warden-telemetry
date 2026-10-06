@@ -168,6 +168,30 @@
 
 import { BASE_EVENT_TYPES } from './schema.ts';
 
+// Schema version at which each BASE_EVENT_TYPES member was INTRODUCED (WARDEN-1594).
+// Feeds the `typeReach` axis of /summary: a zero in `byType` is ambiguous (no build
+// that CAN emit the type has reported vs. eligible builds reported and stayed
+// silent), and this map is what lets the receiver tell the two apart.
+//
+// RECEIVER-LOCAL BY CONSTRUCTION — deliberately NOT in schema.ts (vendored
+// byte-identical, pinned by test/drift.test.mjs), same pattern as
+// COMPATIBLE_SCHEMA_VERSIONS in ingest.mjs. Derived from
+// `git log -S"'<type>'" --reverse -- schema.ts` and the SCHEMA_VERSION at that commit.
+//
+// SCHEMA-BUMP CHECKLIST: a bump that adds a BASE_EVENT_TYPES member MUST add its
+// entry here — test/summary-type-reach.test.mjs fails otherwise.
+export const TYPE_INTRODUCED_IN_SCHEMA_VERSION = Object.freeze({
+  'error': 1, // bc436c8
+  'crash': 1, // bc436c8
+  'performance-stall': 1, // bc436c8
+  'operational-metrics': 5, // 0e3d324
+  'server-stall': 6, // 7c63d82
+  'workspace-names': 7, // 9cdb0e3
+  'workspace-shape': 8, // d586e33
+  'feature-usage': 9, // fc09810
+  'process-memory': 10, // 178a5bc
+});
+
 // Cap the top-error-names list so a runaway variety of names stays readable.
 const TOP_ERROR_NAMES_CAP = 10;
 
@@ -1444,6 +1468,8 @@ export function lastAcceptedInstant(events) {
  *                            lastRejectedAt: number | null }> },
  *   firstSeen: number | null,
  *   lastSeen: number | null,
+ *   typeReach: Record<string, { introducedInSchemaVersion: number | null, eligibleEvents: number,
+ *                               emitted: number, verdict: 'emitting' | 'eligible-silent' | 'no-eligible-builds' }>,
  * }}
  */
 export function summarize(events) {
@@ -1456,6 +1482,9 @@ export function summarize(events) {
 
   const errorNameCounts = Object.create(null);
   const schemaVersions = {};
+  // Numeric-only declared schemaVersion tally (WARDEN-1594): the input to `typeReach`
+  // eligibility. Absent / null / non-numeric versions never enter it.
+  const numericVersionCounts = new Map();
   // Client-keyed histograms (WARDEN-1246): appVersions / platforms / byRuntime /
   // crashReasons are all keyed by FREE client-supplied strings, so they go
   // through the bounded accumulator (key-length truncation + top-N + overflow)
@@ -1543,6 +1572,9 @@ export function summarize(events) {
     if (schemaVersion !== undefined && schemaVersion !== null) {
       const key = String(schemaVersion);
       schemaVersions[key] = (schemaVersions[key] ?? 0) + 1;
+    }
+    if (typeof schemaVersion === 'number' && Number.isFinite(schemaVersion)) {
+      numericVersionCounts.set(schemaVersion, (numericVersionCounts.get(schemaVersion) ?? 0) + 1);
     }
     // appVersion release label (WARDEN-665). Skip-robust like schemaVersions: only
     // bucket a PRESENT, non-empty string — absent / null / non-string / empty is
@@ -1784,7 +1816,37 @@ export function summarize(events) {
     operationRejections: operationRejectionsAcc.snapshot(),
     firstSeen,
     lastSeen,
+    typeReach: _buildTypeReach(byType, numericVersionCounts),
   };
+}
+
+/**
+ * `typeReach` (WARDEN-1594): one row per BASE_EVENT_TYPES member so a zero in
+ * `byType` is readable. `eligibleEvents` = accepted events (any type) declaring a
+ * numeric schemaVersion >= the type's introducing version (a build that reports
+ * anything proves it is installed and reporting); `emitted` = byType[type].
+ * Verdicts: 'emitting' | 'eligible-silent' | 'no-eligible-builds'. Bounded reading,
+ * NOT a diagnosis: `eligible-silent` cannot tell consent-off from nothing-to-report.
+ */
+function _buildTypeReach(byType, numericVersionCounts) {
+  const typeReach = {};
+  for (const t of BASE_EVENT_TYPES) {
+    const introduced = TYPE_INTRODUCED_IN_SCHEMA_VERSION[t];
+    let eligibleEvents = 0;
+    if (typeof introduced === 'number') {
+      for (const [version, count] of numericVersionCounts) {
+        if (version >= introduced) eligibleEvents += count;
+      }
+    }
+    const emitted = byType[t];
+    typeReach[t] = {
+      introducedInSchemaVersion: typeof introduced === 'number' ? introduced : null,
+      eligibleEvents,
+      emitted,
+      verdict: emitted > 0 ? 'emitting' : eligibleEvents > 0 ? 'eligible-silent' : 'no-eligible-builds',
+    };
+  }
+  return typeReach;
 }
 
 /**

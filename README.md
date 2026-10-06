@@ -99,6 +99,13 @@ the NDJSON store; a declared `x-telemetry-schema` version outside the accepted w
 subsets of it) or any out-of-schema event is hard-rejected with a **non-retryable 4xx** (the client drops
 the batch rather than retrying it forever).
 
+#### Schema-bump checklist addition (WARDEN-1594)
+
+A bump that **adds a `BASE_EVENT_TYPES` member** must also add that type's introducing schema version to
+`TYPE_INTRODUCED_IN_SCHEMA_VERSION` in `summary.mjs` (receiver-local — `schema.ts` stays vendored
+byte-identical). `test/summary-type-reach.test.mjs` fails until it does, so a new type's zero in `/summary`
+can never be unclassifiable.
+
 #### The schema-version window (WARDEN-1445)
 
 An **additive** schema bump (new event types only — no field or validator change) no longer strands older
@@ -712,6 +719,33 @@ the event subset, so a platform filter never hides them. With no filters the res
 (`matched === total`). The trust posture is unchanged: filters only SELECT which already-redacted,
 already-schema-validated events get aggregated — no new collection, no server-side redaction, no tier
 expansion; auth is inherited from the route's existing `AUTH_TOKEN` gate.
+
+### Reading a zero in `byType` — `typeReach` (WARDEN-1594)
+
+`byType` is pre-zeroed over every base type, so two very different zeros look identical. `typeReach` (one
+row per base type) tells them apart:
+
+```jsonc
+"typeReach": {
+  "feature-usage":  { "introducedInSchemaVersion": 9,  "eligibleEvents": 2208, "emitted": 0, "verdict": "eligible-silent" },
+  "process-memory": { "introducedInSchemaVersion": 10, "eligibleEvents": 0,    "emitted": 0, "verdict": "no-eligible-builds" }
+}
+```
+
+- `eligibleEvents` — accepted events (of any type) whose declared numeric `schemaVersion` is **≥** the
+  version that introduced the type. A build that reports anything proves it is installed and reporting.
+  Events with an absent / non-numeric `schemaVersion` are eligible for nothing.
+- `emitted` — that type's own count; always equals `byType[type]`.
+- `verdict`:
+  - `emitting` — `emitted > 0`.
+  - `eligible-silent` — builds that *can* emit the type have reported, and it emitted **zero**.
+  - `no-eligible-builds` — no build that can emit the type has reported yet (an expected zero).
+
+`eligible-silent` is a **bounded reading, not a diagnosis**: the receiver cannot tell *consent category off*
+from *nothing to report*. It only says the silence is not explained by "no eligible build has reported".
+`typeReach` honours the `?appVersion=` / `?platform=` / `?type=` / `?since=` filters exactly as
+`schemaVersions` does (same filtered event stream). Purely additive: a read-side aggregate, no schema bump,
+wire field or new collection.
 
 ### Verifying the receiver is reachable — `GET /capabilities`
 
