@@ -2778,3 +2778,45 @@ test('releases: over-long label is truncated at CLIENT_KEY_MAX_LENGTH', () => {
   const s = summarize([relEv('x'.repeat(CLIENT_KEY_MAX_LENGTH + 50))]);
   assert.deepEqual(Object.keys(s.releases.byVersion), ['x'.repeat(CLIENT_KEY_MAX_LENGTH)]);
 });
+
+// ── RELEASES accumulator: dotted-numeric compare + widen() edge branches (WARDEN-1588) ──
+// Each test below is the observable for one branch that mutation probing showed the
+// suite could not tell apart (all observed through summarize().releases, the public surface).
+
+const newestOf = (...labels) => summarize(labels.map((l) => relEv(l))).releases.newestSeen;
+
+test('releases newestSeen: leading zeros in a component are stripped before comparing (1.010 == 1.10, tie keeps first-seen)', () => {
+  assert.equal(newestOf('1.10', '1.010'), '1.10', 'zero-padded A side ties, first-seen stays');
+  assert.equal(newestOf('1.010', '1.10'), '1.010', 'zero-padded B side ties, first-seen stays');
+  assert.equal(newestOf('0.1.0', '0.01.0'), '0.1.0');
+  assert.equal(newestOf('1.09', '1.1'), '1.09', '09 (=9) is greater than 1');
+  assert.equal(newestOf('1.1', '1.09'), '1.09');
+});
+
+test('releases newestSeen: a missing trailing component reads as 0 on the KEY (A) side', () => {
+  assert.equal(newestOf('1.0.0', '1.0'), '1.0.0', '1.0 == 1.0.0 tie keeps first-seen');
+  assert.equal(newestOf('1.0.1', '1.0'), '1.0.1', '1.0 < 1.0.1');
+});
+
+test('releases newestSeen: a missing trailing component reads as 0 on the NEWEST (B) side', () => {
+  assert.equal(newestOf('1.0', '1.0.1'), '1.0.1', '1.0.1 > 1.0');
+  assert.equal(newestOf('1.0', '1.0.0'), '1.0', '1.0.0 == 1.0 tie keeps first-seen');
+});
+
+test('releases newestSeen: a lone all-zero orderable label still becomes newestSeen (null guard)', () => {
+  assert.equal(newestOf('0'), '0');
+  assert.equal(newestOf('0.0'), '0.0');
+  assert.equal(newestOf('0.0', '0.0.0'), '0.0', 'tie keeps first-seen');
+});
+
+test('releases newestSeen: on a TIE the first-seen label stays newestSeen (strict > comparison)', () => {
+  assert.equal(newestOf('2.0', '2.0.0'), '2.0');
+  assert.equal(newestOf('2.0.0', '2.0'), '2.0.0');
+});
+
+test('releases: an instant-less event arriving AFTER dated ones leaves firstSeenAt/lastSeenAt untouched', () => {
+  const undated = { ...validError, appVersion: '0.1.5' };
+  delete undated.timestamp;
+  const s = summarize([relEv('0.1.5', { timestamp: 10 }), relEv('0.1.5', { timestamp: 30 }), undated]);
+  assert.deepEqual(s.releases.byVersion['0.1.5'], { count: 3, firstSeenAt: 10, lastSeenAt: 30 });
+});
