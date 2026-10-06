@@ -10,7 +10,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createDedupTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, DEFAULT_DEDUP_MAX_KEYS, DEFAULT_DEDUP_TTL_MS, DEFAULT_SCHEMA, readBody } from '../server.mjs';
+import { createRequestHandler, createRetentionTrigger, createRejectionTally, createPersistErrorTally, createRetentionTally, createDedupTally, createSeenKeys, DEFAULT_MAX_EVENTS, DEFAULT_MAX_BODY_BYTES, DEFAULT_DEDUP_MAX_KEYS, DEFAULT_DEDUP_TTL_MS, DEFAULT_SCHEMA, readBody, readReceiverVersion } from '../server.mjs';
+import { readFileSync } from 'node:fs';
 import { SCHEMA_VERSION, validateEvent } from '../schema.ts';
 import { createNdjsonStore, parseNdjson } from '../store.mjs';
 import { EVENTS_LIMIT_DEFAULT, EVENTS_LIMIT_MAX } from '../events.mjs';
@@ -906,6 +907,47 @@ test('GET /summary startedAt is a plausible epoch-ms under the DEFAULT real cloc
   assert.equal(typeof startedAt, 'number', 'startedAt is a number even under the default clock');
   assert.ok(Number.isFinite(startedAt) && startedAt > 0, 'startedAt is a finite positive epoch-ms');
   assert.ok(startedAt >= before && startedAt <= after, 'startedAt is the real boot instant (bracketed by handler construction)');
+});
+
+// ── GET /summary.receiverVersion — the receiver's build identity (WARDEN-1585) ─
+async function readSummary(deps, url = '/summary') {
+  const handler = createRequestHandler({ store: readableStore([]), ...deps });
+  const res = fakeRes();
+  await handler(fakeReq({ method: 'GET', url }), res);
+  assert.equal(res.statusCode, 200);
+  return JSON.parse(res.body);
+}
+
+test('GET /summary receiverVersion echoes an injected version verbatim', async () => {
+  const body = await readSummary({ receiverVersion: '9.8.7-test' });
+  assert.equal(body.receiverVersion, '9.8.7-test');
+});
+
+test('GET /summary default receiverVersion equals package.json version', async () => {
+  const expected = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  const body = await readSummary({});
+  assert.equal(typeof expected, 'string');
+  assert.equal(body.receiverVersion, expected);
+});
+
+test('readReceiverVersion returns null for a missing file and for unparseable JSON, never a placeholder', () => {
+  assert.equal(readReceiverVersion(new URL('./does-not-exist.json', import.meta.url)), null);
+  // a real, readable, non-JSON file
+  assert.equal(readReceiverVersion(new URL('./server.test.mjs', import.meta.url)), null);
+  // valid JSON without a usable version
+  assert.equal(readReceiverVersion(new URL('../README.md', import.meta.url)), null);
+  assert.equal(readReceiverVersion(new URL('../package.json', import.meta.url)), JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
+});
+
+test('GET /summary with injected receiverVersion null stays 200 and the key is present as null', async () => {
+  const body = await readSummary({ receiverVersion: null });
+  assert.ok('receiverVersion' in body, 'key present');
+  assert.equal(body.receiverVersion, null);
+});
+
+test('GET /summary?type= filtered read still carries receiverVersion', async () => {
+  const body = await readSummary({ receiverVersion: '1.2.3' }, '/summary?type=error');
+  assert.equal(body.receiverVersion, '1.2.3');
 });
 
 // ── GET /summary.readAt + .liveness — the SILENCE signal (WARDEN-1428) ────────
