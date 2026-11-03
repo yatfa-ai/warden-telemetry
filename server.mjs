@@ -231,6 +231,12 @@ export const DEFAULT_SCHEMA = { SCHEMA_VERSION, validateEvent, COMPATIBLE_SCHEMA
  * and fire-and-forget, so buffering the whole body is fine (no streaming parse).
  * Exported so the handler is unit-testable without binding a socket.
  *
+ * Chunks are buffered as raw BYTES and decoded to a string exactly ONCE, on end
+ * (Buffer.concat(...).toString('utf8'), WARDEN-2114): chunk boundaries follow TCP
+ * segmentation (~1.4KB), so a multibyte UTF-8 char can straddle two `data` events,
+ * and decoding per chunk would turn each half into U+FFFD — corrupting free-text
+ * fields (e.g. the error `message`) silently, with nothing surfacing it.
+ *
  * `maxBytes` (default 0 = unbounded, WARDEN-627): when > 0, the accumulated BYTE
  * length is checked on every chunk; cross the cap and the read ABORTS — listeners
  * are removed and the stream is RESUMED (drained-and-discarded) so its socket stays
@@ -251,7 +257,7 @@ export const DEFAULT_SCHEMA = { SCHEMA_VERSION, validateEvent, COMPATIBLE_SCHEMA
  */
 export function readBody(req, { maxBytes = 0 } = {}) {
   return new Promise((resolve, reject) => {
-    let data = '';
+    const chunks = [];
     let size = 0;
     let settled = false;
 
@@ -262,7 +268,7 @@ export function readBody(req, { maxBytes = 0 } = {}) {
     };
 
     // Free the socket WITHOUT tearing it down: our listeners are already removed
-    // above (so we stop buffering into `data`), then we DRAIN-and-discard the
+    // above (so we stop buffering into `chunks`), then we DRAIN-and-discard the
     // remainder via resume(). The socket stays healthy so the handler's 413 response
     // actually reaches the client. We deliberately do NOT destroy the request: req
     // and res share a socket, so req.destroy() would abort the connection and the 413
@@ -292,13 +298,13 @@ export function readBody(req, { maxBytes = 0 } = {}) {
         );
         return;
       }
-      data += buf.toString('utf8');
+      chunks.push(buf);
     };
     const onEnd = () => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(data);
+      resolve(Buffer.concat(chunks).toString('utf8'));
     };
     const onError = (err) => {
       if (settled) return;

@@ -19,13 +19,20 @@ import { signatureOf } from '../summary.mjs';
 
 // A fake IncomingMessage: an EventEmitter whose body chunks emit on nextTick
 // (mimicking a real readable stream). readBody consumes via .on('data'|'end').
-function fakeReq({ method = 'POST', url = '/ingest', headers = {}, body = '' } = {}) {
+// `chunks` (optional) delivers the body as the given sequence of chunks instead of
+// one `body` string — how a test splits a body at a chosen byte boundary (WARDEN-2114
+// delivers Buffer chunks split mid-character; readBody accepts either).
+function fakeReq({ method = 'POST', url = '/ingest', headers = {}, body = '', chunks = null } = {}) {
   const req = new EventEmitter();
   req.method = method;
   req.url = url;
   req.headers = headers;
   process.nextTick(() => {
-    if (body) req.emit('data', body);
+    if (chunks) {
+      for (const c of chunks) req.emit('data', c);
+    } else if (body) {
+      req.emit('data', body);
+    }
     req.emit('end');
   });
   return req;
@@ -4532,6 +4539,65 @@ test('readBody: a PLAIN read error (no PAYLOAD_TOO_LARGE tag) rejects with the r
     assert.match(err.message, /ECONNRESET/);
     return true;
   });
+});
+
+// ── WARDEN-2114: chunk boundaries must not corrupt multibyte UTF-8 ─────────────
+// Chunk boundaries follow TCP segmentation (~1.4KB), so a multibyte char's bytes can
+// straddle two `data` events. The old per-chunk decode (`data += buf.toString('utf8')`)
+// turned each orphaned half into U+FFFD; the fix buffers the raw bytes and decodes
+// ONCE on end. The existing string-chunk tests never hit this because `streamReq` was
+// only ever fed whole-character strings — these tests feed Buffer chunks split at
+// interior byte offsets.
+
+test('readBody: Buffer chunks split MID-CHARACTER resolve to the original string — 2-, 3- and 4-byte chars intact (WARDEN-2114)', async () => {
+  const text = 'é 日 🎉'; // a 2-byte, a 3-byte and a 4-byte char in one body
+  const buf = Buffer.from(text, 'utf8');
+  // Interior byte offsets (computed from byteLength so they cannot drift from the
+  // char classes they claim to split): each lands INSIDE the named char, verified
+  // against the pre-fix behavior — every one of these corrupted to U+FFFD before.
+  const interiorSplits = [
+    Buffer.byteLength('é') / 2, // 1 — between é's two bytes (0xC3 | 0xA9), a 2-byte char
+    Buffer.byteLength('é ') + 1, // 4 — one byte into 日, a 3-byte char
+    Buffer.byteLength('é 日 ') + 2, // 8 — two bytes into 🎉, a 4-byte char
+  ];
+  for (const at of interiorSplits) {
+    const body = await readBody(streamReq([buf.subarray(0, at), buf.subarray(at)]));
+    assert.equal(body, text, `a split at byte ${at} must resolve to the original string, not U+FFFD mush`);
+  }
+});
+
+test('POST /ingest a body split MID-CHARACTER → 202, and GET /events serves the message verbatim (WARDEN-2114)', async () => {
+  // The readBody unit test above proves the decode; this proves the DELIVERY path:
+  // readBody → ingest → validate → appendEvents → ndjson line → GET /events must
+  // carry the error event's free-text `message` through unchanged — nothing on that
+  // path re-decodes or rewrites it (/summary deliberately never reads `message`, so
+  // /events is the surface where free text serves verbatim). Before the fix the split
+  // halves each decoded to U+FFFD, the event still validated and persisted, and
+  // nothing surfaced the mangling (no 4xx, no tally) — this is the test that would
+  // have caught it.
+  const message = 'boom é 日 🎉 crash';
+  const event = { ...validError, message };
+  const json = JSON.stringify({ schemaVersion: SCHEMA_VERSION, events: [event] });
+  const buf = Buffer.from(json, 'utf8');
+  // Split at a byte offset interior to the 4-byte 🎉 (two bytes into it).
+  const splitAt = Buffer.byteLength(json.slice(0, json.indexOf('🎉')), 'utf8') + 2;
+  assert.equal(buf[splitAt - 1], 0x9f, 'sanity: the split lands inside the emoji (its 2nd byte 0x9F is the split chunk boundary), not on a char boundary');
+
+  const file = inMemoryFile();
+  const store = createNdjsonStore({ sink: file.sink, source: file.source });
+  const handler = createRequestHandler({ store, schema: { SCHEMA_VERSION, validateEvent } });
+
+  const post = fakeRes();
+  await handler(fakeReq({ headers: schemaHeaders, chunks: [buf.subarray(0, splitAt), buf.subarray(splitAt)] }), post);
+  assert.equal(post.statusCode, 202, 'the mid-character-split batch still validates and is accepted');
+
+  const get = fakeRes();
+  await handler(fakeReq({ method: 'GET', url: '/events' }), get);
+  assert.equal(get.statusCode, 200);
+  const body = JSON.parse(get.body);
+  const served = body.events ?? body;
+  assert.equal(served.length, 1);
+  assert.equal(served[0].message, message, 'the message survives the chunk split byte-exact');
 });
 
 // ── handler: the Content-Length pre-check + cap-aware readBody → clean 413 ─────
